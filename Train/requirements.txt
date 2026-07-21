@@ -1,0 +1,6 @@
+# Install torch from the official cu126 index before installing this file.
+# The index selection cannot be expressed as package metadata in pyproject.toml.
+torch==2.12.1
+torchrl==0.13.3
+tensordict==0.13.0
+PyYAML==6.0.2

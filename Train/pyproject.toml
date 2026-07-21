@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rl-flight-train"
+version = "0.1.0"
+description = "GPU-resident recurrent reinforcement-learning training framework"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "torch==2.12.1",
+    "torchrl==0.13.3",
+    "tensordict==0.13.0",
+    "PyYAML==6.0.2",
+]
+
+[project.scripts]
+flight-train = "flight_train.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

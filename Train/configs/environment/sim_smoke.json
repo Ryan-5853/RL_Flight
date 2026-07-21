@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "seed": 20260721,
+  "parallel": {"independent_rng": true},
+  "timing": {
+    "physics_hz": {"value": 5000},
+    "control_hz": {"value": 500}
+  },
+  "initial_state": {
+    "position_n": {"value": [0.0, 0.0, 0.0]},
+    "velocity_n": {"value": [0.0, 0.0, 0.0]},
+    "attitude_q_wb": {"value": [1.0, 0.0, 0.0, 0.0]},
+    "angular_velocity_b": {"value": [0.0, 0.0, 0.0]}
+  },
+  "body": {
+    "mass": {"value": 2.4},
+    "center_of_mass_b": {"value": [0.0, 0.0, 0.08]},
+    "inertia_diagonal_b": {"value": [0.03, 0.028, 0.012]}
+  },
+  "motors": [
+    {
+      "name": "left",
+      "pwm_deadzone": {"value": 0.08},
+      "pwm_to_rpm_table": {"value": [[0.0, 0.0], [0.08, 0.0], [1.0, 1800.0]]},
+      "tau_up": {"value": 0.03},
+      "tau_down": {"value": 0.05},
+      "thrust_curve": {"value": [[0.0, 0.0], [900.0, 4.0], [1800.0, 16.0]]},
+      "torque_curve": {"value": [[0.0, 0.0], [900.0, 0.08], [1800.0, 0.32]]},
+      "torque_sign": {"value": 1.0},
+      "noise": {"distribution": "normal", "stddev": {"value": 5.0}}
+    },
+    {
+      "name": "right",
+      "pwm_deadzone": {"value": 0.08},
+      "pwm_to_rpm_table": {"value": [[0.0, 0.0], [0.08, 0.0], [1.0, 1800.0]]},
+      "tau_up": {"value": 0.03},
+      "tau_down": {"value": 0.05},
+      "thrust_curve": {"value": [[0.0, 0.0], [900.0, 4.0], [1800.0, 16.0]]},
+      "torque_curve": {"value": [[0.0, 0.0], [900.0, 0.08], [1800.0, 0.32]]},
+      "torque_sign": {"value": -1.0},
+      "noise": {"distribution": "normal", "stddev": {"value": 5.0}}
+    }
+  ],
+  "servos": [
+    {"name": "servo_1", "pwm_angle_table": {"value": [[-1.0, -0.35], [0.0, 0.0], [1.0, 0.35]]}, "tau": {"value": 0.02}, "max_speed": {"value": 8.0}, "backlash": {"value": 0.01}, "deadzone": {"value": 0.015}},
+    {"name": "servo_2", "pwm_angle_table": {"value": [[-1.0, -0.35], [0.0, 0.0], [1.0, 0.35]]}, "tau": {"value": 0.02}, "max_speed": {"value": 8.0}, "backlash": {"value": 0.01}, "deadzone": {"value": 0.015}},
+    {"name": "servo_3", "pwm_angle_table": {"value": [[-1.0, -0.35], [0.0, 0.0], [1.0, 0.35]]}, "tau": {"value": 0.02}, "max_speed": {"value": 8.0}, "backlash": {"value": 0.01}, "deadzone": {"value": 0.015}}
+  ],
+  "aerodynamics": {
+    "neutral_thrust_direction_b": {"value": [0.0, 0.0, -1.0]},
+    "direct_thrust_center_b": {"value": [0.0, 0.0, 0.2]},
+    "thrust_partition": {"direct": {"value": 0.4}, "grid_1": {"value": 0.2}, "grid_2": {"value": 0.2}, "grid_3": {"value": 0.2}},
+    "grids": [
+      {"name": "grid_1", "aerodynamic_center_b": {"value": [0.1, 0.0, 0.25]}, "deflection_axis_b": {"value": [1.0, 0.0, 0.0]}, "self_attenuation_curve": {"value": [[0.0, 1.0], [0.35, 0.85]]}, "vector_deflection": {"gain": {"value": 1.0}, "offset": {"value": 0.0}}},
+      {"name": "grid_2", "aerodynamic_center_b": {"value": [-0.05, 0.087, 0.25]}, "deflection_axis_b": {"value": [0.0, 1.0, 0.0]}, "self_attenuation_curve": {"value": [[0.0, 1.0], [0.35, 0.85]]}, "vector_deflection": {"gain": {"value": 1.0}, "offset": {"value": 0.0}}},
+      {"name": "grid_3", "aerodynamic_center_b": {"value": [-0.05, -0.087, 0.25]}, "deflection_axis_b": {"value": [1.0, 0.0, 0.0]}, "self_attenuation_curve": {"value": [[0.0, 1.0], [0.35, 0.85]]}, "vector_deflection": {"gain": {"value": 1.0}, "offset": {"value": 0.0}}}
+    ],
+    "coupling_attenuation": {"value": [[0.0, 0.1, 0.1], [0.1, 0.0, 0.1], [0.1, 0.1, 0.0]]}
+  },
+  "sensors": {
+    "gyro": {"sample_hz": {"value": 5000}, "noise": {"distribution": "normal", "stddev": {"value": [0.002, 0.002, 0.002]}}, "bias": {"value": [0.0, 0.0, 0.0]}, "delay": {"value": 0.001}},
+    "accelerometer": {"sample_hz": {"value": 5000}, "noise": {"distribution": "normal", "stddev": {"value": [0.02, 0.02, 0.02]}}, "bias": {"value": [0.0, 0.0, 0.0]}, "delay": {"value": 0.001}},
+    "motor_speed": {"sample_hz": {"value": 5000}, "noise": {"distribution": "normal", "stddev": {"value": [2.0, 2.0]}}, "bias": {"value": [0.0, 0.0]}, "delay": {"value": 0.0}}
+  },
+  "logging": {"directory": "../../runs/simulator", "chunk_steps": 1024, "queue_chunks": 2, "overflow": "block"}
+}
+
