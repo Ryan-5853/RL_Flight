@@ -88,11 +88,23 @@ class VirtualPilotConfig:
 class ControlContractConfig:
     version: str
     observation_profile: str
+    observation_history_frames: int
+    observation_history_stride_steps: int
     policy_action_fields: tuple[str, ...]
     external_action_fields: tuple[str, ...]
     simulator_command_fields: tuple[str, ...]
     policy_action_trim: tuple[float, ...]
     policy_action_residual_scale: tuple[float, ...]
+
+    @property
+    def observation_dim(self) -> int:
+        return 21 * self.observation_history_frames
+
+    @property
+    def observation_history_span_steps(self) -> int:
+        return (
+            self.observation_history_frames - 1
+        ) * self.observation_history_stride_steps
 
 
 @dataclass(frozen=True)
@@ -123,6 +135,7 @@ class ModelConfig:
     sac_minimum_action_std: tuple[float, ...] = ()
     sac_maximum_action_std: tuple[float, ...] = ()
     sac_learnable_action_std: bool = True
+    recurrent_layers: int = 1
 
 
 @dataclass(frozen=True)
@@ -163,7 +176,16 @@ class SACConfig:
     target_entropy: float | str
     min_alpha: float | None
     max_alpha: float | None
+    replay_sequence_length: int = 1
+    replay_burn_in_steps: int = 0
     critic_pretraining_updates: int = 0
+    actor_update_interval: int = 1
+
+    @property
+    def replay_sample_length(self) -> int:
+        """每条 replay 样本的总步数：隐状态预热段加有效训练段。"""
+
+        return self.replay_burn_in_steps + self.replay_sequence_length
 
 
 @dataclass(frozen=True)
@@ -414,15 +436,92 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
             _positive_int_value(v, "model.encoder.hidden_sizes")
             for v in _sequence(encoder, "hidden_sizes")
         )
+        recurrent_sizes_raw = recurrent.get("hidden_sizes")
+        if recurrent_sizes_raw is None:
+            recurrent_sizes = (_positive_int(recurrent, "hidden_size"),)
+        else:
+            if not isinstance(recurrent_sizes_raw, (list, tuple)):
+                raise ConfigError("model.recurrent.hidden_sizes must be a sequence")
+            recurrent_sizes = tuple(
+                _positive_int_value(v, "model.recurrent.hidden_sizes")
+                for v in recurrent_sizes_raw
+            )
+            if not recurrent_sizes:
+                raise ConfigError("model.recurrent.hidden_sizes must not be empty")
+            if len(set(recurrent_sizes)) != 1:
+                raise ConfigError(
+                    "stacked GRU layers must currently use one common hidden size"
+                )
+        model_kwargs: dict[str, Any] = {}
+        if requested_algorithm_name == "sac":
+            policy_distribution = _map(model_node, "policy_distribution")
+            learnable_action_std = policy_distribution.get(
+                "learnable_action_std", True
+            )
+            if not isinstance(learnable_action_std, bool):
+                raise ConfigError(
+                    "model.policy_distribution.learnable_action_std must be boolean"
+                )
+            model_kwargs = {
+                "sac_initial_action_std": tuple(
+                    _positive_float_value(
+                        value, "model.policy_distribution.initial_action_std"
+                    )
+                    for value in _sequence(
+                        policy_distribution, "initial_action_std"
+                    )
+                ),
+                "sac_minimum_action_std": tuple(
+                    _positive_float_value(
+                        value, "model.policy_distribution.minimum_action_std"
+                    )
+                    for value in _sequence(
+                        policy_distribution, "minimum_action_std"
+                    )
+                ),
+                "sac_maximum_action_std": tuple(
+                    _positive_float_value(
+                        value, "model.policy_distribution.maximum_action_std"
+                    )
+                    for value in _sequence(
+                        policy_distribution, "maximum_action_std"
+                    )
+                ),
+                "sac_learnable_action_std": learnable_action_std,
+            }
         model = ModelConfig(
             encoder_sizes=encoder_sizes,
-            hidden_size=_positive_int(recurrent, "hidden_size"),
+            hidden_size=recurrent_sizes[0],
             actor_head_size=_positive_int_value(
                 _sequence(actor_head, "hidden_sizes")[0],
                 "model.actor_head.hidden_sizes",
             ),
             architecture="gru",
+            recurrent_layers=len(recurrent_sizes),
+            **model_kwargs,
         )
+        if requested_algorithm_name == "sac":
+            if not (
+                len(model.sac_initial_action_std)
+                == len(model.sac_minimum_action_std)
+                == len(model.sac_maximum_action_std)
+                == 4
+            ):
+                raise ConfigError(
+                    "SAC policy distribution std lists must each contain 4 actions"
+                )
+            if any(
+                not minimum < initial < maximum
+                for minimum, initial, maximum in zip(
+                    model.sac_minimum_action_std,
+                    model.sac_initial_action_std,
+                    model.sac_maximum_action_std,
+                    strict=True,
+                )
+            ):
+                raise ConfigError(
+                    "each SAC action std must satisfy minimum < initial < maximum"
+                )
     elif model_type == "mlp_actor_critic":
         hidden_sizes = tuple(
             _positive_int_value(v, "model.hidden_sizes")
@@ -560,8 +659,6 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
         if model.architecture == "mlp" and ppo.sequence_length != 1:
             raise ConfigError("MLP PPO requires algorithm.sequence_length=1")
     elif algorithm_name == "sac":
-        if model.architecture != "mlp":
-            raise ConfigError("the first SAC implementation supports MLP policies only")
         optimizer = _map(algorithm, "optimizer")
         replay = _map(algorithm, "replay")
         target_update = _map(algorithm, "target_update")
@@ -599,6 +696,35 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
             raise ConfigError("SAC replay batch_size must not exceed capacity")
         if warmup_transitions > replay_capacity:
             raise ConfigError("SAC warmup_transitions must not exceed replay capacity")
+        replay_sequence_length = _positive_int_value(
+            replay.get("sequence_length", 1),
+            "algorithm.replay.sequence_length",
+        )
+        replay_burn_in_steps = _nonnegative_int_value(
+            replay.get("burn_in_steps", 0),
+            "algorithm.replay.burn_in_steps",
+        )
+        replay_sample_length = replay_burn_in_steps + replay_sequence_length
+        if model.architecture == "mlp":
+            if replay_sequence_length != 1:
+                raise ConfigError("MLP SAC requires replay.sequence_length=1")
+            if replay_burn_in_steps:
+                raise ConfigError("MLP SAC requires replay.burn_in_steps=0")
+        if model.architecture == "gru":
+            if replay_sequence_length < 2:
+                raise ConfigError(
+                    "GRU SAC requires replay.sequence_length of at least 2"
+                )
+            if replay_batch_size % replay_sample_length:
+                raise ConfigError(
+                    "GRU SAC replay.batch_size must be divisible by "
+                    "burn_in_steps + sequence_length"
+                )
+            if run.rollout_steps < replay_sample_length:
+                raise ConfigError(
+                    "GRU SAC collector rollout must be at least "
+                    "burn_in_steps + sequence_length"
+                )
         sac = SACConfig(
             gamma=_unit_float(algorithm, "gamma"),
             n_step_return=_positive_int_value(
@@ -620,8 +746,14 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
             target_entropy=target_entropy,
             min_alpha=min_alpha,
             max_alpha=max_alpha,
+            replay_sequence_length=replay_sequence_length,
+            replay_burn_in_steps=replay_burn_in_steps,
             critic_pretraining_updates=_nonnegative_int(
                 algorithm, "critic_pretraining_updates"
+            ),
+            actor_update_interval=_positive_int_value(
+                algorithm.get("actor_update_interval", 1),
+                "algorithm.actor_update_interval",
             ),
         )
     else:
@@ -852,6 +984,7 @@ def _control_contract(node: Mapping[str, Any]) -> ControlContractConfig:
         {
             "version",
             "observation_profile",
+            "observation_history",
             "policy_action",
             "external_action",
             "simulator_command",
@@ -871,6 +1004,26 @@ def _control_contract(node: Mapping[str, Any]) -> ControlContractConfig:
     profile = str(node.get("observation_profile", ""))
     if version != "self_stabilize_v1" or profile != "attitude_self_stabilize_21d_v3":
         raise ConfigError("unsupported self-stabilize control/observation contract")
+    history_raw = node.get("observation_history", {})
+    if not isinstance(history_raw, Mapping):
+        raise ConfigError("control_contract.observation_history must be a mapping")
+    _keys(
+        history_raw,
+        {"frames", "stride_steps"},
+        "control_contract.observation_history",
+    )
+    history_frames = _positive_int_value(
+        history_raw.get("frames", 1),
+        "control_contract.observation_history.frames",
+    )
+    history_stride_steps = _positive_int_value(
+        history_raw.get("stride_steps", 1),
+        "control_contract.observation_history.stride_steps",
+    )
+    if history_frames == 1 and history_stride_steps != 1:
+        raise ConfigError(
+            "single-frame observation history requires stride_steps=1"
+        )
     transform = _map(node, "action_transform")
     _keys(
         transform,
@@ -906,7 +1059,15 @@ def _control_contract(node: Mapping[str, Any]) -> ControlContractConfig:
             "trim_command ± residual_scale must stay inside simulator action bounds"
         )
     return ControlContractConfig(
-        version, profile, policy, external, simulator, trim, scale
+        version=version,
+        observation_profile=profile,
+        observation_history_frames=history_frames,
+        observation_history_stride_steps=history_stride_steps,
+        policy_action_fields=policy,
+        external_action_fields=external,
+        simulator_command_fields=simulator,
+        policy_action_trim=trim,
+        policy_action_residual_scale=scale,
     )
 
 
@@ -1058,7 +1219,10 @@ def _positive_int_value(value: Any, key: str) -> int:
 
 
 def _nonnegative_int(node: Mapping[str, Any], key: str) -> int:
-    value = node.get(key)
+    return _nonnegative_int_value(node.get(key), key)
+
+
+def _nonnegative_int_value(value: Any, key: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ConfigError(f"{key} must be a nonnegative integer")
     return value

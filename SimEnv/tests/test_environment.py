@@ -610,7 +610,7 @@ class SimulationEnvironmentTests(unittest.TestCase):
                     torch.tensor([[5.0, 0.0, 0.0]]),
                 )
 
-    def test_sensor_bias_and_reference_frame_mapping(self) -> None:
+    def test_sensor_bias_and_source_mapping(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config = _config(str(root / "logs"))
@@ -642,10 +642,73 @@ class SimulationEnvironmentTests(unittest.TestCase):
                 )
                 torch.testing.assert_close(
                     values["accelerometer"],
-                    torch.tensor([[0.0, 0.0, 9.80665]]).expand(2, 3),
+                    torch.zeros((2, 3)),
                 )
                 torch.testing.assert_close(
                     values["motor_speed"], torch.tensor([[1.0, -1.0]]).expand(2, 2)
+                )
+
+    def test_accelerometer_uses_time_aligned_body_specific_force(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = _config(str(root / "logs"))
+            config["timing"] = {
+                "physics_hz": _randomizable(100),
+                "control_hz": _randomizable(100),
+            }
+            config["initial_state"]["attitude_q_wb"] = _randomizable(
+                [0.9238795325112867, 0.0, 0.3826834323650898, 0.0]
+            )
+            config["initial_state"]["angular_velocity_b"] = _randomizable(
+                [2.0, -1.0, 3.0]
+            )
+            config["sensors"] = {
+                "accelerometer": {
+                    "sample_hz": _randomizable(100),
+                    "noise": {
+                        "distribution": "normal",
+                        "stddev": _randomizable([0.0, 0.0, 0.0]),
+                    },
+                    "bias": _randomizable([0.0, 0.0, 0.0]),
+                    "delay": _randomizable(0.0),
+                }
+            }
+            for motor in config["motors"]:
+                motor["pwm_deadzone"] = _randomizable(0.0)
+                motor["pwm_to_rpm_table"] = _randomizable(
+                    [[0.0, 0.0], [1.0, 100.0]]
+                )
+                motor["time_constant"] = _randomizable(0.01)
+                motor["torque_coefficient"] = _randomizable(0.0)
+            config["aerodynamics"]["thrust_coefficients"] = _randomizable(
+                [1.0e-3, 1.0e-3, 0.0]
+            )
+            self._disable_motor_noise(config)
+            path = self._write_named_config(
+                root, "accelerometer-time-alignment.json", config
+            )
+
+            with SimulationEnvironment.create(path, 1, "cpu") as env:
+                initial_truth = env.observe(
+                    "truth", ("linear_acceleration_n",)
+                ).values["linear_acceleration_n"]
+                torch.testing.assert_close(
+                    initial_truth, torch.tensor([[0.0, 0.0, 9.80665]])
+                )
+                torch.testing.assert_close(
+                    env.observe("sensor").values["accelerometer"],
+                    torch.zeros((1, 3)),
+                )
+
+                env.advance(torch.tensor([[1.0, 1.0, 0.0, 0.0, 0.0]]))
+                truth = env.observe("truth").values
+                expected = (
+                    truth["force_b"]
+                    / env.parameters["body.mass"][:, None]
+                )
+                torch.testing.assert_close(
+                    env.observe("sensor").values["accelerometer"],
+                    expected,
                 )
 
     def test_sensor_noise_stream_is_isolated_by_instance_counter(self) -> None:

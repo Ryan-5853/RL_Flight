@@ -78,7 +78,6 @@ class TensorSensorKernel:
     """Batched sampled sensors with bias, noise, and physical-time delay."""
 
     implemented = True
-    _GRAVITY_N = (0.0, 0.0, 9.80665)
 
     def __init__(
         self,
@@ -104,12 +103,9 @@ class TensorSensorKernel:
         self._delay_lower: dict[str, torch.Tensor] = {}
         self._delay_upper: dict[str, torch.Tensor] = {}
         self._delay_fraction: dict[str, torch.Tensor] = {}
-        self._gravity_n = torch.tensor(
-            self._GRAVITY_N, dtype=self._dtype, device=self._device
-        )
 
         for name in sensor_names:
-            source = self._source(name, truth_state)
+            source = self._source(name, truth_state, parameters)
             capacity = self._required_capacity(name, parameters)
             self._capacity[name] = capacity
             self._history[name] = source[:, None, ...].expand(
@@ -158,7 +154,7 @@ class TensorSensorKernel:
         parameters: Mapping[str, torch.Tensor],
     ) -> dict[str, torch.Tensor]:
         return {
-            name: self._source(name, truth_state)
+            name: self._source(name, truth_state, parameters)
             + parameters[f"sensors.{name}.bias"]
             for name in self._sensor_names
         }
@@ -224,7 +220,7 @@ class TensorSensorKernel:
     ) -> Mapping[str, torch.Tensor]:
         next_state: dict[str, torch.Tensor] = {}
         for name in self._sensor_names:
-            source = self._source(name, truth_state)
+            source = self._source(name, truth_state, parameters)
             history = self._history[name]
             capacity = self._capacity[name]
             write_index = torch.remainder(physics_step, capacity)
@@ -265,7 +261,7 @@ class TensorSensorKernel:
         self.refresh_parameters(parameters, reset_mask)
         next_state: dict[str, torch.Tensor] = {}
         for name in self._sensor_names:
-            source = self._source(name, truth_state)
+            source = self._source(name, truth_state, parameters)
             history = self._history[name]
             initial_history = source[:, None, ...].expand_as(history)
             history.copy_(
@@ -338,28 +334,24 @@ class TensorSensorKernel:
         return int(torch.ceil(delay_steps.max()).item()) + 1
 
     def _source(
-        self, name: str, truth_state: Mapping[str, torch.Tensor]
+        self,
+        name: str,
+        truth_state: Mapping[str, torch.Tensor],
+        parameters: Mapping[str, torch.Tensor],
     ) -> torch.Tensor:
         if name == "gyro":
             return truth_state["angular_velocity_b"]
         if name == "motor_speed":
             return truth_state["motor_speed"]
         if name == "accelerometer":
-            specific_force_n = (
-                truth_state["linear_acceleration_n"] - self._gravity_n
-            )
-            return self._rotate_world_to_body(
-                truth_state["attitude_q_wb"], specific_force_n
+            # 质心处加速度计测量机体系非重力比力。直接使用同一物理步的
+            # force_b/m，避免把步初姿态计算的世界系加速度再用步末姿态旋回，
+            # 从而引入 O(|omega|*dt) 的伪横向分量。
+            return (
+                truth_state["force_b"]
+                / parameters["body.mass"][:, None]
             )
         raise RuntimeError(f"unsupported sensor {name!r}")
-
-    @staticmethod
-    def _rotate_world_to_body(q_wb: torch.Tensor, vector_n: torch.Tensor) -> torch.Tensor:
-        q_vector = q_wb[:, 1:]
-        cross = torch.linalg.cross(q_vector, vector_n)
-        return vector_n - 2 * q_wb[:, :1] * cross + 2 * torch.linalg.cross(
-            q_vector, cross
-        )
 
     @staticmethod
     def _expand(mask: torch.Tensor, target: torch.Tensor) -> torch.Tensor:

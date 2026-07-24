@@ -145,7 +145,7 @@ reward:
 
       # 每个有效控制步给固定生存奖励，避免 episode_age_fraction 随课程时长
       # 改变而让 replay 中相同物理状态拥有不同即时奖励。
-      alive_bonus: 0.1
+      alive_bonus: 0.01
       survival_progress_weight: 0.0
 
       # barrier 在接近安全边界前提供连续梯度。

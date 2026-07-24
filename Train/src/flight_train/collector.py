@@ -37,7 +37,11 @@ class TensorDictRolloutCollector:
             self.current.set(
                 "recurrent_state",
                 torch.zeros(
-                    (self.batch_size, 1, model.hidden_size),
+                    (
+                        self.batch_size,
+                        model.recurrent_layers,
+                        model.hidden_size,
+                    ),
                     device=self.device,
                     dtype=env.spec.dtype,
                 ),
@@ -89,6 +93,7 @@ class TensorDictRolloutCollector:
                     }
                 )
                 for reward_key in (
+                    "reward.alive",
                     "reward.attitude",
                     "reward.tilt",
                     "reward.yaw_rate",
@@ -106,6 +111,7 @@ class TensorDictRolloutCollector:
                 "is_init": current["is_init"],
                 "action": policy_td["action"],
                 "action_log_prob": policy_td["action_log_prob"],
+                "policy_scale": policy_td["scale"],
                 "next": TensorDict(
                     next_values,
                     batch_size=[self.batch_size],

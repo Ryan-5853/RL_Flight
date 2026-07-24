@@ -84,7 +84,7 @@ servos:
 aerodynamics:
   # T_total = k1*rpm_upper² + k2*rpm_lower² + k3*rpm_upper*rpm_lower。
   # k1、k2 >= 0，且 k3 + 2*sqrt(k1*k2) >= 0，以保证非负转速下推力非负。
-  thrust_coefficients: {value: [4.0e-6, 4.0e-6, 2.0e-6]} # [k1,k2,k3]，N/(rad/s)²
+  thrust_coefficients: {value: [4.0e-6, 4.0e-6, -2.0e-6]} # [k1,k2,k3]，N/(rad/s)²
   neutral_thrust_direction_b: {value: [0.0, 0.0, -1.0]} # 中立受力方向，FRD 单位向量
   direct_thrust_center_b: {value: [0.0, 0.0, 0.20]}      # 直接推力作用点，FRD，m
   thrust_partition:                # direct + grid_1 + grid_2 + grid_3 必须等于 1

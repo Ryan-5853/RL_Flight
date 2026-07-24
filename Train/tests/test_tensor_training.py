@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import torch
 from tensordict import TensorDict
+from torchrl.modules import set_recurrent_mode
 
 from flight_train.algorithms import RecurrentPPO, TorchRLPPO, TorchRLSAC
 from flight_train.collector import TensorDictRolloutCollector
@@ -25,6 +26,7 @@ from flight_train.models import build_actor_critic, build_sac_actor_critic
 from flight_train.randomization import StaticParameterSpec, StaticRandomizer
 from flight_train.rewards import AttitudeRewardCalculator, RewardOutput
 from flight_train.tasks import AttitudeTrackingTask
+from simenv.config import load_and_materialize
 
 
 class TensorEnv:
@@ -94,6 +96,543 @@ class TensorTrainingTests(unittest.TestCase):
         )
         self.assertFalse(config.model.sac_learnable_action_std)
         self.assertEqual(config.sac.critic_pretraining_updates, 2)
+
+    def test_gru_sac_nominal_config_parses_without_curriculum(self):
+        path = (
+            Path(__file__).parents[1]
+            / "configs/experiments/gru_sac_truth_nominal_no_curriculum.yaml"
+        )
+        config = load_experiment_config(path)
+        self.assertEqual(config.algorithm_name, "sac")
+        self.assertEqual(config.task.attitude_source, "truth")
+        self.assertEqual(config.task.curriculum_durations_s, (30.0,))
+        self.assertEqual(config.task.curriculum_target_scales, (1.0,))
+        self.assertEqual(config.model.architecture, "gru")
+        self.assertEqual(config.model.encoder_sizes, (128, 128))
+        self.assertEqual(config.model.hidden_size, 128)
+        self.assertEqual(config.model.recurrent_layers, 2)
+        self.assertEqual(config.sac.replay_burn_in_steps, 128)
+        self.assertEqual(config.sac.replay_sequence_length, 128)
+        self.assertEqual(config.sac.replay_sample_length, 256)
+        self.assertEqual(config.sac.replay_batch_size, 4096)
+        self.assertEqual(config.run.rollout_steps, 256)
+        self.assertEqual(config.static_randomization.parameters, {})
+        self.assertEqual(config.dynamic_randomization.parameters, {})
+
+    def test_gru_sac_upright_height_only_config_and_initial_tip(self):
+        path = (
+            Path(__file__).parents[1]
+            / "configs/experiments/gru_sac_upright_height_only_small_tip.yaml"
+        )
+        config = load_experiment_config(path)
+        self.assertEqual(
+            config.name, "gru_sac_upright_height_only_small_tip"
+        )
+        self.assertEqual(config.command_source.max_roll_rad, 0.0)
+        self.assertEqual(config.command_source.max_pitch_rad, 0.0)
+        self.assertEqual(config.command_source.max_yaw_rate_rad_s, 0.0)
+        self.assertEqual(config.command_source.initial_target_scale, 0.0)
+        self.assertEqual(config.sac.updates_per_collection, 32)
+        self.assertEqual(config.sac.replay_burn_in_steps, 128)
+        self.assertEqual(config.sac.replay_sequence_length, 128)
+        self.assertEqual(config.static_randomization.parameters, {})
+        self.assertEqual(config.dynamic_randomization.parameters, {})
+
+        materialized = load_and_materialize(
+            config.simulator_config,
+            parallel_count=256,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        attitude = materialized.initial_state["attitude_q_wb"]
+        angular_velocity = materialized.initial_state[
+            "angular_velocity_b"
+        ]
+        torch.testing.assert_close(
+            attitude.norm(dim=-1), torch.ones(256)
+        )
+        self.assertTrue((angular_velocity[:, 0] >= 0.02).all())
+        self.assertTrue((angular_velocity[:, 0] <= 0.04).all())
+        self.assertTrue((angular_velocity[:, 1] >= -0.03).all())
+        self.assertTrue((angular_velocity[:, 1] <= -0.01).all())
+        self.assertTrue((angular_velocity[:, 2].abs() <= 0.005).all())
+
+        pilot = VirtualPilotCommandSource(
+            config.command_source,
+            batch_size=256,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            control_hz=500,
+        )
+        pilot.reset(torch.ones(256, dtype=torch.bool))
+        for _ in range(100):
+            pilot.step(torch.zeros(256, 1))
+        snapshot = pilot.snapshot()
+        self.assertEqual(torch.count_nonzero(snapshot.stick_target), 0)
+        self.assertEqual(torch.count_nonzero(snapshot.filtered_stick), 0)
+        self.assertEqual(torch.count_nonzero(pilot.desired_yaw_rate), 0)
+        expected_upright = torch.zeros(256, 4)
+        expected_upright[:, 0] = 1.0
+        torch.testing.assert_close(
+            snapshot.target_attitude_q_wb, expected_upright
+        )
+
+    def test_gru_sac_upright_credit_fixed_config(self):
+        path = (
+            Path(__file__).parents[1]
+            / "configs/experiments/"
+            "gru_sac_upright_height_only_small_tip_credit_fixed.yaml"
+        )
+        config = load_experiment_config(path)
+        self.assertEqual(
+            config.name,
+            "gru_sac_upright_height_only_small_tip_credit_fixed",
+        )
+        self.assertEqual(config.model.architecture, "gru")
+        self.assertEqual(config.model.encoder_sizes, (128, 128))
+        self.assertEqual(config.model.hidden_size, 128)
+        self.assertEqual(config.model.recurrent_layers, 2)
+        self.assertEqual(config.run.rollout_steps, 512)
+        self.assertEqual(config.sac.replay_burn_in_steps, 128)
+        self.assertEqual(config.sac.replay_sequence_length, 128)
+        self.assertEqual(config.sac.replay_sample_length, 256)
+        self.assertGreater(
+            config.run.rollout_steps,
+            config.sac.replay_sample_length,
+        )
+        self.assertEqual(config.sac.n_step_return, 16)
+        self.assertEqual(config.sac.critic_pretraining_updates, 512)
+        self.assertEqual(config.sac.updates_per_collection, 64)
+        self.assertEqual(config.sac.warmup_transitions, 262_144)
+        self.assertEqual(
+            config.model.sac_initial_action_std,
+            (0.06, 0.05, 0.05, 0.05),
+        )
+        self.assertEqual(
+            config.model.sac_maximum_action_std,
+            (0.10, 0.08, 0.08, 0.08),
+        )
+        self.assertEqual(
+            config.evaluation.interval_control_steps,
+            1_048_576,
+        )
+        self.assertEqual(
+            config.checkpoint.interval_control_steps,
+            524_288,
+        )
+        self.assertEqual(
+            config.evaluation.interval_control_steps
+            % config.checkpoint.interval_control_steps,
+            0,
+        )
+        reward_params = config.reward.calculator.params
+        self.assertEqual(reward_params["roll_pitch_weight"], 0)
+        self.assertEqual(reward_params["tilt_weight"], 0.08)
+        self.assertEqual(
+            reward_params["angular_rate_weight"],
+            0.01 / 8.0**2,
+        )
+        self.assertEqual(
+            reward_params["yaw_rate_weight"],
+            0.01 / 8.0**2,
+        )
+        self.assertEqual(reward_params["alive_bonus"], 0.02)
+        self.assertEqual(reward_params["termination_penalty"], 10.0)
+        self.assertEqual(reward_params["tilt_barrier_weight"], 0)
+        self.assertEqual(reward_params["rate_barrier_weight"], 0)
+        # 64 updates × (4096 / 256 sequences) × 128 loss steps
+        # 与 256 env × 512 collector steps严格相等。
+        effective_training_steps = (
+            config.sac.updates_per_collection
+            * (
+                config.sac.replay_batch_size
+                // config.sac.replay_sample_length
+            )
+            * config.sac.replay_sequence_length
+        )
+        self.assertEqual(
+            effective_training_steps,
+            config.run.parallel_count * config.run.rollout_steps,
+        )
+
+    def test_mlp_sac_upright_credit_fixed_uses_gentle_actor_updates(self):
+        path = (
+            Path(__file__).parents[1]
+            / "configs/experiments/"
+            "mlp_sac_upright_height_only_small_tip_credit_fixed.yaml"
+        )
+        config = load_experiment_config(path)
+        self.assertEqual(
+            config.name,
+            "mlp_sac_upright_height_only_small_tip_credit_fixed",
+        )
+        self.assertEqual(config.model.architecture, "mlp")
+        self.assertEqual(config.model.encoder_sizes, (128, 128))
+        self.assertEqual(
+            config.control_contract.observation_history_frames, 16
+        )
+        self.assertEqual(
+            config.control_contract.observation_history_stride_steps, 4
+        )
+        self.assertEqual(
+            config.control_contract.observation_history_span_steps, 60
+        )
+        self.assertEqual(config.control_contract.observation_dim, 336)
+        self.assertEqual(config.sac.replay_burn_in_steps, 0)
+        self.assertEqual(config.sac.replay_sequence_length, 1)
+        self.assertEqual(config.sac.critic_pretraining_updates, 512)
+        self.assertEqual(config.sac.actor_update_interval, 4)
+        self.assertEqual(config.sac.actor_learning_rate, 0.00003)
+        self.assertEqual(config.sac.critic_learning_rate, 0.0003)
+        self.assertEqual(config.sac.updates_per_collection, 64)
+
+    def test_observation_history_uses_strided_oldest_to_current_frames(self):
+        env = object.__new__(SimEnvAdapter)
+        env.batch_size = 2
+        env.base_observation_dim = 21
+        env.observation_history_frames = 3
+        env.observation_history_stride_steps = 2
+        env.observation_history_capacity = 5
+        env.observation_history = torch.zeros(2, 5, 21)
+        env.observation_history_index = 4
+        env._observation_history_offsets = torch.tensor([4, 2, 0])
+
+        initial = torch.zeros(2, 21)
+        env._reset_observation_history(
+            torch.ones(2, dtype=torch.bool), initial
+        )
+        for value in range(1, 5):
+            base = torch.full((2, 21), float(value))
+            env._append_observation_history(
+                base, torch.zeros(2, dtype=torch.bool)
+            )
+
+        stacked = env._history_observation().reshape(2, 3, 21)
+        torch.testing.assert_close(
+            stacked[:, :, 0],
+            torch.tensor([[0.0, 2.0, 4.0], [0.0, 2.0, 4.0]]),
+        )
+
+        reset_base = torch.stack(
+            (torch.full((21,), 9.0), torch.full((21,), 5.0))
+        )
+        env._append_observation_history(
+            reset_base, torch.tensor([True, False])
+        )
+        reset_stacked = env._history_observation().reshape(2, 3, 21)
+        torch.testing.assert_close(
+            reset_stacked[0],
+            torch.full((3, 21), 9.0),
+        )
+        torch.testing.assert_close(
+            reset_stacked[1, :, 0],
+            torch.tensor([1.0, 3.0, 5.0]),
+        )
+
+    def test_gru_sac_long_collector_samples_sliding_windows_and_terminal(self):
+        device = torch.device("cpu")
+        model_config = ModelConfig(
+            (8, 8),
+            8,
+            8,
+            architecture="gru",
+            sac_initial_action_std=(0.05, 0.05, 0.05, 0.05),
+            sac_minimum_action_std=(0.01, 0.01, 0.01, 0.01),
+            sac_maximum_action_std=(0.10, 0.10, 0.10, 0.10),
+            recurrent_layers=2,
+        )
+        model = build_sac_actor_critic(21, 4, model_config, device)
+        sac = TorchRLSAC(
+            model,
+            SACConfig(
+                gamma=0.99,
+                n_step_return=1,
+                replay_capacity=128,
+                replay_batch_size=16,
+                warmup_transitions=16,
+                updates_per_collection=1,
+                actor_learning_rate=3e-4,
+                critic_learning_rate=3e-4,
+                alpha_learning_rate=3e-4,
+                actor_max_grad_norm=1.0,
+                critic_max_grad_norm=5.0,
+                target_tau=0.005,
+                target_update_interval=1,
+                initial_alpha=0.1,
+                target_entropy="auto",
+                min_alpha=None,
+                max_alpha=None,
+                replay_sequence_length=2,
+                replay_burn_in_steps=2,
+            ),
+            device,
+        )
+        batch, time = 2, 8
+        terminated = torch.zeros(batch, time, 1, dtype=torch.bool)
+        terminated[:, 4] = True
+        rollout = TensorDict(
+            {
+                "observation": torch.randn(batch, time, 21),
+                "action": torch.zeros(batch, time, 4),
+                "is_init": torch.zeros(batch, time, 1, dtype=torch.bool),
+                "next": TensorDict(
+                    {
+                        "observation": torch.randn(batch, time, 21),
+                        "reward": torch.zeros(batch, time, 1),
+                        "done": terminated.clone(),
+                        "terminated": terminated,
+                        "truncated": torch.zeros(
+                            batch, time, 1, dtype=torch.bool
+                        ),
+                        "valid": torch.ones(
+                            batch, time, 1, dtype=torch.bool
+                        ),
+                        "is_init": terminated.clone(),
+                    },
+                    batch_size=[batch, time],
+                ),
+            },
+            batch_size=[batch, time],
+        )
+        self.assertEqual(sac.add(rollout), batch * time)
+        # 固定 sampler RNG，避免概率性回归测试。
+        sac.replay._sampler._rng = torch.Generator().manual_seed(20260726)
+        start_offsets: set[int] = set()
+        terminal_in_loss = 0
+        for _ in range(32):
+            sampled = sac.replay.sample().reshape(-1, 4)
+            start_offsets.update(
+                int(value)
+                for value in (
+                    sampled["index"][:, 0].squeeze(-1) % time
+                ).tolist()
+            )
+            terminal_in_loss += int(
+                sampled[("next", "terminated")][:, 2:].sum()
+            )
+        # 4-step 样本可以在 5-step 真实 episode 片段的 offset 0 或 1
+        # 开始；旧的 collector==sample_length 配置只能从 offset 0 开始。
+        self.assertEqual(start_offsets, {0, 1})
+        # offset 1 的后两步包含真实 terminal，证明终止样本能进入 loss 段。
+        self.assertGreater(terminal_in_loss, 0)
+
+    def test_gru_sac_upright_minimal_reward_exact_terms(self):
+        config = load_experiment_config(
+            Path(__file__).parents[1]
+            / "configs/experiments/"
+            "gru_sac_upright_height_only_small_tip_credit_fixed.yaml"
+        )
+        calculator = AttitudeRewardCalculator(
+            config.reward.calculator.params
+        )
+        context = TensorDict(
+            {
+                "attitude_geodesic_rad": torch.zeros(2, 1),
+                # 故意提供非零 roll/pitch error，验证重复姿态项已关闭。
+                "roll_pitch_error_rad": torch.ones(2, 2),
+                "yaw_rate_error_rad_s": torch.tensor([[4.0], [0.0]]),
+                "tilt_rad": torch.tensor([[0.5], [0.0]]),
+                "angular_velocity_b": torch.tensor(
+                    [[2.0, 3.0, 4.0], [0.0, 0.0, 0.0]]
+                ),
+                "action": torch.ones(2, 4),
+                "previous_action": torch.zeros(2, 4),
+                "terminated": torch.tensor([[False], [True]]),
+                "tilt_ratio": torch.tensor([[0.5], [0.0]]),
+                "rate_ratio": torch.tensor([[0.5], [0.0]]),
+                "episode_age_fraction": torch.zeros(2, 1),
+                "episode_remaining_fraction": torch.ones(2, 1),
+            },
+            batch_size=[2],
+        )
+        output = calculator(context)
+        normalized_rate_weight = 0.01 / 8.0**2
+        expected_first = (
+            0.02
+            - 0.08 * 0.5**2
+            - normalized_rate_weight * (2.0**2 + 3.0**2)
+            - normalized_rate_weight * 4.0**2
+        )
+        torch.testing.assert_close(
+            output.reward[:, 0],
+            torch.tensor([expected_first, 0.02 - 10.0]),
+        )
+        for disabled_term in (
+            "reward.attitude",
+            "reward.action_rate",
+            "reward.saturation",
+            "reward.risk",
+            "reward.survival",
+        ):
+            self.assertEqual(
+                torch.count_nonzero(output.terms[disabled_term]),
+                0,
+            )
+        torch.testing.assert_close(
+            output.terms["reward.tilt"][:, 0],
+            torch.tensor([-0.08 * 0.5**2, 0.0]),
+        )
+        torch.testing.assert_close(
+            output.terms["reward.angular_rate"][:, 0],
+            torch.tensor(
+                [
+                    -normalized_rate_weight * (2.0**2 + 3.0**2),
+                    0.0,
+                ]
+            ),
+        )
+        torch.testing.assert_close(
+            output.terms["reward.yaw_rate"][:, 0],
+            torch.tensor(
+                [-normalized_rate_weight * 4.0**2, 0.0]
+            ),
+        )
+        torch.testing.assert_close(
+            output.terms["reward.termination"][:, 0],
+            torch.tensor([0.0, -10.0]),
+        )
+
+    def test_gru_sac_collects_sequences_and_updates(self):
+        device = torch.device("cpu")
+        model_config = ModelConfig(
+            (16, 16),
+            16,
+            16,
+            architecture="gru",
+            sac_initial_action_std=(0.10, 0.10, 0.10, 0.10),
+            sac_minimum_action_std=(0.01, 0.01, 0.01, 0.01),
+            sac_maximum_action_std=(0.50, 0.50, 0.50, 0.50),
+            recurrent_layers=2,
+        )
+        model = build_sac_actor_critic(21, 4, model_config, device)
+        rollout = TensorDictRolloutCollector(
+            TensorEnv(batch=4, device=device), model, 8
+        ).collect()
+        self.assertEqual(
+            rollout["recurrent_state"].shape, torch.Size([4, 8, 2, 16])
+        )
+        sac = TorchRLSAC(
+            model,
+            SACConfig(
+                gamma=0.99,
+                n_step_return=1,
+                replay_capacity=1024,
+                replay_batch_size=16,
+                warmup_transitions=16,
+                updates_per_collection=1,
+                actor_learning_rate=3e-4,
+                critic_learning_rate=3e-4,
+                alpha_learning_rate=3e-4,
+                actor_max_grad_norm=1.0,
+                critic_max_grad_norm=5.0,
+                target_tau=0.005,
+                target_update_interval=1,
+                initial_alpha=0.1,
+                target_entropy="auto",
+                min_alpha=None,
+                max_alpha=None,
+                replay_sequence_length=2,
+                replay_burn_in_steps=2,
+            ),
+            device,
+        )
+        metrics = sac.update(rollout)
+        self.assertEqual(sac.replay_size, 32)
+        self.assertEqual(float(metrics["sac_updates"]), 1.0)
+        self.assertEqual(float(metrics["sac_actor_updates_total"]), 1.0)
+        self.assertTrue(torch.isfinite(metrics["loss_actor"]))
+        self.assertTrue(torch.isfinite(metrics["loss_qvalue"]))
+        state = sac.state_dict()
+        restored_model = build_sac_actor_critic(
+            21, 4, model_config, device
+        )
+        restored = TorchRLSAC(restored_model, sac.config, device)
+        restored.load_state_dict(state)
+        restored_metrics = restored.update(rollout)
+        self.assertEqual(restored.replay_size, 64)
+        self.assertEqual(
+            float(restored_metrics["sac_actor_updates_total"]), 2.0
+        )
+        self.assertTrue(torch.isfinite(restored_metrics["loss_actor"]))
+
+    def test_gru_sac_burn_in_rebuilds_detached_initial_states(self):
+        device = torch.device("cpu")
+        model_config = ModelConfig(
+            (8, 8),
+            8,
+            8,
+            architecture="gru",
+            sac_initial_action_std=(0.10, 0.10, 0.10, 0.10),
+            sac_minimum_action_std=(0.01, 0.01, 0.01, 0.01),
+            sac_maximum_action_std=(0.50, 0.50, 0.50, 0.50),
+            recurrent_layers=2,
+        )
+        model = build_sac_actor_critic(21, 4, model_config, device)
+        sac = TorchRLSAC(
+            model,
+            SACConfig(
+                gamma=0.99,
+                n_step_return=1,
+                replay_capacity=128,
+                replay_batch_size=8,
+                warmup_transitions=8,
+                updates_per_collection=1,
+                actor_learning_rate=3e-4,
+                critic_learning_rate=3e-4,
+                alpha_learning_rate=3e-4,
+                actor_max_grad_norm=1.0,
+                critic_max_grad_norm=5.0,
+                target_tau=0.005,
+                target_update_interval=1,
+                initial_alpha=0.1,
+                target_entropy="auto",
+                min_alpha=None,
+                max_alpha=None,
+                replay_sequence_length=2,
+                replay_burn_in_steps=2,
+            ),
+            device,
+        )
+        observation = torch.randn(2, 4, 21)
+        next_observation = torch.randn(2, 4, 21)
+        batch = TensorDict(
+            {
+                "observation": observation,
+                "action": torch.zeros(2, 4, 4),
+                "is_init": torch.zeros(2, 4, 1, dtype=torch.bool),
+                "next": TensorDict(
+                    {
+                        "observation": next_observation,
+                        "reward": torch.zeros(2, 4, 1),
+                        "done": torch.zeros(2, 4, 1, dtype=torch.bool),
+                        "terminated": torch.zeros(
+                            2, 4, 1, dtype=torch.bool
+                        ),
+                        "truncated": torch.zeros(
+                            2, 4, 1, dtype=torch.bool
+                        ),
+                        "valid": torch.ones(2, 4, 1, dtype=torch.bool),
+                        "is_init": torch.zeros(
+                            2, 4, 1, dtype=torch.bool
+                        ),
+                    },
+                    batch_size=[2, 4],
+                ),
+            },
+            batch_size=[2, 4],
+        )
+        with set_recurrent_mode(True):
+            train = sac._prepare_recurrent_batch(batch)
+        self.assertEqual(train.batch_size, torch.Size([2, 2]))
+        root_state = train["recurrent_state"]
+        next_state = train[("next", "recurrent_state")]
+        self.assertEqual(root_state.shape, torch.Size([2, 2, 2, 8]))
+        self.assertFalse(root_state.requires_grad)
+        self.assertFalse(next_state.requires_grad)
+        self.assertTrue(torch.count_nonzero(root_state[:, 0]) > 0)
+        self.assertTrue(torch.count_nonzero(next_state[:, 0]) > 0)
+        self.assertEqual(torch.count_nonzero(root_state[:, 1]), 0)
+        self.assertEqual(torch.count_nonzero(next_state[:, 1]), 0)
 
     def test_sac_policy_starts_at_zero_mean_with_bounded_configured_std(self):
         config = load_experiment_config(
@@ -179,6 +718,7 @@ class TensorTrainingTests(unittest.TestCase):
                 min_alpha=1e-4,
                 max_alpha=1.0,
                 critic_pretraining_updates=2,
+                actor_update_interval=2,
             ),
             device,
         )
@@ -212,7 +752,8 @@ class TensorTrainingTests(unittest.TestCase):
         restored_metrics = restored.update(rollout)
         self.assertEqual(restored.replay_size, 32)
         self.assertEqual(float(restored_metrics["sac_critic_pretraining"]), 0.0)
-        self.assertEqual(float(restored_metrics["sac_actor_updates_total"]), 2.0)
+        self.assertEqual(float(restored_metrics["sac_actor_updates"]), 1.0)
+        self.assertEqual(float(restored_metrics["sac_actor_updates_total"]), 1.0)
         self.assertTrue(torch.isfinite(restored_metrics["loss_actor"]))
 
     def test_sac_n_step_return_crosses_rollout_boundary_and_shifts_terminal(self):
@@ -590,6 +1131,54 @@ class TensorTrainingTests(unittest.TestCase):
         self.assertEqual(result.reward.shape, (8, 1))
         self.assertEqual(result.terminated.shape, (8, 1))
         self.assertEqual(result.reward.device, torch.device("cpu"))
+
+    def test_reward_terms_log_alive_and_sum_to_total_reward(self):
+        calculator = AttitudeRewardCalculator(
+            {
+                "roll_pitch_weight": 0.0,
+                "tilt_weight": 0.0,
+                "yaw_rate_weight": 0.0,
+                "angular_rate_weight": 0.0,
+                "action_rate_weight": 0.0,
+                "saturation_weight": 0.0,
+                "alive_bonus": 0.05,
+                "survival_progress_weight": 0.4,
+                "termination_penalty": 2.0,
+                "early_termination_penalty": 1.0,
+            }
+        )
+        context = TensorDict(
+            {
+                "attitude_geodesic_rad": torch.zeros(2, 1),
+                "roll_pitch_error_rad": torch.zeros(2, 2),
+                "yaw_rate_error_rad_s": torch.zeros(2, 1),
+                "tilt_rad": torch.zeros(2, 1),
+                "angular_velocity_b": torch.zeros(2, 3),
+                "action": torch.zeros(2, 4),
+                "previous_action": torch.zeros(2, 4),
+                "terminated": torch.tensor([[False], [True]]),
+                "tilt_ratio": torch.zeros(2, 1),
+                "rate_ratio": torch.zeros(2, 1),
+                "episode_age_fraction": torch.tensor([[0.25], [0.75]]),
+                "episode_remaining_fraction": torch.tensor(
+                    [[0.75], [0.25]]
+                ),
+            },
+            batch_size=[2],
+        )
+        output = calculator(context)
+        torch.testing.assert_close(
+            output.terms["reward.alive"],
+            torch.full((2, 1), 0.05),
+        )
+        torch.testing.assert_close(
+            output.terms["reward.survival"],
+            torch.tensor([[0.10], [0.30]]),
+        )
+        term_sum = torch.stack(
+            list(output.terms.values()), dim=0
+        ).sum(dim=0)
+        torch.testing.assert_close(term_sum, output.reward)
 
     def test_reward_calculator_can_read_declared_environment_tensor(self):
         class DomainReward:

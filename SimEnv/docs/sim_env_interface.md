@@ -305,7 +305,7 @@ sensors:
 | 字段 | shape | 单位 | 加噪前理想值 |
 | --- | --- | --- | --- |
 | `gyro` | `[B,3]` | rad/s | `angular_velocity_b`，机体系角速度 |
-| `accelerometer` | `[B,3]` | m/s^2 | `R_bw * (linear_acceleration_n - gravity_n)`，机体系比力；NED 下 `gravity_n=[0,0,9.80665]` |
+| `accelerometer` | `[B,3]` | m/s^2 | `force_b / body.mass`，质心处机体系非重力比力；与同一物理步的力严格对齐 |
 | `motor_speed` | `[B,2]` | rad/s | 两台电机的实际 `motor_speed` |
 
 - 未声明的传感器名称必须在创建时失败，不能猜测其真值来源或单位。

@@ -532,9 +532,13 @@ class SimulationEnvironment:
         zeros_grid = torch.zeros(
             (count, 3, 3), dtype=self.dtype, device=self.device
         )
+        gravity_n = zeros_3.clone()
+        gravity_n[:, 2] = 9.80665
         return {
             **{name: value.clone() for name, value in initial_state.items()},
-            "linear_acceleration_n": zeros_3.clone(),
+            # 初始执行器速度和气动力均为零，因此初态质心立即处于自由落体；
+            # 真值加速度从 NED 重力开始，而不是在第一个物理步前暂时为零。
+            "linear_acceleration_n": gravity_n,
             "angular_acceleration_b": zeros_3.clone(),
             "motor_speed": zeros_2.clone(),
             "effective_motor_speed": zeros_2.clone(),

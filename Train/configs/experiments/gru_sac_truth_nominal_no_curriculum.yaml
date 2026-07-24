@@ -1,0 +1,186 @@
+# 双层 128 单元 GRU-SAC 标称真值训练。
+#
+# 启动：
+#   flight-train run \
+#     --config configs/experiments/gru_sac_truth_nominal_no_curriculum.yaml
+#
+# 观测沿用 attitude_self_stabilize_21d_v3：
+#   17 维姿态/角速度/加速度/执行器/指令真值 + 4 维上一策略输出。
+# 不配置 episode_curriculum，因此从第一回合起直接使用 30 s episode 和完整指令范围。
+
+schema_version: 2
+
+experiment:
+  name: gru_sac_truth_nominal_no_curriculum
+  entrypoint:
+    type: "flight_train.runner:run_experiment"
+    version: "train-framework-v1"
+
+seed:
+  base: 20260724
+  deterministic_algorithms: true
+  cudnn_benchmark: false
+
+run:
+  device: cuda:0
+  dtype: float32
+  parallel_count: 256
+  total_control_steps: 16777216
+  output_root: ../../runs
+  allow_unimplemented_simulator: false
+
+environment:
+  factory: "simenv:SimulationEnvironment"
+  config_path: ../environment/gru_sac_truth_nominal_no_randomization.yaml
+  observation_source: truth
+
+command_source:
+  type: "flight_train.commands:VirtualPilotCommandSource"
+  version: "2"
+  seed: 51024
+  params:
+    throttle:
+      minimum: 0.20
+      maximum: 0.85
+      spool:
+        duration_s: 0.10
+        target_range: [0.54, 0.58]
+      height_controller:
+        observation_source: truth
+        target_m: 0.0
+        initial_throttle_range: [0.55, 0.58]
+        proportional_gain: 0.08
+        integral_gain: 0.04
+        error_limit_m: 5.0
+      slew_rate:
+        rise_per_s: 4.0
+        fall_per_s: 0.35
+    sticks:
+      roll:  {mode: angle, limit_rad: 0.10, time_constant_s: 0.20}
+      pitch: {mode: angle, limit_rad: 0.10, time_constant_s: 0.20}
+      yaw:   {mode: rate, limit_rad_s: 0.35, time_constant_s: 0.30}
+      target_sampling:
+        distribution: centered
+        center_exponent: 2.0
+        hold_duration_s:
+          range: [2.0, 4.0]
+      reset:
+        filtered_stick: zero
+        initial_target_scale: 1.0
+
+control_contract:
+  version: self_stabilize_v1
+  observation_profile: attitude_self_stabilize_21d_v3
+  action_transform:
+    type: residual_around_trim
+    trim_command: [0.53523, 0.0, 0.0, 0.0]
+    residual_scale: [0.30, 1.0, 1.0, 1.0]
+  policy_action:
+    fields: [lower_motor, servo_1, servo_2, servo_3]
+  external_action:
+    fields: [upper_motor]
+  simulator_command:
+    fields: [upper_motor, lower_motor, servo_1, servo_2, servo_3]
+
+# Train 层不进行 episode 级参数随机化，也不向 SimEnv 下发动态随机化。
+randomization:
+  static:
+    seed: 31024
+    scope: episode
+    parameters: {}
+  dynamic:
+    seed: 41024
+    scope: simulator
+    parameters: {}
+
+task:
+  episode_duration_s: 30.0
+  termination:
+    max_tilt_rad: 1.0
+    max_angular_rate_rad_s: 8.0
+
+reward:
+  calculator:
+    type: "flight_train.rewards.attitude:AttitudeRewardCalculator"
+    version: "3"
+    params:
+      roll_pitch_weight: 0.1
+      tilt_weight: 0.02
+      yaw_rate_weight: 0.0005
+      angular_rate_weight: 0.0005
+      action_rate_weight: 0.0001
+      saturation_weight: 0.0002
+      alive_bonus: 0.05
+      survival_progress_weight: 0.0
+      tilt_barrier_weight: 0.10
+      rate_barrier_weight: 0.005
+      barrier_start_fraction: 0.30
+      barrier_exponent: 2.0
+      termination_penalty: 10.0
+      early_termination_penalty: 0.0
+  context:
+    fields:
+      - {name: attitude_geodesic_rad, source: task}
+      - {name: angular_velocity_b, source: truth}
+      - {name: static_domain, source: train_randomizer, visibility: reward_only}
+
+model:
+  type: gru_actor_critic
+  encoder:
+    hidden_sizes: [128, 128]
+  recurrent:
+    hidden_sizes: [128, 128]
+  actor_head:
+    hidden_sizes: [128]
+  policy_distribution:
+    learnable_action_std: true
+    initial_action_std: [0.10, 0.1, 0.1, 0.1]
+    minimum_action_std: [0.01, 0.02, 0.02, 0.02]
+    maximum_action_std: [0.30, 0.20, 0.20, 0.20]
+
+algorithm:
+  name: sac
+  gamma: 0.999
+  n_step_return: 1
+  replay:
+    capacity_transitions: 1048576
+    warmup_transitions: 65536
+    # 每次抽取 128 步预热隐状态，再用后 128 步计算 SAC loss。
+    # 500 Hz 下分别对应 256 ms，总连续上下文为 512 ms。
+    batch_size: 4096
+    burn_in_steps: 128
+    sequence_length: 128
+  critic_pretraining_updates: 0
+  updates_per_collection: 32
+  target_update:
+    tau: 0.005
+    interval_updates: 1
+  entropy:
+    automatic: true
+    initial_alpha: 0.10
+    target_entropy: auto
+  actor_max_grad_norm: 1.0
+  critic_max_grad_norm: 5.0
+  optimizer:
+    type: adam
+    actor_learning_rate: 0.0003
+    critic_learning_rate: 0.0003
+    alpha_learning_rate: 0.0003
+
+collector:
+  # 至少覆盖一条完整 replay 样本（128 burn-in + 128 train）。
+  control_steps_per_rollout: 256
+
+evaluation:
+  enabled: true
+  interval_control_steps: 4194304
+  suite_path: ../evaluation/fixed_attitude_v1.yaml
+
+checkpoint:
+  resume:
+    from: null
+    mode: exact
+  interval_control_steps: 2097152
+  keep_last: 4
+
+recording: {}

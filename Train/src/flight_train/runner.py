@@ -94,6 +94,7 @@ def _rollout_diagnostic_metrics(
             episode_length >= seconds * control_hz
         ).to(torch.float32).mean()
     for reward_key in (
+        "reward.alive",
         "reward.attitude",
         "reward.tilt",
         "reward.yaw_rate",
@@ -291,11 +292,16 @@ def run_experiment(config: ExperimentConfig) -> dict[str, Any]:
                 **_rollout_diagnostic_metrics(rollout, env.spec.control_hz),
             }
             exploration_std_for = getattr(model, "exploration_std_for", None)
-            exploration_std = (
-                exploration_std_for(rollout["observation"])
-                if exploration_std_for is not None
-                else model.exploration_std()
-            )
+            if "policy_scale" in rollout.keys():
+                exploration_std = rollout["policy_scale"].reshape(
+                    -1, rollout["policy_scale"].shape[-1]
+                ).mean(dim=0)
+            else:
+                exploration_std = (
+                    exploration_std_for(rollout["observation"])
+                    if exploration_std_for is not None
+                    else model.exploration_std()
+                )
             if exploration_std is not None:
                 for action_index, value in enumerate(exploration_std):
                     metrics[f"exploration_std_action_{action_index}"] = value
@@ -478,6 +484,8 @@ def _checkpoint_state(
         "simulator_state": env.simulator.state_dict(),
         "training_environment": {
             "previous_policy_action": env.previous_action,
+            "observation_history": env.observation_history,
+            "observation_history_index": env.observation_history_index,
             "episode_id": env.episode_id,
             "episode_step": env.episode_step,
             "command_source": env.command_source.state_dict(),
@@ -574,6 +582,30 @@ def _restore_exact(
     if not isinstance(current_static, TensorDictBase):
         raise ValueError("checkpoint static_parameters is missing")
     env.current_static_parameters = tensordict_to_device(current_static, device)
+    stored_history = training.get("observation_history")
+    if stored_history is None:
+        if env.observation_history_capacity != 1:
+            raise ValueError(
+                "checkpoint observation history is missing for a stacked observation"
+            )
+        base_observation, *_ = env._base_observation()
+        env.observation_history[:, 0].copy_(base_observation)
+        env.observation_history_index = 0
+    else:
+        if not isinstance(stored_history, torch.Tensor):
+            raise ValueError("checkpoint observation_history must be a tensor")
+        if (
+            stored_history.shape != env.observation_history.shape
+            or stored_history.dtype != env.observation_history.dtype
+        ):
+            raise ValueError("checkpoint observation_history is incompatible")
+        env.observation_history.copy_(stored_history.to(device))
+        history_index = int(training.get("observation_history_index", -1))
+        if not 0 <= history_index < env.observation_history_capacity:
+            raise ValueError(
+                "checkpoint observation_history_index is incompatible"
+            )
+        env.observation_history_index = history_index
 
     model.actor.load_state_dict(state["actor"])
     if isinstance(algorithm, TorchRLSAC):
@@ -612,4 +644,3 @@ def _copy_training_tensor(
     if value.shape != destination.shape or value.dtype != destination.dtype:
         raise ValueError(f"checkpoint training tensor is incompatible: {name}")
     destination.copy_(value.to(destination.device))
-

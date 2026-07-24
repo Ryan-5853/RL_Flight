@@ -6,7 +6,12 @@ from contextlib import nullcontext
 
 import torch
 from tensordict import TensorDictBase
-from torchrl.data import LazyTensorStorage, MultiStep, TensorDictReplayBuffer
+from torchrl.data import (
+    LazyTensorStorage,
+    MultiStep,
+    SliceSampler,
+    TensorDictReplayBuffer,
+)
 from torchrl.modules import set_recurrent_mode
 from torchrl.objectives import ClipPPOLoss, SACLoss, SoftUpdate
 from torchrl.objectives.utils import ValueEstimators
@@ -155,7 +160,7 @@ RecurrentPPO = TorchRLPPO
 
 
 class TorchRLSAC:
-    """TorchRL MLP-SAC：GPU replay、双 Q、自动温度和软目标网络更新。"""
+    """TorchRL SAC：GPU replay、可选 GRU 序列采样、双 Q 与自动温度。"""
 
     def __init__(
         self,
@@ -201,12 +206,21 @@ class TorchRLSAC:
         self.alpha_optimizer = torch.optim.Adam(
             [self.loss.log_alpha], lr=config.alpha_learning_rate
         )
+        replay_kwargs: dict[str, object] = {}
+        if model.is_recurrent:
+            replay_kwargs["sampler"] = SliceSampler(
+                slice_len=config.replay_sample_length,
+                end_key="replay_boundary",
+                strict_length=True,
+                use_gpu=(device if device.type == "cuda" else False),
+            )
         self.replay = TensorDictReplayBuffer(
             storage=LazyTensorStorage(
                 config.replay_capacity,
                 device=device,
             ),
             batch_size=config.replay_batch_size,
+            **replay_kwargs,
         )
         self.gradient_updates = 0
         self.actor_updates = 0
@@ -231,7 +245,7 @@ class TorchRLSAC:
             raise ValueError(
                 f"SAC rollout must have [B,T] batch dimensions, got {rollout.batch_size}"
             )
-        raw = rollout.select(
+        replay_keys: list[str | tuple[str, str]] = [
             "observation",
             "action",
             ("next", "observation"),
@@ -240,8 +254,10 @@ class TorchRLSAC:
             ("next", "terminated"),
             ("next", "truncated"),
             ("next", "valid"),
-            strict=True,
-        ).clone(False)
+        ]
+        if self.model.is_recurrent:
+            replay_keys.extend(("is_init", ("next", "is_init")))
+        raw = rollout.select(*replay_keys, strict=True).clone(False)
         # 数值无效的仿真转移必须终止多步累计，并禁止从无效 next observation
         # bootstrap。正常的 time-limit truncated 仍保留 terminated=False。
         invalid = ~raw[("next", "valid")]
@@ -283,7 +299,10 @@ class TorchRLSAC:
             + steps.to(torch.long)
             - 1
         ).clamp_max(time - 1)
-        for key in ("done", "terminated", "truncated", "valid"):
+        endpoint_keys = ["done", "terminated", "truncated", "valid"]
+        if self.model.is_recurrent:
+            endpoint_keys.append("is_init")
+        for key in endpoint_keys:
             value = raw[("next", key)]
             gather_index = endpoint
             while gather_index.ndim < value.ndim:
@@ -293,7 +312,7 @@ class TorchRLSAC:
                 value, dim=1, index=gather_index
             )
 
-        transitions = transitions[:, :complete_count].select(
+        selected_keys: list[str | tuple[str, str]] = [
             "observation",
             "action",
             "steps_to_next_obs",
@@ -303,6 +322,20 @@ class TorchRLSAC:
             ("next", "terminated"),
             ("next", "truncated"),
             ("next", "valid"),
+        ]
+        transitions = transitions[:, :complete_count]
+        if self.model.is_recurrent:
+            # replay 以 [env0 的整段, env1 的整段, ...] 展平。专用边界既包含
+            # 真实 episode 结束，也包含本次可写片段末端，禁止 SliceSampler
+            # 跨环境或跨不连续 collector 片段拼接伪序列。
+            replay_boundary = transitions[("next", "done")].clone()
+            replay_boundary[:, -1] = True
+            transitions["replay_boundary"] = replay_boundary
+            selected_keys.extend(
+                ("is_init", ("next", "is_init"), "replay_boundary")
+            )
+        transitions = transitions.select(
+            *selected_keys,
             strict=True,
         ).reshape(-1)
         valid = transitions[("next", "valid")].squeeze(-1)
@@ -333,6 +366,7 @@ class TorchRLSAC:
                     self.replay_size, device=self.device, dtype=torch.float32
                 ),
                 "sac_updates": zero,
+                "sac_actor_updates": zero,
                 "sac_warmup": torch.ones((), device=self.device),
                 "sac_critic_pretraining": zero,
                 "sac_critic_updates_total": torch.tensor(
@@ -355,84 +389,106 @@ class TorchRLSAC:
 
         aggregate: dict[str, torch.Tensor] = {}
         updates = self.config.updates_per_collection
-        for update_index in range(updates):
-            batch = self.replay.sample().to(self.device)
-            # actor 只能读取已经完成当前 critic 更新后的 Q；warm-up 数据达到
-            # 阈值并不代表随机初始化的 critic 已经学会了动力学。
-            actor_enabled = (
-                self.gradient_updates
-                >= self.config.critic_pretraining_updates
-            )
-            critic_loss_td = self.loss(batch)
-            critic_objective = critic_loss_td["loss_qvalue"]
-            if not bool(torch.isfinite(critic_objective).all()):
-                raise FloatingPointError("SAC critic objective is non-finite")
-            self.actor_optimizer.zero_grad(set_to_none=True)
-            self.critic_optimizer.zero_grad(set_to_none=True)
-            self.alpha_optimizer.zero_grad(set_to_none=True)
-            critic_objective.backward()
-            critic_grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.critic_parameters, self.config.critic_max_grad_norm
-            )
-            if not bool(torch.isfinite(torch.as_tensor(critic_grad_norm)).all()):
-                raise FloatingPointError("SAC critic gradient norm is non-finite")
-            self.critic_optimizer.step()
-            self.gradient_updates += 1
-            if self.gradient_updates % self.config.target_update_interval == 0:
-                self.target_updater.step()
-
-            actor_grad_norm = zero.clone()
-            actor_loss = zero.clone()
-            alpha_loss = zero.clone()
-            entropy = critic_loss_td["entropy"].detach()
-            if actor_enabled:
-                # critic 已先完成本轮更新；重新前向，避免 actor 沿旧 Q 梯度移动。
-                actor_loss_td = self.loss(batch)
-                actor_objective = (
-                    actor_loss_td["loss_actor"]
-                    + actor_loss_td["loss_alpha"]
-                )
-                if not bool(torch.isfinite(actor_objective).all()):
-                    raise FloatingPointError("SAC actor objective is non-finite")
-                self.actor_optimizer.zero_grad(set_to_none=True)
-                self.alpha_optimizer.zero_grad(set_to_none=True)
-                actor_objective.backward()
-                actor_grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self.actor_parameters, self.config.actor_max_grad_norm
-                )
-                if not bool(
-                    torch.isfinite(torch.as_tensor(actor_grad_norm)).all()
-                ):
-                    raise FloatingPointError(
-                        "SAC actor gradient norm is non-finite"
+        actor_updates_this_call = 0
+        recurrent_context = (
+            set_recurrent_mode(True)
+            if self.model.is_recurrent
+            else nullcontext()
+        )
+        with recurrent_context:
+            for update_index in range(updates):
+                batch = self.replay.sample().to(self.device)
+                if self.model.is_recurrent:
+                    batch = batch.reshape(
+                        -1, self.config.replay_sample_length
                     )
-                self.actor_optimizer.step()
-                self.alpha_optimizer.step()
-                self.actor_updates += 1
-                actor_loss = actor_loss_td["loss_actor"].detach()
-                alpha_loss = actor_loss_td["loss_alpha"].detach()
-                entropy = actor_loss_td["entropy"].detach()
-
-            scalar_metrics = {
-                "loss_actor": actor_loss,
-                "loss_qvalue": critic_objective.detach(),
-                "loss_alpha": alpha_loss,
-                "alpha": self.loss._alpha.detach(),
-                "entropy": entropy,
-            }
-            for key, value in scalar_metrics.items():
-                aggregate[key] = (
-                    aggregate.get(key, torch.zeros_like(value)) + value
+                    batch = self._prepare_recurrent_batch(batch)
+                critic_loss_td = self.loss(batch)
+                critic_objective = critic_loss_td["loss_qvalue"]
+                if not bool(torch.isfinite(critic_objective).all()):
+                    raise FloatingPointError("SAC critic objective is non-finite")
+                self.actor_optimizer.zero_grad(set_to_none=True)
+                self.critic_optimizer.zero_grad(set_to_none=True)
+                self.alpha_optimizer.zero_grad(set_to_none=True)
+                critic_objective.backward()
+                critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.critic_parameters, self.config.critic_max_grad_norm
                 )
-            aggregate["actor_grad_norm"] = aggregate.get(
-                "actor_grad_norm", zero.clone()
-            ) + torch.as_tensor(actor_grad_norm, device=self.device)
-            aggregate["critic_grad_norm"] = aggregate.get(
-                "critic_grad_norm", zero.clone()
-            ) + torch.as_tensor(critic_grad_norm, device=self.device)
-            if progress_callback is not None:
-                progress_callback(update_index + 1, updates)
+                if not bool(torch.isfinite(torch.as_tensor(critic_grad_norm)).all()):
+                    raise FloatingPointError("SAC critic gradient norm is non-finite")
+                self.critic_optimizer.step()
+                self.gradient_updates += 1
+                if self.gradient_updates % self.config.target_update_interval == 0:
+                    self.target_updater.step()
+
+                actor_grad_norm = zero.clone()
+                actor_loss = zero.clone()
+                alpha_loss = zero.clone()
+                entropy = critic_loss_td["entropy"].detach()
+                # actor 只能读取已经完成当前 critic 更新后的 Q。critic-only
+                # 阶段结束后，再按独立间隔降低策略追逐 Q 外推误差的速度。
+                critic_updates_after_pretraining = (
+                    self.gradient_updates
+                    - self.config.critic_pretraining_updates
+                )
+                actor_enabled = (
+                    critic_updates_after_pretraining > 0
+                    and critic_updates_after_pretraining
+                    % self.config.actor_update_interval
+                    == 0
+                )
+                if actor_enabled:
+                    # critic 已先完成本轮更新；重新前向，避免 actor 沿旧 Q 梯度移动。
+                    actor_loss_td = self.loss(batch)
+                    actor_objective = (
+                        actor_loss_td["loss_actor"]
+                        + actor_loss_td["loss_alpha"]
+                    )
+                    if not bool(torch.isfinite(actor_objective).all()):
+                        raise FloatingPointError("SAC actor objective is non-finite")
+                    self.actor_optimizer.zero_grad(set_to_none=True)
+                    self.alpha_optimizer.zero_grad(set_to_none=True)
+                    actor_objective.backward()
+                    actor_grad_norm = torch.nn.utils.clip_grad_norm_(
+                        self.actor_parameters, self.config.actor_max_grad_norm
+                    )
+                    if not bool(
+                        torch.isfinite(torch.as_tensor(actor_grad_norm)).all()
+                    ):
+                        raise FloatingPointError(
+                            "SAC actor gradient norm is non-finite"
+                        )
+                    self.actor_optimizer.step()
+                    self.alpha_optimizer.step()
+                    self.actor_updates += 1
+                    actor_updates_this_call += 1
+                    actor_loss = actor_loss_td["loss_actor"].detach()
+                    alpha_loss = actor_loss_td["loss_alpha"].detach()
+                    entropy = actor_loss_td["entropy"].detach()
+
+                scalar_metrics = {
+                    "loss_actor": actor_loss,
+                    "loss_qvalue": critic_objective.detach(),
+                    "loss_alpha": alpha_loss,
+                    "alpha": self.loss._alpha.detach(),
+                    "entropy": entropy,
+                }
+                for key, value in scalar_metrics.items():
+                    aggregate[key] = (
+                        aggregate.get(key, torch.zeros_like(value)) + value
+                    )
+                aggregate["actor_grad_norm"] = aggregate.get(
+                    "actor_grad_norm", zero.clone()
+                ) + torch.as_tensor(actor_grad_norm, device=self.device)
+                aggregate["critic_grad_norm"] = aggregate.get(
+                    "critic_grad_norm", zero.clone()
+                ) + torch.as_tensor(critic_grad_norm, device=self.device)
+                if progress_callback is not None:
+                    progress_callback(update_index + 1, updates)
         metrics = {key: value / updates for key, value in aggregate.items()}
+        if actor_updates_this_call:
+            for key in ("loss_actor", "loss_alpha", "actor_grad_norm"):
+                metrics[key] = aggregate[key] / actor_updates_this_call
         metrics.update(
             {
                 "replay_size": torch.tensor(
@@ -440,6 +496,11 @@ class TorchRLSAC:
                 ),
                 "sac_updates": torch.tensor(
                     updates, device=self.device, dtype=torch.float32
+                ),
+                "sac_actor_updates": torch.tensor(
+                    actor_updates_this_call,
+                    device=self.device,
+                    dtype=torch.float32,
                 ),
                 "sac_warmup": zero,
                 "sac_critic_pretraining": torch.tensor(
@@ -468,6 +529,77 @@ class TorchRLSAC:
             }
         )
         return metrics
+
+    def _prepare_recurrent_batch(
+        self, batch: TensorDictBase
+    ) -> TensorDictBase:
+        """用无梯度 burn-in 重建 GRU 状态，只返回参与损失的后半段。
+
+        replay 中不保存采集策略的旧 hidden，避免参数更新后使用陈旧状态。当前
+        actor 分别沿根 observation 和 n-step ``next`` observation 的预热段前向，
+        再把得到的状态作为有效训练段的初始状态。这样 SAC loss 只在
+        ``sequence_length`` 步上计算，梯度也不会穿过 burn-in。
+        """
+
+        burn_in = self.config.replay_burn_in_steps
+        if burn_in == 0:
+            return batch
+        if (
+            batch.ndim != 2
+            or batch.batch_size[1] != self.config.replay_sample_length
+        ):
+            raise ValueError(
+                "recurrent SAC batch must have [N, burn_in_steps + sequence_length] "
+                f"shape, got {batch.batch_size}"
+            )
+
+        with torch.no_grad():
+            root_prefix = batch[:, :burn_in].select(
+                "observation", "is_init", strict=True
+            ).clone(False)
+            self.model.policy_module(root_prefix)
+            root_hidden = root_prefix[("next", "recurrent_state")][
+                :, -1
+            ].detach()
+
+            next_prefix = batch.get("next")[:, :burn_in].select(
+                "observation", "is_init", strict=True
+            ).clone(False)
+            self.model.policy_module(next_prefix)
+            next_hidden = next_prefix[("next", "recurrent_state")][
+                :, -1
+            ].detach()
+
+        train = batch[:, burn_in:].clone(False)
+        train.set(
+            "recurrent_state",
+            self._initial_recurrent_state_sequence(train, root_hidden),
+        )
+        train.get("next").set(
+            "recurrent_state",
+            self._initial_recurrent_state_sequence(train, next_hidden),
+        )
+        return train
+
+    def _initial_recurrent_state_sequence(
+        self,
+        batch: TensorDictBase,
+        initial_state: torch.Tensor,
+    ) -> torch.Tensor:
+        """把单个初始 hidden 放到 GRUModule 约定的序列首位置。"""
+
+        state = torch.zeros(
+            (
+                batch.batch_size[0],
+                batch.batch_size[1],
+                self.model.recurrent_layers,
+                self.model.hidden_size,
+            ),
+            device=self.device,
+            dtype=initial_state.dtype,
+        )
+        state[:, 0] = initial_state
+        return state
 
     def state_dict(self) -> Mapping[str, object]:
         """返回 exact-resume 所需的完整 SAC 状态，包括 replay 内容。"""

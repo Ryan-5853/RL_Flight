@@ -35,6 +35,7 @@ class ActorCritic:
     hidden_size: int
     architecture: str
     exploration_module: "ScheduledNormalParameters | None" = None
+    recurrent_layers: int = 1
 
     @property
     def is_recurrent(self) -> bool:
@@ -57,7 +58,7 @@ class ActorCritic:
         recurrent_state: torch.Tensor | None = None,
         is_init: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """确定性控制单步：`[B,21] -> [B,5]`，GRU 额外返回下一 hidden。"""
+        """确定性控制单步；GRU 额外返回下一 hidden。"""
 
         if observation.ndim != 2:
             raise ValueError("observation must have shape [B, observation_dim]")
@@ -67,7 +68,7 @@ class ActorCritic:
             if recurrent_state is None:
                 recurrent_state = torch.zeros(
                     batch,
-                    1,
+                    self.recurrent_layers,
                     self.hidden_size,
                     dtype=observation.dtype,
                     device=observation.device,
@@ -89,20 +90,21 @@ class ActorCritic:
 
 @dataclass(frozen=True)
 class SACActorCritic:
-    """MLP-SAC 模型：随机 actor 与供 SACLoss 复制为双 Q 的 Q 网络模板。"""
+    """SAC 模型：可选循环 actor 与供 SACLoss 复制的 Q 网络模板。"""
 
     actor: ProbabilisticActor
     qvalue: ValueOperator
     policy_module: TensorDictSequential
     architecture: str = "mlp"
     hidden_size: int = 0
-    recurrent: None = None
+    recurrent: GRUModule | None = None
+    recurrent_layers: int = 1
     critic: None = None
     exploration_module: None = None
 
     @property
     def is_recurrent(self) -> bool:
-        return False
+        return self.recurrent is not None
 
     @torch.no_grad()
     def set_exploration_progress(self, progress: float) -> None:
@@ -117,11 +119,12 @@ class SACActorCritic:
         """返回给定观测批次上的逐动作平均策略标准差。"""
 
         flat = observation.reshape(-1, observation.shape[-1])
-        td = TensorDict(
-            {"observation": flat},
-            batch_size=[flat.shape[0]],
-            device=flat.device,
-        )
+        values: dict[str, torch.Tensor] = {"observation": flat}
+        if self.is_recurrent:
+            values["is_init"] = torch.ones(
+                flat.shape[0], 1, device=flat.device, dtype=torch.bool
+            )
+        td = TensorDict(values, batch_size=[flat.shape[0]], device=flat.device)
         self.policy_module(td)
         return td["scale"].mean(dim=0)
 
@@ -131,18 +134,33 @@ class SACActorCritic:
         observation: torch.Tensor,
         recurrent_state: torch.Tensor | None = None,
         is_init: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, None]:
-        del recurrent_state, is_init
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if observation.ndim != 2:
             raise ValueError("observation must have shape [B, observation_dim]")
-        td = TensorDict(
-            {"observation": observation},
-            batch_size=[observation.shape[0]],
-            device=observation.device,
-        )
+        batch = observation.shape[0]
+        values: dict[str, torch.Tensor] = {"observation": observation}
+        if self.is_recurrent:
+            if recurrent_state is None:
+                recurrent_state = torch.zeros(
+                    batch,
+                    self.recurrent_layers,
+                    self.hidden_size,
+                    dtype=observation.dtype,
+                    device=observation.device,
+                )
+            if is_init is None:
+                is_init = torch.zeros(
+                    batch, 1, dtype=torch.bool, device=observation.device
+                )
+            values["recurrent_state"] = recurrent_state
+            values["is_init"] = is_init
+        td = TensorDict(values, batch_size=[batch], device=observation.device)
         with set_exploration_type(ExplorationType.DETERMINISTIC):
             self.actor(td)
-        return td["action"], None
+        next_state = (
+            td[("next", "recurrent_state")] if self.is_recurrent else None
+        )
+        return td["action"], next_state
 
 
 class BoundedNormalParameters(nn.Module):
@@ -291,28 +309,69 @@ def build_sac_actor_critic(
     device: torch.device,
     dtype: torch.dtype = torch.float32,
 ) -> SACActorCritic:
-    """构建 SAC 的可学习方差 actor 和单个 Q 模板。
+    """构建 SAC 的有界随机 actor 和单个 Q 模板。
 
     TorchRL ``SACLoss`` 会把 Q 模板复制为两个独立 Q 网络并维护目标参数。
+    GRU 只用于策略时序特征；双 Q 读取包含上一动作的完整真值观测和当前动作。
+    replay 训练时由算法按连续序列执行截断 BPTT。
     """
 
-    if config.architecture != "mlp":
-        raise ValueError("SAC currently supports MLP policies only")
-    params = TensorDictModule(
-        BoundedNormalParameters(
-            observation_dim=observation_dim,
-            action_dim=action_dim,
-            hidden_sizes=config.encoder_sizes,
-            initial_std=config.sac_initial_action_std,
-            minimum_std=config.sac_minimum_action_std,
-            maximum_std=config.sac_maximum_action_std,
-            learnable_std=config.sac_learnable_action_std,
+    if config.architecture == "mlp":
+        params = TensorDictModule(
+            BoundedNormalParameters(
+                observation_dim=observation_dim,
+                action_dim=action_dim,
+                hidden_sizes=config.encoder_sizes,
+                initial_std=config.sac_initial_action_std,
+                minimum_std=config.sac_minimum_action_std,
+                maximum_std=config.sac_maximum_action_std,
+                learnable_std=config.sac_learnable_action_std,
+                device=device,
+            ),
+            in_keys=["observation"],
+            out_keys=["loc", "scale"],
+        )
+        policy_module = TensorDictSequential(params)
+        recurrent = None
+    elif config.architecture == "gru":
+        encoder = TensorDictModule(
+            MLP(
+                in_features=observation_dim,
+                out_features=config.encoder_sizes[-1],
+                num_cells=list(config.encoder_sizes[:-1]),
+                activation_class=nn.SiLU,
+                activate_last_layer=True,
+                device=device,
+            ),
+            in_keys=["observation"],
+            out_keys=["embedding"],
+        )
+        recurrent = GRUModule(
+            input_size=config.encoder_sizes[-1],
+            hidden_size=config.hidden_size,
+            num_layers=config.recurrent_layers,
+            batch_first=True,
+            in_keys=["embedding", "recurrent_state", "is_init"],
+            out_keys=["recurrent_features", ("next", "recurrent_state")],
             device=device,
-        ),
-        in_keys=["observation"],
-        out_keys=["loc", "scale"],
-    )
-    policy_module = TensorDictSequential(params)
+        )
+        params = TensorDictModule(
+            BoundedNormalParameters(
+                observation_dim=config.hidden_size,
+                action_dim=action_dim,
+                hidden_sizes=(config.actor_head_size,),
+                initial_std=config.sac_initial_action_std,
+                minimum_std=config.sac_minimum_action_std,
+                maximum_std=config.sac_maximum_action_std,
+                learnable_std=config.sac_learnable_action_std,
+                device=device,
+            ),
+            in_keys=["recurrent_features"],
+            out_keys=["loc", "scale"],
+        )
+        policy_module = TensorDictSequential(encoder, recurrent, params)
+    else:
+        raise ValueError(f"unsupported SAC model architecture: {config.architecture}")
     spec = Bounded(
         low=-1.0,
         high=1.0,
@@ -346,6 +405,10 @@ def build_sac_actor_critic(
         actor=actor,
         qvalue=qvalue,
         policy_module=policy_module,
+        architecture=config.architecture,
+        hidden_size=(config.hidden_size if recurrent is not None else 0),
+        recurrent=recurrent,
+        recurrent_layers=config.recurrent_layers,
     )
 
 
@@ -379,7 +442,7 @@ def _build_gru_actor_critic(
     recurrent = GRUModule(
         input_size=config.encoder_sizes[-1],
         hidden_size=config.hidden_size,
-        num_layers=1,
+        num_layers=config.recurrent_layers,
         batch_first=True,
         in_keys=["embedding", "recurrent_state", "is_init"],
         out_keys=["recurrent_features", ("next", "recurrent_state")],
@@ -434,6 +497,7 @@ def _build_gru_actor_critic(
         policy_module=policy_module,
         hidden_size=config.hidden_size,
         architecture="gru",
+        recurrent_layers=config.recurrent_layers,
     )
 
 
@@ -444,7 +508,7 @@ def _build_mlp_actor_critic(
     device: torch.device,
     dtype: torch.dtype,
 ) -> ActorCritic:
-    """构建文档基线 MLP：21 维观测直接映射到动作分布与价值。"""
+    """构建文档基线 MLP：展平观测直接映射到动作分布与价值。"""
 
     exploration = ScheduledNormalParameters(
         observation_dim,
