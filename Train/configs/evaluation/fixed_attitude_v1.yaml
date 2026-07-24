@@ -1,0 +1,54 @@
+schema_version: 1
+name: fixed_attitude_v1
+
+# 固定评测不启用训练层 domain randomization；该 seed 用于模型/高度飞手的确定性随机流。
+seed: 72001
+parallel_count: 8
+output_root: ../../evaluation_runs
+
+scenarios:
+  # 科目一：目标姿态和目标位置都保持初始值，考察自稳悬停与漂移。
+  - name: hover
+    type: hover
+    duration_s: 10.0
+    fixed_euler_deg: [0.0, 0.0, 0.0]
+
+  # 科目二：全程保持固定俯仰姿态，同时以匀速直线作为位置/速度参考。
+  # 自稳策略没有速度外环，因此姿态分和轨迹分会分别报告，便于区分问题来源。
+  - name: constant_translation
+    type: constant_translation
+    duration_s: 12.0
+    fixed_euler_deg: [0.0, 5.0, 0.0]
+    target_velocity_n_m_s: [1.0, 0.0, 0.0]
+
+  # 科目三：roll=A*sin(wt)，pitch=A*cos(wt)，圆轨迹从初始位置出发。
+  - name: circle
+    type: circle
+    duration_s: 16.0
+    fixed_euler_deg: [0.0, 0.0, 0.0]
+    circle_radius_m: 1.0
+    circle_period_s: 8.0
+    roll_amplitude_deg: 6.0
+    pitch_amplitude_deg: 6.0
+
+scoring:
+  # 每项采用线性评分：误差为 0 得 100，达到 bad 阈值得 0，中间线性插值。
+  # 原始指标始终保存在 report.json 中，修改阈值不会丢失可解释性。
+  limits:
+    attitude_rmse_bad_deg: 15.0
+    position_rmse_bad_m: 5.0
+    velocity_rmse_bad_m_s: 3.0
+    action_rms_bad: 1.0
+    action_delta_rms_bad: 0.25
+    saturation_fraction_bad: 0.50
+    response_time_bad_s: 2.0
+    settling_error_deg: 2.0
+    settling_window_s: 0.50
+    phase_lag_max_s: 2.0
+
+  # 科目总分权重；三个科目的总分再做等权平均。
+  weights:
+    survival: 0.35
+    tracking: 0.35
+    action: 0.15
+    response: 0.15

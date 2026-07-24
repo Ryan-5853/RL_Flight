@@ -5,7 +5,7 @@ import queue
 import shutil
 import threading
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 import torch
 
@@ -29,6 +29,10 @@ class TensorChunkLogger:
         self.directory.mkdir(parents=True, exist_ok=False)
         self._chunk_steps = config.chunk_steps
         self._overflow = config.overflow
+        self._mode = config.mode
+        self._physics_step_stride = config.physics_step_stride
+        self._fields = config.fields
+        self._physics_append_count = 0
         self._queue: queue.Queue[object] = queue.Queue(maxsize=config.queue_chunks)
         self._sentinel = object()
         self._buffers: dict[str, torch.Tensor] = {}
@@ -45,6 +49,13 @@ class TensorChunkLogger:
                     "batch_id": batch_id,
                     "instance_ids": instance_ids,
                     "schema_version": raw_config.get("schema_version"),
+                    "logging_mode": config.mode,
+                    "physics_step_stride": config.physics_step_stride,
+                    "timeline_fields": list(config.fields) if config.fields is not None else "all",
+                    "reset_parameters": "selected_instances" if config.mode == "compact" else "full_batch",
+                    "reset_event_storage": (
+                        "sparse_snapshot" if config.mode == "compact" else "full_batch_timeline"
+                    ),
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -59,6 +70,11 @@ class TensorChunkLogger:
         self._thread = threading.Thread(target=self._writer_loop, name=f"simlog-{batch_id}", daemon=True)
         self._thread.start()
 
+    @property
+    def uses_sparse_reset_events(self) -> bool:
+        """Whether masked reset state belongs in its sparse reset snapshot."""
+        return self._mode == "compact"
+
     def record_reset(
         self,
         reset_mask: torch.Tensor,
@@ -67,8 +83,9 @@ class TensorChunkLogger:
         instance_ids: tuple[str, ...],
         config_path: Path,
         parameters: Mapping[str, torch.Tensor],
+        timeline_record: Mapping[str, torch.Tensor] | None = None,
     ) -> None:
-        """Persist one masked reset operation and its candidate parameter batch."""
+        """Persist one masked reset and, in compact mode, its selected post-reset state."""
         self._check_open()
         self._check_writer()
         reset_directory = self.directory / "resets" / f"{self._reset_index:06d}"
@@ -77,24 +94,46 @@ class TensorChunkLogger:
             config_path,
             reset_directory / f"config{config_path.suffix or '.yaml'}",
         )
+        indices = torch.nonzero(reset_mask, as_tuple=False).flatten().cpu().tolist()
+        generation_cpu = generation.detach().cpu()
+        if self._mode == "compact":
+            saved_parameters = {
+                name: value[reset_mask].detach().cpu()
+                for name, value in parameters.items()
+            }
+            saved_generation = generation[reset_mask].detach().cpu()
+            if timeline_record is None:
+                raise LoggingError("compact reset logging requires a post-reset timeline record")
+            saved_timeline = self._select_fields(timeline_record)
+            saved_timeline = {
+                name: value[reset_mask].detach().cpu()
+                for name, value in saved_timeline.items()
+            }
+        else:
+            saved_parameters = {
+                name: value.detach().cpu() for name, value in parameters.items()
+            }
+            saved_generation = generation_cpu
+            saved_timeline = None
+        snapshot = {
+            "reset_mask": reset_mask.detach().cpu(),
+            "parameter_instance_indices": torch.tensor(indices, dtype=torch.int64),
+            "generation": saved_generation,
+            "parameters": saved_parameters,
+        }
+        if saved_timeline is not None:
+            snapshot["post_reset_timeline"] = saved_timeline
         torch.save(
-            {
-                "reset_mask": reset_mask.detach().cpu(),
-                "generation": generation.detach().cpu(),
-                "parameters": {
-                    name: value.detach().cpu() for name, value in parameters.items()
-                },
-            },
+            snapshot,
             reset_directory / "parameters.pt",
         )
-        indices = torch.nonzero(reset_mask, as_tuple=False).flatten().cpu().tolist()
         event = {
             "reset_index": self._reset_index,
             "instance_indices": indices,
             "instances": [
                 {
                     "instance_index": index,
-                    "generation": int(generation[index].item()),
+                    "generation": int(generation_cpu[index].item()),
                     "previous_instance_id": previous_instance_ids[index],
                     "instance_id": instance_ids[index],
                 }
@@ -106,9 +145,35 @@ class TensorChunkLogger:
             stream.write(json.dumps(event, ensure_ascii=False) + "\n")
         self._reset_index += 1
 
-    def append(self, record: Mapping[str, torch.Tensor]) -> None:
+    def append(self, record: Mapping[str, torch.Tensor], *, force: bool = False) -> None:
         self._check_open()
         self._check_writer()
+        if not self._begin_append(force):
+            return
+        self._append_selected(record)
+
+    def append_lazy(
+        self,
+        record_factory: Callable[[], Mapping[str, torch.Tensor]],
+        *,
+        force: bool = False,
+    ) -> None:
+        """仅在本物理步确实需要保存时才构造时间线记录。"""
+
+        self._check_open()
+        self._check_writer()
+        if not self._begin_append(force):
+            return
+        self._append_selected(record_factory())
+
+    def _begin_append(self, force: bool) -> bool:
+        if force:
+            return True
+        self._physics_append_count += 1
+        return self._physics_append_count % self._physics_step_stride == 0
+
+    def _append_selected(self, record: Mapping[str, torch.Tensor]) -> None:
+        record = self._select_fields(record)
         if not self._buffers:
             self._allocate(record)
         if set(record) != set(self._buffers):
@@ -150,6 +215,16 @@ class TensorChunkLogger:
             self._buffers[name] = torch.empty(
                 (self._chunk_steps, *value.shape), dtype=value.dtype, device=value.device
             )
+
+    def _select_fields(
+        self, record: Mapping[str, torch.Tensor]
+    ) -> Mapping[str, torch.Tensor]:
+        if self._fields is None:
+            return record
+        unknown = sorted(set(self._fields) - set(record))
+        if unknown:
+            raise LoggingError(f"unknown configured timeline fields: {unknown}")
+        return {name: record[name] for name in self._fields}
 
     def _snapshot(self, count: int) -> tuple[dict[str, torch.Tensor], torch.cuda.Event | None]:
         first = next(iter(self._buffers.values()))

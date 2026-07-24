@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="RL Flight 轻量化仿真控制台" />
+    <title>RL Flight · Simulation Console</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true"><span></span><span></span></div>
+          <div>
+            <strong>RL FLIGHT</strong>
+            <small>SIMULATION CONSOLE</small>
+          </div>
+        </div>
+
+        <div class="sim-controls" aria-label="仿真控制">
+          <button class="control-button primary" id="runButton" type="button">
+            <span class="icon play-icon" aria-hidden="true"></span>
+            <span id="runLabel">启动仿真</span>
+          </button>
+          <button class="control-button" id="stepButton" type="button">
+            <span class="step-icon" aria-hidden="true">›|</span>单步
+          </button>
+          <button class="control-button" id="resetButton" type="button">
+            <span class="reset-icon" aria-hidden="true">↻</span>重置
+          </button>
+        </div>
+
+        <div class="top-status">
+          <button class="gamepad-top disconnected" id="gamepadTop" type="button" title="查看手柄状态"><i></i><span>NO GAMEPAD</span></button>
+          <div class="connection" id="runtimeConnection"><i></i><span>LOCAL</span></div>
+          <div class="clock" id="clock">--:--:--</div>
+          <button class="icon-button" type="button" aria-label="设置">•••</button>
+        </div>
+      </header>
+
+      <main class="workspace">
+        <aside class="panel left-panel">
+          <div class="panel-heading">
+            <div><span class="eyebrow">TELEMETRY</span><h2>实时运行状态</h2></div>
+            <div class="heading-actions"><span class="live-pill"><i></i>LIVE</span><button class="panel-collapse" id="collapseLeft" type="button" title="收起状态栏">‹</button></div>
+          </div>
+
+          <section class="status-card featured">
+            <div class="card-label"><span>仿真状态</span><span id="simStateLabel">READY</span></div>
+            <div class="state-row">
+              <div class="state-symbol" id="stateSymbol">R</div>
+              <div><strong id="stateTitle">等待启动</strong><small id="stateHint">参数已载入，可以运行</small></div>
+            </div>
+            <div class="progress-track"><span id="episodeProgress"></span></div>
+            <div class="progress-meta"><span>Episode <b id="episodeNumber">0042</b></span><span id="episodeTime">00:00.000 / 30s</span></div>
+          </section>
+
+          <section class="metric-group controller-monitor">
+            <div class="section-title"><span>手柄输入</span><small id="gamepadMonitorState">DISCONNECTED</small></div>
+            <div class="stick-monitor-row">
+              <div class="stick-monitor"><i id="leftStickDot"></i><span>YAW / THROTTLE</span></div>
+              <div class="stick-monitor"><i id="rightStickDot"></i><span>ROLL / PITCH</span></div>
+              <div class="controller-values">
+                <code id="controllerAxesReadout">R +0.00&nbsp; P +0.00<br>Y +0.00&nbsp; T +0.00</code>
+                <button id="openCalibrationLeft" type="button">校准</button>
+              </div>
+            </div>
+          </section>
+
+          <section class="metric-group">
+            <div class="section-title"><span>姿态估计</span><small>BODY FRAME</small></div>
+            <div class="attitude-grid">
+              <div><span>ROLL</span><strong id="rollValue">+0.00°</strong><i class="axis-x"></i></div>
+              <div><span>PITCH</span><strong id="pitchValue">+0.00°</strong><i class="axis-y"></i></div>
+              <div><span>YAW</span><strong id="yawValue">+0.00°</strong><i class="axis-z"></i></div>
+            </div>
+            <div class="quaternion-row"><span>QUATERNION</span><code id="quatValue">[1.000, 0.000, 0.000, 0.000]</code></div>
+          </section>
+
+          <section class="metric-group">
+            <div class="section-title"><span>控制器输出</span><small>5 CHANNELS</small></div>
+            <div class="output-list">
+              <div class="output-item"><span>MOTOR L</span><div class="bar"><i id="motorLBar"></i></div><b id="motorLValue">0.00</b></div>
+              <div class="output-item"><span>MOTOR R</span><div class="bar"><i id="motorRBar"></i></div><b id="motorRValue">0.00</b></div>
+              <div class="output-item"><span>SERVO X</span><div class="bar servo"><i id="servoXBar"></i></div><b id="servoXValue">0.00</b></div>
+              <div class="output-item"><span>SERVO Y</span><div class="bar servo"><i id="servoYBar"></i></div><b id="servoYValue">0.00</b></div>
+              <div class="output-item"><span>SERVO Z</span><div class="bar servo"><i id="servoZBar"></i></div><b id="servoZValue">0.00</b></div>
+            </div>
+          </section>
+
+          <section class="metric-group compact-stats">
+            <div><span>CONTROL RATE</span><strong id="controlRateValue">500 <small>Hz</small></strong></div>
+            <div><span>SIM RATE</span><strong id="simRateValue">5.0 <small>kHz</small></strong></div>
+            <div><span>STEP LATENCY</span><strong id="latencyValue">0.00 <small>ms</small></strong></div>
+            <div><span>ENVIRONMENT</span><strong id="validEnvs">1 <small>/ READY</small></strong></div>
+          </section>
+        </aside>
+
+        <section class="viewport-panel">
+          <div class="viewport-toolbar">
+            <div class="viewport-title">
+              <button class="sidebar-restore" id="toggleLeftPanel" type="button" title="展开或收起左侧栏">☰</button>
+              <div>
+              <span class="eyebrow">WORLD VIEW</span>
+              <h1>飞行器姿态</h1>
+              </div>
+            </div>
+            <div class="view-actions">
+              <button type="button" class="view-button active" data-view="perspective">透视</button>
+              <button type="button" class="view-button" data-view="top">俯视</button>
+              <button type="button" class="view-button" id="gridToggle">网格</button>
+              <button type="button" class="view-button square" id="centerView" aria-label="复位视角">⌖</button>
+              <button class="sidebar-restore" id="toggleRightPanel" type="button" title="展开或收起右侧栏">☷</button>
+            </div>
+          </div>
+
+          <div class="canvas-wrap" id="canvasWrap">
+            <canvas id="sceneCanvas" aria-label="飞行器三维姿态可视化"></canvas>
+            <div class="view-badge"><i></i><span>CAM 01</span><b>FREE VIEW</b></div>
+            <div class="target-card">
+              <span>目标姿态</span>
+              <strong id="targetReadout">R +0.0° &nbsp; P +0.0° &nbsp; Y +0.0°</strong>
+            </div>
+            <div class="moment-legend" id="momentLegend">
+              <div><i class="m1"></i><span>GRID 1</span><b id="moment1Value">0.000 N·m</b></div>
+              <div><i class="m2"></i><span>GRID 2</span><b id="moment2Value">0.000 N·m</b></div>
+              <div><i class="m3"></i><span>GRID 3</span><b id="moment3Value">0.000 N·m</b></div>
+              <div class="total"><i></i><span>RESULTANT</span><b id="momentTotalValue">0.000 N·m</b></div>
+            </div>
+            <div class="canvas-hint">拖拽旋转视角 · 滚轮缩放</div>
+            <div class="axis-legend"><span class="x">X</span><span class="y">Y</span><span class="z">Z↓</span></div>
+          </div>
+
+          <footer class="viewport-footer">
+            <div><span>POSITION</span><code>X&nbsp; 0.000&nbsp;&nbsp; Y&nbsp; 0.000&nbsp;&nbsp; Z&nbsp; 1.240 m</code></div>
+            <div><span>ANGULAR VELOCITY</span><code id="angularVelocity">0.00&nbsp;&nbsp; 0.00&nbsp;&nbsp; 0.00 rad/s</code></div>
+            <div class="runtime-rate"><span>CTRL RATE</span><div><i id="controlPerfBar"></i></div><b id="controlPerfValue">--</b></div>
+          </footer>
+        </section>
+
+        <aside class="panel right-panel">
+          <div class="panel-heading">
+            <div><span class="eyebrow">CONFIGURATION</span><h2>仿真参数</h2></div>
+            <div class="heading-actions"><button class="icon-button small" id="openServerConfig" type="button" title="从服务器目录导入配置">⌁</button><button class="icon-button small" id="restoreDefaults" type="button" title="恢复默认值">↺</button><button class="panel-collapse" id="collapseRight" type="button" title="收起参数栏">›</button></div>
+          </div>
+
+          <div class="parameters" id="parameters">
+            <details open class="controller-settings">
+              <summary><span>输入设备</span><i></i></summary>
+              <div class="detail-body">
+                <div class="device-status disconnected" id="gamepadDeviceStatus">
+                  <i></i>
+                  <div><strong>未检测到手柄</strong><small>连接后按任意按键激活</small></div>
+                </div>
+                <label class="select-field"><span>活动设备</span><select id="gamepadSelect" disabled><option value="">等待设备连接…</option></select></label>
+                <div class="mapping-grid" id="mappingGrid">
+                  <label><span>ROLL</span><select data-channel="roll" disabled></select><button data-invert="roll" type="button" title="反向 Roll">↕</button></label>
+                  <label><span>PITCH</span><select data-channel="pitch" disabled></select><button data-invert="pitch" type="button" title="反向 Pitch">↕</button></label>
+                  <label><span>YAW</span><select data-channel="yaw" disabled></select><button data-invert="yaw" type="button" title="反向 Yaw">↕</button></label>
+                  <label><span>THROTTLE</span><select data-channel="throttle" disabled></select><button data-invert="throttle" type="button" title="反向 Throttle">↕</button></label>
+                </div>
+                <label class="slider-field"><span>输入死区 <output id="deadzoneOut">5%</output></span><input id="gamepadDeadzone" type="range" min="0" max="20" value="5" /></label>
+                <div class="secure-context-note" id="secureContextNote"><i>!</i><span>远程访问需要 HTTPS，浏览器才能读取本机手柄。</span></div>
+                <button class="secondary-action" id="openCalibration" type="button" disabled>校准手柄</button>
+              </div>
+            </details>
+            <div id="configSections"></div>
+          </div>
+
+          <div class="apply-zone">
+            <div class="dirty-indicator" id="dirtyIndicator"><i></i><span>配置尚未生成</span></div>
+            <div class="config-actions"><button class="export-button" id="exportConfig" type="button" title="导出 YAML">⇩</button><button class="apply-button" id="applyButton" type="button">生成配置 <span>⌘ ↵</span></button></div>
+          </div>
+        </aside>
+      </main>
+    </div>
+
+    <div class="modal-backdrop" id="calibrationModal" hidden>
+      <section class="calibration-dialog" role="dialog" aria-modal="true" aria-labelledby="calibrationTitle">
+        <header>
+          <div><span class="eyebrow">CONTROLLER SETUP</span><h2 id="calibrationTitle">手柄校准</h2></div>
+          <button type="button" id="closeCalibration" aria-label="关闭">×</button>
+        </header>
+        <div class="calibration-steps" aria-label="校准进度">
+          <span class="active" data-step-indicator="0"><i>1</i>轴识别</span>
+          <b></b>
+          <span data-step-indicator="1"><i>2</i>中心点</span>
+          <b></b>
+          <span data-step-indicator="2"><i>3</i>确认</span>
+        </div>
+        <div class="calibration-content">
+          <div class="calibration-copy">
+            <span class="step-kicker" id="calibrationKicker">动作 1 / 9</span>
+            <h3 id="calibrationHeading">将左侧油门推到最大</h3>
+            <p id="calibrationDescription">保持在最大位置，然后点击采集。系统将连续采样并自动识别对应轴。</p>
+          </div>
+          <div class="axis-calibration-list" id="axisCalibrationList"></div>
+          <div class="calibration-warning" id="calibrationWarning"><i>i</i><span>默认只识别 Axis 0–3，额外轴和所有按钮不参与校准。</span></div>
+        </div>
+        <footer>
+          <button class="dialog-secondary" id="cancelCalibration" type="button">取消</button>
+          <button class="dialog-primary" id="calibrationNext" type="button">采集此位置</button>
+        </footer>
+      </section>
+    </div>
+    <div class="modal-backdrop" id="serverConfigModal" hidden>
+      <section class="server-config-dialog" role="dialog" aria-modal="true" aria-labelledby="serverConfigTitle">
+        <header>
+          <div><span class="eyebrow">SERVER FILESYSTEM</span><h2 id="serverConfigTitle">从服务器导入配置</h2></div>
+          <button type="button" id="closeServerConfig" aria-label="关闭">×</button>
+        </header>
+        <div class="server-browser-toolbar">
+          <select id="serverConfigRoot" aria-label="服务器配置根目录"></select>
+          <button id="serverConfigUp" type="button" title="上级目录">↑</button>
+          <button id="serverConfigRefresh" type="button" title="刷新目录">↻</button>
+        </div>
+        <div class="server-path" id="serverConfigPath">/</div>
+        <div class="server-file-list" id="serverConfigFiles" role="listbox"></div>
+        <div class="server-browser-status" id="serverConfigStatus"><i></i><span>正在连接服务器配置接口…</span></div>
+        <footer>
+          <button class="dialog-secondary" id="cancelServerConfig" type="button">取消</button>
+          <button class="dialog-primary" id="importServerConfig" type="button" disabled>导入所选配置</button>
+        </footer>
+      </section>
+    </div>
+    <script src="./config.js"></script>
+    <script src="./server-config.js"></script>
+    <script src="./app.js"></script>
+    <script src="./gamepad.js"></script>
+    <script src="./runtime-client.js"></script>
+  </body>
+</html>

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
+from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
-from typing import Literal, Mapping
+from typing import Any, Literal, Mapping
 
 import torch
 
@@ -24,6 +27,9 @@ class SimulationEnvironment:
         parallel_count: int,
         device: torch.device,
         dtype: torch.dtype,
+        *,
+        dynamic_parameter_names: tuple[str, ...] = (),
+        dynamic_seed: int | None = None,
     ) -> None:
         self.parallel_count = parallel_count
         self.batch_shape = torch.Size([parallel_count])
@@ -33,6 +39,8 @@ class SimulationEnvironment:
         self.instance_ids = tuple(str(uuid.uuid4()) for _ in range(parallel_count))
         self._config = materialized
         self._parameters = dict(materialized.parameters)
+        self._dynamic_parameter_names = dynamic_parameter_names
+        self._dynamic_seed = dynamic_seed
         self._truth = self._initialize_truth(materialized.initial_state)
         self._sensor_kernel = TensorSensorKernel(
             tuple(materialized.sensor_state),
@@ -64,6 +72,15 @@ class SimulationEnvironment:
         }
         self._control = torch.zeros((parallel_count, 5), dtype=dtype, device=device)
         self._dynamics = TensorDynamicsKernel(parallel_count, device, dtype)
+        self._dynamics.refresh_parameters(
+            self._parameters, materialized.timing.physics_dt
+        )
+        self._all_active = torch.ones(
+            parallel_count, dtype=torch.bool, device=device
+        )
+        self._zero_event_code = torch.zeros(
+            parallel_count, dtype=torch.int32, device=device
+        )
         self._closed = False
         self._logger = TensorChunkLogger(
             materialized.logging,
@@ -76,6 +93,7 @@ class SimulationEnvironment:
         self._append_log(
             active_mask=torch.zeros_like(self._valid),
             event_code=torch.ones(parallel_count, dtype=torch.int32, device=device),
+            force=True,
         )
 
     @classmethod
@@ -85,6 +103,9 @@ class SimulationEnvironment:
         parallel_count: int,
         device: torch.device | str,
         dtype: torch.dtype = torch.float32,
+        *,
+        dynamic_randomization: Mapping[str, Mapping[str, Any]] | None = None,
+        dynamic_seed: int | None = None,
     ) -> "SimulationEnvironment":
         if isinstance(parallel_count, bool) or not isinstance(parallel_count, int) or parallel_count <= 0:
             raise ConfigurationError("parallel_count must be a positive integer")
@@ -96,7 +117,28 @@ class SimulationEnvironment:
         materialized = load_and_materialize(
             config_path, parallel_count, resolved_device, dtype
         )
-        return cls(materialized, parallel_count, resolved_device, dtype)
+        if dynamic_randomization:
+            parameters = _apply_dynamic_randomization(
+                materialized.parameters,
+                dynamic_randomization,
+                materialized.seed if dynamic_seed is None else dynamic_seed,
+                parallel_count,
+                resolved_device,
+                dtype,
+            )
+            materialized = replace(
+                materialized,
+                seed=materialized.seed if dynamic_seed is None else dynamic_seed,
+                parameters=parameters,
+            )
+        return cls(
+            materialized,
+            parallel_count,
+            resolved_device,
+            dtype,
+            dynamic_parameter_names=tuple((dynamic_randomization or {}).keys()),
+            dynamic_seed=dynamic_seed,
+        )
 
     @property
     def parameters(self) -> Mapping[str, torch.Tensor]:
@@ -110,6 +152,13 @@ class SimulationEnvironment:
     @property
     def sensors_implemented(self) -> bool:
         return self._sensor_kernel.implemented
+
+    @property
+    def log_directory(self) -> Path:
+        """本批次完整物理时间线和 reset 快照所在目录。"""
+
+        self._ensure_open()
+        return self._logger.directory
 
     def observe(
         self,
@@ -141,7 +190,11 @@ class SimulationEnvironment:
         )
 
     def reset(
-        self, reset_mask: torch.Tensor, config_path: str | Path
+        self,
+        reset_mask: torch.Tensor,
+        config_path: str | Path,
+        *,
+        static_parameters: Mapping[str, torch.Tensor] | None = None,
     ) -> ResetResult:
         """Replace selected batch slots using a fully batched candidate config."""
         self._ensure_open()
@@ -159,6 +212,34 @@ class SimulationEnvironment:
         replacement = load_and_materialize(
             config_path, self.parallel_count, self.device, self.dtype
         )
+        if self._dynamic_parameter_names:
+            parameters = dict(replacement.parameters)
+            for name in self._dynamic_parameter_names:
+                parameters[name] = self._parameters[name]
+            replacement = replace(
+                replacement,
+                seed=(replacement.seed if self._dynamic_seed is None else self._dynamic_seed),
+                parameters=parameters,
+            )
+        if static_parameters is not None and len(static_parameters) > 0:
+            parameters = dict(replacement.parameters)
+            for name, candidate in static_parameters.items():
+                if name not in parameters:
+                    raise ConfigurationError(f"unknown static parameter: {name}")
+                expected = parameters[name]
+                if not isinstance(candidate, torch.Tensor):
+                    raise ConfigurationError(f"static parameter {name} must be a Tensor")
+                if candidate.device != self.device or candidate.dtype != self.dtype:
+                    raise ConfigurationError(
+                        f"static parameter {name} must use {self.device}/{self.dtype}"
+                    )
+                if candidate.shape != expected.shape:
+                    raise ConfigurationError(
+                        f"static parameter {name} shape {tuple(candidate.shape)} "
+                        f"does not match {tuple(expected.shape)}"
+                    )
+                parameters[name] = candidate
+            replacement = replace(replacement, parameters=parameters)
         replacement_truth = self._initialize_truth(replacement.initial_state)
         self._validate_reset_compatibility(replacement, replacement_truth)
 
@@ -166,6 +247,9 @@ class SimulationEnvironment:
             self._masked_copy(value, replacement.parameters[name], mask)
         for name, value in self._truth.items():
             self._masked_copy(value, replacement_truth[name], mask)
+        self._dynamics.refresh_parameters(
+            self._parameters, self._config.timing.physics_dt, mask
+        )
         self._sensors = dict(
             self._sensor_kernel.reset(
                 self._sensors, self._truth, self._parameters, mask
@@ -191,6 +275,12 @@ class SimulationEnvironment:
             for current, should_reset in zip(self.instance_ids, selected)
         )
 
+        event_code = torch.where(
+            mask,
+            torch.full_like(self._error_code, 2),
+            torch.full_like(self._error_code, -1),
+        )
+        reset_record = self._log_record(torch.zeros_like(self._valid), event_code)
         self._logger.record_reset(
             reset_mask=mask,
             generation=self._generation,
@@ -198,13 +288,12 @@ class SimulationEnvironment:
             instance_ids=self.instance_ids,
             config_path=replacement.source_path,
             parameters=replacement.parameters,
+            timeline_record=(
+                reset_record if self._logger.uses_sparse_reset_events else None
+            ),
         )
-        event_code = torch.where(
-            mask,
-            torch.full_like(self._error_code, 2),
-            torch.full_like(self._error_code, -1),
-        )
-        self._append_log(torch.zeros_like(self._valid), event_code)
+        if not self._logger.uses_sparse_reset_events:
+            self._logger.append(reset_record, force=True)
         return ResetResult(
             batch_id=self.batch_id,
             reset_mask=mask.clone(),
@@ -279,9 +368,7 @@ class SimulationEnvironment:
             )
             self._append_log(
                 active_mask=commit,
-                event_code=torch.zeros(
-                    self.parallel_count, dtype=torch.int32, device=self.device
-                ),
+                event_code=self._zero_event_code,
             )
 
         completed = steps_advanced == self._config.timing.substeps
@@ -300,6 +387,127 @@ class SimulationEnvironment:
     def flush_logs(self) -> None:
         self._ensure_open()
         self._logger.flush()
+
+    def state_dict(self) -> Mapping[str, Any]:
+        """导出决定未来数值轨迹的完整、版本化仿真状态。
+
+        日志线程、batch UUID 和 instance UUID 只影响产物身份，不参与数值演化，
+        因此不作为可恢复状态；源身份保留为审计元数据。恢复后的新环境继续写入
+        自己的新日志目录，同时物理、执行器、传感器和随机流逐张量连续。
+        """
+
+        self._ensure_open()
+        return {
+            "schema_version": 1,
+            "compatibility": {
+                "parallel_count": self.parallel_count,
+                "dtype": str(self.dtype),
+                "physics_hz": self._config.timing.physics_hz,
+                "control_hz": self._config.timing.control_hz,
+                "config_sha256": self._state_config_sha256(),
+                "dynamic_parameter_names": self._dynamic_parameter_names,
+                "dynamic_seed": self._dynamic_seed,
+            },
+            "source_identity": {
+                "batch_id": self.batch_id,
+                "instance_ids": self.instance_ids,
+            },
+            "parameters": {name: value.clone() for name, value in self._parameters.items()},
+            "truth": {name: value.clone() for name, value in self._truth.items()},
+            "sensors": {name: value.clone() for name, value in self._sensors.items()},
+            "sensor_kernel": self._sensor_kernel.state_dict(),
+            "physics_step": self._physics_step.clone(),
+            "control_step": self._control_step.clone(),
+            "valid": self._valid.clone(),
+            "error_code": self._error_code.clone(),
+            "generation": self._generation.clone(),
+            "instance_seeds": self._instance_seeds.clone(),
+            "random_counters": {
+                name: value.clone() for name, value in self._random_counters.items()
+            },
+            "control": self._control.clone(),
+        }
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        """严格校验并恢复完整仿真状态，允许 checkpoint 张量来自 CPU。"""
+
+        self._ensure_open()
+        if not isinstance(state, Mapping):
+            raise TypeError("simulation state must be a mapping")
+        if int(state.get("schema_version", -1)) != 1:
+            raise ConfigurationError("unsupported simulation state schema")
+        compatibility = state.get("compatibility")
+        if not isinstance(compatibility, Mapping):
+            raise ConfigurationError("simulation state compatibility metadata is missing")
+        expected = {
+            "parallel_count": self.parallel_count,
+            "dtype": str(self.dtype),
+            "physics_hz": self._config.timing.physics_hz,
+            "control_hz": self._config.timing.control_hz,
+            "config_sha256": self._state_config_sha256(),
+            "dynamic_parameter_names": self._dynamic_parameter_names,
+            "dynamic_seed": self._dynamic_seed,
+        }
+        actual = dict(compatibility)
+        actual["dynamic_parameter_names"] = tuple(
+            actual.get("dynamic_parameter_names", ())
+        )
+        if actual != expected:
+            raise ConfigurationError(
+                f"simulation state is incompatible: expected {expected}, got {actual}"
+            )
+
+        parameters = self._validated_tensor_mapping(
+            state.get("parameters"), self._parameters, "parameter", require_finite=True
+        )
+        truth = self._validated_tensor_mapping(
+            state.get("truth"), self._truth, "truth", require_finite=True
+        )
+        sensors = self._validated_tensor_mapping(
+            state.get("sensors"), self._sensors, "sensor", require_finite=True
+        )
+        random_counters = self._validated_tensor_mapping(
+            state.get("random_counters"), self._random_counters, "random counter"
+        )
+        scalar_tensors = {
+            "physics_step": self._validated_tensor(state, "physics_step", self._physics_step),
+            "control_step": self._validated_tensor(state, "control_step", self._control_step),
+            "valid": self._validated_tensor(state, "valid", self._valid),
+            "error_code": self._validated_tensor(state, "error_code", self._error_code),
+            "generation": self._validated_tensor(state, "generation", self._generation),
+            "instance_seeds": self._validated_tensor(state, "instance_seeds", self._instance_seeds),
+            "control": self._validated_tensor(state, "control", self._control, require_finite=True),
+        }
+        try:
+            self._sensor_kernel.validate_parameters(parameters)
+            self._sensor_kernel.load_state_dict(state.get("sensor_kernel", {}))
+        except (TypeError, ValueError) as exc:
+            raise ConfigurationError(str(exc)) from exc
+
+        for name, value in parameters.items():
+            self._parameters[name].copy_(value)
+        self._dynamics.refresh_parameters(
+            self._parameters, self._config.timing.physics_dt
+        )
+        self._sensor_kernel.refresh_parameters(self._parameters)
+        self._truth = {name: value.clone() for name, value in truth.items()}
+        self._sensors = {name: value.clone() for name, value in sensors.items()}
+        for name, value in random_counters.items():
+            self._random_counters[name].copy_(value)
+        self._physics_step.copy_(scalar_tensors["physics_step"])
+        self._control_step.copy_(scalar_tensors["control_step"])
+        self._valid.copy_(scalar_tensors["valid"])
+        self._error_code.copy_(scalar_tensors["error_code"])
+        self._generation.copy_(scalar_tensors["generation"])
+        self._instance_seeds.copy_(scalar_tensors["instance_seeds"])
+        self._control.copy_(scalar_tensors["control"])
+
+        # 在新日志中留下明确的 resume 边界；不修改任何数值状态。
+        self._append_log(
+            active_mask=torch.zeros_like(self._valid),
+            event_code=torch.full_like(self._error_code, 3),
+            force=True,
+        )
 
     def close(self) -> None:
         if self._closed:
@@ -329,7 +537,8 @@ class SimulationEnvironment:
             "linear_acceleration_n": zeros_3.clone(),
             "angular_acceleration_b": zeros_3.clone(),
             "motor_speed": zeros_2.clone(),
-            "motor_thrust": zeros_2.clone(),
+            "effective_motor_speed": zeros_2.clone(),
+            "total_thrust": torch.zeros(count, dtype=self.dtype, device=self.device),
             "motor_torque": zeros_2.clone(),
             "servo_angle": zeros_3.clone(),
             "servo_effective_pwm": zeros_3.clone(),
@@ -359,7 +568,7 @@ class SimulationEnvironment:
 
     def _validate_active_mask(self, mask: torch.Tensor | None) -> torch.Tensor:
         if mask is None:
-            return torch.ones(self.parallel_count, dtype=torch.bool, device=self.device)
+            return self._all_active
         if not isinstance(mask, torch.Tensor):
             raise TypeError("active_mask must be a torch.Tensor")
         if mask.shape != (self.parallel_count,) or mask.dtype != torch.bool or mask.device != self.device:
@@ -409,9 +618,66 @@ class SimulationEnvironment:
     def _simulation_time(self) -> torch.Tensor:
         return self._physics_step.to(self.dtype) * self._config.timing.physics_dt
 
+    def _state_config_sha256(self) -> str:
+        resolved = json.dumps(
+            self._config.raw, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        )
+        return hashlib.sha256(resolved.encode("utf-8")).hexdigest()
+
+    def _validated_tensor_mapping(
+        self,
+        value: Any,
+        reference: Mapping[str, torch.Tensor],
+        label: str,
+        *,
+        require_finite: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        if not isinstance(value, Mapping) or set(value) != set(reference):
+            raise ConfigurationError(f"simulation state {label} fields are incompatible")
+        return {
+            name: self._validated_tensor(
+                value, name, expected, require_finite=require_finite, label=label
+            )
+            for name, expected in reference.items()
+        }
+
+    def _validated_tensor(
+        self,
+        state: Mapping[str, Any],
+        name: str,
+        expected: torch.Tensor,
+        *,
+        require_finite: bool = False,
+        label: str = "field",
+    ) -> torch.Tensor:
+        value = state.get(name)
+        if not isinstance(value, torch.Tensor):
+            raise ConfigurationError(f"simulation state {label} {name} must be a Tensor")
+        if value.shape != expected.shape or value.dtype != expected.dtype:
+            raise ConfigurationError(
+                f"simulation state {label} {name} has incompatible shape/dtype"
+            )
+        if require_finite and not bool(torch.isfinite(value).all().item()):
+            raise ConfigurationError(f"simulation state {label} {name} is non-finite")
+        return value.to(self.device)
+
     def _append_log(
-        self, active_mask: torch.Tensor, event_code: torch.Tensor
+        self,
+        active_mask: torch.Tensor,
+        event_code: torch.Tensor,
+        *,
+        force: bool = False,
     ) -> None:
+        self._logger.append_lazy(
+            lambda: self._log_record(active_mask, event_code),
+            force=force,
+        )
+
+    def _log_record(
+        self,
+        active_mask: torch.Tensor,
+        event_code: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
         record = {
             "physics_step": self._physics_step,
             "control_step": self._control_step,
@@ -425,7 +691,7 @@ class SimulationEnvironment:
         }
         record.update({f"truth.{name}": value for name, value in self._truth.items()})
         record.update({f"sensor.{name}": value for name, value in self._sensors.items()})
-        self._logger.append(record)
+        return record
 
     def _validate_reset_compatibility(
         self,
@@ -475,3 +741,111 @@ class SimulationEnvironment:
     def _ensure_open(self) -> None:
         if self._closed:
             raise EnvironmentClosedError("simulation environment is closed")
+
+
+def _apply_dynamic_randomization(
+    baseline_parameters: Mapping[str, torch.Tensor],
+    specs: Mapping[str, Mapping[str, Any]],
+    seed: int,
+    parallel_count: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Mapping[str, torch.Tensor]:
+    """由 SimEnv 消费 v2 动态随机化规格并生成设备端参数。"""
+
+    parameters = dict(baseline_parameters)
+    for name, spec in specs.items():
+        if name not in parameters:
+            raise ConfigurationError(f"unknown dynamic parameter: {name}")
+        distribution = spec.get("distribution")
+        allowed = {
+            "distribution", "seed_stream", "valid_range", "on_out_of_range", "unit"
+        }
+        if distribution in {"normal", "truncated_normal"}:
+            allowed.add("stddev")
+        elif distribution == "uniform":
+            allowed.add("range")
+        unknown = set(spec) - allowed
+        if unknown:
+            raise ConfigurationError(
+                f"unknown dynamic randomization fields for {name}: {sorted(unknown)}"
+            )
+        if "seed_stream" not in spec:
+            raise ConfigurationError(
+                f"dynamic parameter {name} requires seed_stream"
+            )
+        # 标称值只来自环境配置；动态规格只能描述围绕它的分布。
+        baseline = parameters[name]
+        if baseline.shape[0] != parallel_count:
+            raise ConfigurationError(f"dynamic parameter batch mismatch: {name}")
+        generator = torch.Generator(device=device)
+        digest = hashlib.blake2b(
+            f"{seed}:{spec['seed_stream']}".encode(), digest_size=8
+        ).digest()
+        generator.manual_seed(int.from_bytes(digest, "little") & ((1 << 63) - 1))
+        if distribution in {"normal", "truncated_normal"}:
+            stddev = torch.as_tensor(
+                spec["stddev"], device=device, dtype=dtype
+            ).expand_as(baseline)
+            sampled = baseline + torch.randn(
+                baseline.shape, device=device, dtype=dtype, generator=generator
+            ) * stddev
+            if distribution == "truncated_normal":
+                if "valid_range" not in spec:
+                    raise ConfigurationError(
+                        f"truncated_normal parameter {name} requires valid_range"
+                    )
+                low = torch.as_tensor(
+                    spec["valid_range"][0], device=device, dtype=dtype
+                ).expand_as(baseline)
+                high = torch.as_tensor(
+                    spec["valid_range"][1], device=device, dtype=dtype
+                ).expand_as(baseline)
+                invalid = (sampled < low) | (sampled > high)
+                for _ in range(64):
+                    candidate = baseline + torch.randn(
+                        baseline.shape,
+                        device=device,
+                        dtype=dtype,
+                        generator=generator,
+                    ) * stddev
+                    sampled = torch.where(invalid, candidate, sampled)
+                    invalid = (sampled < low) | (sampled > high)
+                if bool(invalid.any().item()):
+                    raise ConfigurationError(
+                        f"truncated_normal parameter {name} failed after 64 attempts"
+                    )
+        elif distribution == "uniform":
+            low, high = spec["range"]
+            low_tensor = torch.as_tensor(low, device=device, dtype=dtype).expand_as(
+                baseline
+            )
+            high_tensor = torch.as_tensor(high, device=device, dtype=dtype).expand_as(
+                baseline
+            )
+            sampled = low_tensor + torch.rand(
+                baseline.shape, device=device, dtype=dtype, generator=generator
+            ) * (high_tensor - low_tensor)
+        else:
+            raise ConfigurationError(
+                f"unsupported dynamic distribution for {name}: {distribution}"
+            )
+        if "valid_range" in spec:
+            low = torch.as_tensor(
+                spec["valid_range"][0], device=device, dtype=dtype
+            ).expand_as(sampled)
+            high = torch.as_tensor(
+                spec["valid_range"][1], device=device, dtype=dtype
+            ).expand_as(sampled)
+            if distribution != "truncated_normal" and spec.get("on_out_of_range", "fail") == "clamp":
+                sampled = torch.maximum(torch.minimum(sampled, high), low)
+            elif bool(torch.any((sampled < low) | (sampled > high)).item()):
+                raise ConfigurationError(
+                    f"dynamic parameter {name} exceeded valid_range"
+                )
+        if not bool(torch.isfinite(sampled).all().item()):
+            raise ConfigurationError(
+                f"dynamic parameter {name} produced non-finite values"
+            )
+        parameters[name] = sampled
+    return parameters

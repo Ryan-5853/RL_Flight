@@ -1,13 +1,13 @@
 {
   "schema_version": 2,
   "experiment": {
-    "name": "attitude_gru_ppo_smoke",
+    "name": "attitude_mlp_ppo_smoke",
     "entrypoint": {"type": "flight_train.runner:run_experiment", "version": "train-framework-v1"}
   },
-  "seed": {"base": 20260721, "deterministic_algorithms": true, "cudnn_benchmark": false},
+  "seed": {"base": 20260722, "deterministic_algorithms": true, "cudnn_benchmark": false},
   "run": {
     "device": "cpu", "dtype": "float32", "parallel_count": 8,
-    "total_control_steps": 128, "output_root": "../../runs", "allow_unimplemented_simulator": true
+    "total_control_steps": 128, "output_root": "../../runs", "allow_unimplemented_simulator": false
   },
   "environment": {
     "factory": "simenv:SimulationEnvironment",
@@ -15,12 +15,16 @@
     "observation_source": "truth"
   },
   "command_source": {
-    "type": "flight_train.commands:VirtualPilotCommandSource", "version": "2", "seed": 51001,
+    "type": "flight_train.commands:VirtualPilotCommandSource", "version": "2", "seed": 51002,
     "params": {
       "throttle": {
         "minimum": 0.2, "maximum": 0.85,
         "spool": {"duration_s": 1.0, "target_range": [0.3, 0.4]},
-        "height_controller": {"observation_source": "truth", "target_m": 0.0, "initial_throttle_range": [0.48, 0.60], "proportional_gain": 0.08, "integral_gain": 0.04, "error_limit_m": 5.0},
+        "height_controller": {
+          "observation_source": "truth", "target_m": 0.0,
+          "initial_throttle_range": [0.48, 0.60],
+          "proportional_gain": 0.08, "integral_gain": 0.04, "error_limit_m": 5.0
+        },
         "slew_rate": {"rise_per_s": 0.5, "fall_per_s": 0.35}
       },
       "sticks": {
@@ -41,18 +45,25 @@
   },
   "randomization": {
     "static": {
-      "seed": 31001, "scope": "episode", "parameters": {
+      "seed": 31002, "scope": "episode", "parameters": {
         "body.mass": {"range": [-0.1, 0.1], "distribution": "uniform", "mode": "relative", "unit": "ratio", "seed_stream": "static.body.mass"}
       }
     },
     "dynamic": {
-      "seed": 41001, "scope": "simulator", "parameters": {
+      "seed": 41002, "scope": "simulator", "parameters": {
         "sensors.gyro.noise.stddev": {"stddev": [0.0002, 0.0002, 0.0002], "distribution": "normal", "valid_range": [0.0, 0.01], "on_out_of_range": "clamp", "seed_stream": "dynamic.sensor.gyro.noise"}
       }
     }
   },
   "task": {
-    "episode_duration_s": 30.0,
+    "episode_duration_s": 0.032,
+    "episode_curriculum": {
+      "durations_s": [0.008, 0.016, 0.032],
+      "target_scales": [0.0, 0.5, 1.0],
+      "success_fraction": 0.5,
+      "evaluation_episodes_per_env": 0.5,
+      "consecutive_passes": 1
+    },
     "termination": {"max_tilt_rad": 1.3, "max_angular_rate_rad_s": 20.0}
   },
   "reward": {
@@ -64,14 +75,18 @@
     ]}
   },
   "model": {
-    "encoder": {"hidden_sizes": [64, 64]}, "recurrent": {"hidden_size": 64}, "actor_head": {"hidden_sizes": [64]}
+    "type": "mlp_actor_critic",
+    "hidden_sizes": [256, 256, 128],
+    "exploration": {"initial_action_std": [0.12, 0.25, 0.25, 0.25], "final_action_std": [0.03, 0.05, 0.05, 0.05], "decay_control_steps": 96}
   },
   "algorithm": {
-    "name": "recurrent_ppo", "gamma": 0.995, "gae_lambda": 0.95, "clip_epsilon": 0.2,
+    "name": "ppo", "gamma": 0.995, "gae_lambda": 0.95, "clip_epsilon": 0.2,
     "entropy_coefficient": 0.001, "value_coefficient": 0.5, "actor_max_grad_norm": 1.0, "critic_max_grad_norm": 5.0,
-    "epochs_per_rollout": 1, "minibatches": 8, "sequence_length": 8,
+    "epochs_per_rollout": 2, "minibatches": 8, "sequence_length": 1,
     "optimizer": {"type": "adam", "actor_learning_rate": 0.0003, "critic_learning_rate": 0.0001}
   },
   "collector": {"control_steps_per_rollout": 16},
-  "evaluation": {}, "checkpoint": {}, "recording": {}
+  "evaluation": {},
+  "checkpoint": {"interval_control_steps": 32, "keep_last": 2},
+  "recording": {}
 }

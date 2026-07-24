@@ -2,7 +2,7 @@
 
 ## 1. 项目定位
 
-本目录用于完成开源 PX4 飞控的移植、裁剪与改造，并将训练完成的循环神经网络控制器部署到飞控 MCU。最终目标是以神经网络替代传统飞控中的 **controller + control allocation** 链路：网络接收目标姿态、飞行器状态和必要的历史信息，直接输出两路电机与三路舵机的归一化指令。
+本目录用于完成开源 PX4 飞控的移植、裁剪与改造，并将训练完成的循环神经网络控制器部署到飞控 MCU。最终目标是以神经网络替代传统飞控中的姿态 **controller + control allocation** 链路：真实飞手直接控制上桨油门，网络接收飞手姿态命令、当前上桨油门、飞行器状态和必要历史信息，输出下桨电机与三路舵机的归一化指令。
 
 本层位于训练系统与真实执行机构之间，重点解决的不是网络训练，而是以下工程问题：
 
@@ -15,7 +15,11 @@
 
 上层总体方案见 [`../Docs/目标：使用循环神经网络替代传统飞控中的controller+alloc.txt`](../Docs/%E7%9B%AE%E6%A0%87%EF%BC%9A%E4%BD%BF%E7%94%A8%E5%BE%AA%E7%8E%AF%E7%A5%9E%E7%BB%8F%E7%BD%91%E7%BB%9C%E6%9B%BF%E4%BB%A3%E4%BC%A0%E7%BB%9F%E9%A3%9E%E6%8E%A7%E4%B8%AD%E7%9A%84controller%2Balloc.txt)。
 
-> 当前状态：本目录仅建立嵌入层设计说明，尚未引入 PX4 源码、板级配置或模型文件。具体目标 MCU、PX4 版本和工具链确定后，应将它们固定在版本记录中。
+> 当前基线：完整的 PX4 仓库以子模块形式位于 `px4/`，使用项目 fork
+> `Ryan-5853/PX4-Autopilot` 的 `teleai/v1.16.2` 分支，基于 PX4
+> `v1.16.2`。目标飞控板已经确定为 MicoAir H743 V2，项目固件 target 为
+> `micoair_h743-v2_nncontrol`。2026-07-23 已使用 ARM GCC 10.3.1 完成
+> NuttX 硬件固件全量编译验证。
 
 ## 2. 系统边界
 
@@ -24,9 +28,10 @@
 面向 PX4 的外部语义接口至少包含：
 
 - 目标姿态；
+- 当前飞手上桨油门；
 - EKF 输出的实时姿态与角速度；
 - 网络结构要求的其他观测量；
-- 上一时刻动作；
+- 上一时刻 4 维策略动作；
 - 循环网络隐藏状态，以及隐藏状态的复位信号。
 
 按照当前训练方案，候选观测向量为 21 维：
@@ -38,16 +43,21 @@
 | 机体加速度 | 3 | 明确是否包含重力 |
 | 两路电机转速 | 2 | 明确归一化或物理单位 |
 | 目标姿态四元数 | 4 | 与当前姿态使用同一约定 |
-| 上一时刻动作 | 5 | 两路电机、三路舵机 |
+| 当前上桨油门 | 1 | 飞手直接输入，`[0,1]` 映射到模型范围 |
+| 上一时刻策略动作 | 4 | 下桨电机、三路舵机 |
 
 实际部署前必须把输入顺序、单位、范围、坐标系、时间戳策略、归一化参数和异常值处理固化为一份机器可读的模型清单。训练端和固件端不得分别手工维护这些定义。
 
 ### 2.2 本层输出
 
-网络输出 5 维归一化动作：
+网络输出 4 维归一化策略动作：
 
-- 两路电机指令；
+- 一路下桨电机指令；
 - 三路舵机指令。
+
+PX4 命令合成器把真实飞手的上桨油门放在执行器通道 0，再拼接网络的下桨电机和
+三路舵机，形成 5 维执行器命令。网络不得覆盖上桨油门；切换、失效保护和人工接管
+也必须保持该所有权边界。
 
 输出进入硬件驱动前仍需经过确定性的安全后处理，包括有限值检查、限幅、变化率限制、解锁状态检查和失效保护。归一化区间及其到 PWM、DShot 或其他执行器协议的映射由板级执行器配置明确规定。
 
@@ -63,14 +73,14 @@
 ## 3. 目标运行链路
 
 ```text
-目标姿态 ─┐
-          ├─> 观测采集与时间对齐 ─> 预处理/归一化 ─> RNN 前向传播
-EKF/传感器 ┤                                          │
-电机反馈 ──┘                                          v
-                                         安全后处理与动作限幅
-                                                    │
-                                                    v
-                                          PX4 执行器输出驱动
+目标姿态 ───┐
+飞手上桨油门 ├─> 观测采集与时间对齐 ─> 预处理/归一化 ─> RNN 前向传播 ─> 4维策略动作
+EKF/传感器 ──┤                                                               │
+电机反馈 ────┘                                                               v
+飞手上桨油门 ───────────────────────────────────────────────> 命令合成与安全后处理
+                                                                             │
+                                                                             v
+                                                                   PX4 5维执行器输出
 ```
 
 循环网络的隐藏状态属于飞控运行状态，必须明确其生命周期：
@@ -267,7 +277,7 @@ px4_trans/
 ### 阶段 A：基线与接口冻结
 
 - 选定 PX4 版本、目标板、编译器和基础固件配置；
-- 明确 21 维输入与 5 维输出的完整语义；
+- 明确 21 维输入、4 维策略输出和 5 维执行器命令的完整语义与所有权；
 - 定义模型部署包、稳定 C ABI 和黄金测试格式；
 - 在桌面端跑通手写 C 浮点参考实现。
 
@@ -311,3 +321,188 @@ px4_trans/
 - STM32Cube.AI、CMSIS 或其他工具的版本与许可证约束。
 
 这些决策应记录在 `docs/` 下，并与模型清单、固件版本和测试报告建立对应关系，确保每次飞行所使用的软件与模型均可追溯。
+
+## 14. PX4 v1.16.2 / MicoAir H743 V2 编译指南
+
+本项目只使用以下硬件固件 target：
+
+```text
+micoair_h743-v2_nncontrol
+```
+
+该 target 包含传感器、EKF2、日志、遥控输入、Commander 和安全保护，以及项目自定义的
+`nn_control` 模块；传统 PX4 多旋翼/固定翼控制器、Flight Mode Manager 和 Control
+Allocator 均不参与构建。不要再使用 `micoair_h743-v2_default` 或通用 Pixhawk target
+编译本项目固件。
+
+### 14.1 检查源码版本与子模块
+
+从大仓库根目录进入 PX4 子模块：
+
+```bash
+cd px4
+
+git describe --tags --always --dirty
+git branch --show-current
+git status --short
+git submodule status --recursive
+```
+
+当前版本应以 `v1.16.2` 为基线，开发分支为 `teleai/v1.16.2`。`dirty` 表示本地包含本项目
+尚未提交的板级配置或控制器代码，并不等于版本错误。
+
+若递归子模块尚未检出，执行：
+
+```bash
+git submodule sync --recursive
+git submodule update --init --recursive
+```
+
+### 14.2 准备独立 Python 环境
+
+不要让当前 Conda 环境中的 Python 3.13 参与 PX4 构建。项目使用仓库内的 Python 3.10
+虚拟环境：
+
+```bash
+cd px4
+
+python3.10 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install -r Tools/setup/requirements.txt ninja "setuptools<81"
+```
+
+`setuptools<81` 用于保留 PX4 v1.16.2 的 DroneCAN DSDL 编译器需要的
+`pkg_resources`。验证关键 Python 依赖：
+
+```bash
+.venv/bin/python --version
+.venv/bin/python -c 'import menuconfig, kconfiglib, pkg_resources; print("PX4 Python dependencies OK")'
+.venv/bin/ninja --version
+```
+
+再确认 ARM 交叉编译器：
+
+```bash
+arm-none-eabi-gcc --version
+```
+
+若系统没有 ARM 工具链，可在 PX4 仓库中运行：
+
+```bash
+bash ./Tools/setup/ubuntu.sh --no-sim-tools
+```
+
+该安装脚本会使用系统包管理器、网络和 `sudo`。
+
+### 14.3 编译神经网络控制器固件
+
+在 `px4/` 目录中执行以下完整命令：
+
+```bash
+env \
+  CCACHE_DISABLE=1 \
+  MAKEFLAGS= \
+  PATH="$PWD/.venv/bin:$PATH" \
+  PYTHON_EXECUTABLE="$PWD/.venv/bin/python" \
+  make micoair_h743-v2_nncontrol
+```
+
+这里有三项必须保留：
+
+- `PATH` 和 `PYTHON_EXECUTABLE` 强制 CMake 使用仓库内的 Python 3.10 环境；
+- `MAKEFLAGS=` 清除外层 Make jobserver 参数，避免 Ninja 报
+  `Could not initialize jobserver: Invalid file descriptors`；
+- 不在 `make` 后添加外层 `-j"$(nproc)"`，Ninja 会自行进行并行构建。
+
+编译成功后固件位于：
+
+```text
+build/micoair_h743-v2_nncontrol/micoair_h743-v2_nncontrol.px4
+```
+
+2026-07-23 的已验证结果为：
+
+```text
+FLASH:     1046448 B / 1792 KB    57.03%
+AXI_SRAM:    50696 B / 512 KB      9.67%
+```
+
+每次加入模型权重、推理运行时或新的驱动后，都必须重新检查链接器输出中的 Flash 和
+RAM 占用，不能只检查是否生成了 `.px4` 文件。
+
+### 14.4 增量编译、清理与上传
+
+源码修改后，重复第 14.3 节的完整命令即可增量编译。
+
+确实需要清理全部 PX4 构建产物时，在 `px4/` 中执行：
+
+```bash
+make clean
+```
+
+连接 MicoAir H743 V2、进入 Bootloader 后，可使用同一环境直接编译并上传：
+
+```bash
+env \
+  CCACHE_DISABLE=1 \
+  MAKEFLAGS= \
+  PATH="$PWD/.venv/bin:$PATH" \
+  PYTHON_EXECUTABLE="$PWD/.venv/bin/python" \
+  make micoair_h743-v2_nncontrol upload
+```
+
+也可以在 QGroundControl 中选择“自定义固件”，手动上传：
+
+```text
+build/micoair_h743-v2_nncontrol/micoair_h743-v2_nncontrol.px4
+```
+
+### 14.5 烧录后的模块检查
+
+当前 `nn_control` 已编入固件，但尚未设置为开机自动启动。进入 NSH 后执行：
+
+```text
+nn_control start
+nn_control status
+```
+
+检查输入和执行器主题：
+
+```text
+listener vehicle_attitude
+listener vehicle_angular_velocity
+listener vehicle_acceleration
+listener vehicle_local_position
+listener manual_control_setpoint
+listener actuator_motors
+listener actuator_servos
+```
+
+当前神经网络接口仍是安全桩，`NeuralNetworkInterface::run()` 默认返回 `false`，所以
+`actuator_motors` 和 `actuator_servos` 应显示 `NaN` 安全输出。接入并验证真实模型前，
+不得通过临时常量或无条件 `return true` 绕过该保护。
+
+### 14.6 常见构建错误
+
+| 提示或错误 | 原因 | 处理方式 |
+| --- | --- | --- |
+| `No module named 'menuconfig'` | CMake 使用了 Conda 或系统 Python | 使用第 14.3 节的完整命令，并在 `.venv` 中安装 requirements |
+| `kconfiglib is not installed` | 当前构建 Python 缺少 Kconfig 依赖 | 用 `.venv/bin/python` 安装 `Tools/setup/requirements.txt` |
+| `No module named 'pkg_resources'` | 虚拟环境缺少兼容的 setuptools | 执行 `.venv/bin/python -m pip install "setuptools<81"` |
+| `Could not initialize jobserver: Invalid file descriptors` | 外层 `make -j` 参数被传给 Ninja | 去掉 `-j"$(nproc)"` 并设置 `MAKEFLAGS=` |
+| `arm-none-eabi-gcc: command not found` | ARM/NuttX 工具链未安装 | 运行 `Tools/setup/ubuntu.sh --no-sim-tools` |
+| `BOARD_UAVCAN_INTERFACES ... got the value ''` | 基础板声明 UAVCAN 接口，但裁剪配置关闭了 UAVCAN | 当前配置中的预期警告，不影响固件生成 |
+
+排错时优先处理日志中的第一个致命错误。CMake 配置失败后出现的“构建目录不存在”等信息
+通常只是连锁错误。
+
+### 14.7 可复现性与安全注意事项
+
+- 提交或发布前记录 PX4 commit、`git describe`、编译器版本、target 和固件校验和；
+- 固定主仓库和所有递归子模块的 commit，不要无记录地更新子模块；
+- 不提交 `build/`、`.venv/`、日志、模型缓存或编译缓存；
+- 始终显式指定 `.venv`，不要依赖当前终端碰巧激活的 Conda 环境；
+- `nn_control` 当前直接发布 `actuator_motors` 和 `actuator_servos`，不会经过 Control
+  Allocator；
+- 接入真实模型后，必须重新完成无桨、台架、故障注入、SIL/HIL 和执行器映射验证；
+- 在模型、输出映射和失效保护全部验证完成前，不得进行带桨测试。

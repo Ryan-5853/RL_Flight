@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import math
-from typing import Mapping, Protocol
+from typing import Any, Mapping, Protocol
 
 import torch
 
@@ -99,6 +99,14 @@ class TensorSensorKernel:
         self._history: dict[str, torch.Tensor] = {}
         self._capacity: dict[str, int] = {}
         self._subsystem_ids: dict[str, int] = {}
+        self._component_index: dict[str, torch.Tensor] = {}
+        self._sample_period: dict[str, torch.Tensor] = {}
+        self._delay_lower: dict[str, torch.Tensor] = {}
+        self._delay_upper: dict[str, torch.Tensor] = {}
+        self._delay_fraction: dict[str, torch.Tensor] = {}
+        self._gravity_n = torch.tensor(
+            self._GRAVITY_N, dtype=self._dtype, device=self._device
+        )
 
         for name in sensor_names:
             source = self._source(name, truth_state)
@@ -111,6 +119,38 @@ class TensorSensorKernel:
             self._subsystem_ids[name] = int.from_bytes(digest, "little") & (
                 (1 << 62) - 1
             )
+            width = math.prod(source.shape[1:])
+            self._component_index[name] = torch.arange(
+                width, dtype=torch.int64, device=self._device
+            )[None, :]
+        self.refresh_parameters(parameters)
+
+    def refresh_parameters(
+        self,
+        parameters: Mapping[str, torch.Tensor],
+        mask: torch.Tensor | None = None,
+    ) -> None:
+        """缓存传感器采样周期和延迟分解，并支持 masked reset 局部刷新。"""
+
+        for name in self._sensor_names:
+            sample_period = torch.round(
+                self._physics_hz / parameters[f"sensors.{name}.sample_hz"]
+            ).to(torch.int64)
+            delay_steps = parameters[f"sensors.{name}.delay"] * self._physics_hz
+            lower = torch.floor(delay_steps).to(torch.int64)
+            upper = torch.ceil(delay_steps).to(torch.int64)
+            fraction = delay_steps - lower.to(self._dtype)
+            candidates = (
+                ("sample_period", self._sample_period, sample_period),
+                ("delay_lower", self._delay_lower, lower),
+                ("delay_upper", self._delay_upper, upper),
+                ("delay_fraction", self._delay_fraction, fraction),
+            )
+            for _label, cache, candidate in candidates:
+                if mask is None or name not in cache:
+                    cache[name] = candidate
+                else:
+                    cache[name].copy_(torch.where(mask, candidate, cache[name]))
 
     def initial_state(
         self,
@@ -131,6 +171,46 @@ class TensorSensorKernel:
                     f"sensor {name!r} delay requires history length {required}, "
                     f"but the batch capacity is {self._capacity[name]}"
                 )
+
+    def state_dict(self) -> Mapping[str, Any]:
+        """导出影响未来传感器输出的全部延迟历史状态。"""
+
+        return {
+            "schema_version": 1,
+            "sensor_names": self._sensor_names,
+            "physics_hz": self._physics_hz,
+            "capacity": dict(self._capacity),
+            "history": {name: value.clone() for name, value in self._history.items()},
+        }
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        """严格校验并恢复传感器延迟环形缓冲。"""
+
+        if not isinstance(state, Mapping):
+            raise TypeError("sensor-kernel state must be a mapping")
+        if int(state.get("schema_version", -1)) != 1:
+            raise ValueError("unsupported sensor-kernel state schema")
+        if tuple(state.get("sensor_names", ())) != self._sensor_names:
+            raise ValueError("sensor-kernel state changes sensor names or order")
+        if int(state.get("physics_hz", -1)) != self._physics_hz:
+            raise ValueError("sensor-kernel state changes physics_hz")
+        if dict(state.get("capacity", {})) != self._capacity:
+            raise ValueError("sensor-kernel state changes delay-buffer capacity")
+        history = state.get("history")
+        if not isinstance(history, Mapping) or set(history) != set(self._history):
+            raise ValueError("sensor-kernel history fields are incompatible")
+        checked: dict[str, torch.Tensor] = {}
+        for name, current in self._history.items():
+            value = history[name]
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(f"sensor-kernel history {name} must be a Tensor")
+            if value.shape != current.shape or value.dtype != current.dtype:
+                raise ValueError(f"sensor-kernel history {name} has incompatible shape/dtype")
+            if not bool(torch.isfinite(value).all().item()):
+                raise ValueError(f"sensor-kernel history {name} contains non-finite values")
+            checked[name] = value.to(self._device)
+        for name, value in checked.items():
+            self._history[name].copy_(value)
 
     def step(
         self,
@@ -153,15 +233,14 @@ class TensorSensorKernel:
                 self._expand(active_mask, source), source, previous_slot
             )
 
-            sample_period = torch.round(
-                self._physics_hz / parameters[f"sensors.{name}.sample_hz"]
-            ).to(torch.int64)
+            sample_period = self._sample_period[name]
             sample_due = active_mask & (torch.remainder(physics_step, sample_period) == 0)
             delayed = self._delayed_value(name, physics_step, parameters)
             noise = self._normal_noise(
                 instance_seeds,
                 sample_counters[name],
                 self._subsystem_ids[name],
+                self._component_index[name],
                 sensor_state[name].shape[1:],
             )
             measured = (
@@ -183,6 +262,7 @@ class TensorSensorKernel:
         reset_mask: torch.Tensor,
     ) -> Mapping[str, torch.Tensor]:
         self.validate_parameters(parameters)
+        self.refresh_parameters(parameters, reset_mask)
         next_state: dict[str, torch.Tensor] = {}
         for name in self._sensor_names:
             source = self._source(name, truth_state)
@@ -209,14 +289,13 @@ class TensorSensorKernel:
     ) -> torch.Tensor:
         history = self._history[name]
         capacity = self._capacity[name]
-        delay_steps = parameters[f"sensors.{name}.delay"] * self._physics_hz
-        lower_delay = torch.floor(delay_steps).to(torch.int64)
-        upper_delay = torch.ceil(delay_steps).to(torch.int64)
+        lower_delay = self._delay_lower[name]
+        upper_delay = self._delay_upper[name]
         newer_index = torch.remainder(physics_step - lower_delay, capacity)
         older_index = torch.remainder(physics_step - upper_delay, capacity)
         newer = history[self._batch_index, newer_index]
         older = history[self._batch_index, older_index]
-        fraction = delay_steps - lower_delay.to(self._dtype)
+        fraction = self._delay_fraction[name]
         return newer + self._expand(fraction, newer) * (older - newer)
 
     def _normal_noise(
@@ -224,10 +303,9 @@ class TensorSensorKernel:
         seeds: torch.Tensor,
         counters: torch.Tensor,
         subsystem_id: int,
+        component: torch.Tensor,
         tail_shape: torch.Size,
     ) -> torch.Tensor:
-        width = math.prod(tail_shape)
-        component = torch.arange(width, dtype=torch.int64, device=self._device)[None, :]
         base = (
             seeds[:, None]
             ^ ((counters[:, None] + 1) * 6364136223846793005)
@@ -267,10 +345,9 @@ class TensorSensorKernel:
         if name == "motor_speed":
             return truth_state["motor_speed"]
         if name == "accelerometer":
-            gravity_n = torch.as_tensor(
-                self._GRAVITY_N, dtype=self._dtype, device=self._device
+            specific_force_n = (
+                truth_state["linear_acceleration_n"] - self._gravity_n
             )
-            specific_force_n = truth_state["linear_acceleration_n"] - gravity_n
             return self._rotate_world_to_body(
                 truth_state["attitude_q_wb"], specific_force_n
             )

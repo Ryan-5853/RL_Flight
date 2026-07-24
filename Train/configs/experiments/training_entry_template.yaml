@@ -1,0 +1,324 @@
+# =============================================================================
+# RL Flight 训练层入口配置模版（schema v2）
+# =============================================================================
+#
+# 使用方法：
+#   1. 复制本文件，不要直接在模版上记录正式实验：
+#        cp configs/experiments/training_entry_template.yaml \
+#           configs/experiments/my_attitude_mlp_ppo.yaml
+#   2. 修改 experiment.name、seed、随机化范围和训练预算。
+#   3. 先做 CPU 小规模检查：
+#        flight-train run --config configs/experiments/my_attitude_mlp_ppo.yaml
+#   4. 在 V100 上运行时无需修改文件，可使用白名单覆盖：
+#        flight-train run --config configs/experiments/my_attitude_mlp_ppo.yaml \
+#          --device cuda:0 --output-root /path/to/runs
+#
+# 重要约束：
+#   - 本文件描述“训练实验”；environment.config_path 指向另一份 SimEnv 物理配置。
+#   - 所有正式实验必须使用唯一 name，并归档本文件及 SimEnv 配置。
+#   - 下方物理数值是接口/短跑示例，不是已经完成参数辨识的真机数值。
+#   - 当前模版选择 MLP PPO 基线；文末注释给出切换 GRU 的最小修改。
+# =============================================================================
+
+# 训练配置 schema。v2 强制显式声明入口、两级随机化和 RewardCalculator。
+schema_version: 2
+
+experiment:
+  # 实验唯一名称。它也是 runs/<name>/... 的目录名，建议只用字母、数字、下划线。
+  name: attitude_mlp_ppo_template
+
+  # 训练主入口。配置只允许使用注册器白名单中的入口，不能执行任意脚本。
+  entrypoint:
+    type: "flight_train.runner:run_experiment"
+    version: "train-framework-v1"
+
+seed:
+  # 实验主 seed：模型初始化和 PPO minibatch 排列由它确定或派生；飞手命令另用 command_source.seed。
+  base: 20260722
+
+  # 确定性算法便于回归和复现实验；若某个 CUDA kernel 不支持，会直接报错。
+  deterministic_algorithms: true
+
+  # 确定性实验必须关闭 cuDNN benchmark，避免根据运行时测量选择不同 kernel。
+  cudnn_benchmark: false
+
+run:
+  # 模版默认 CPU，便于任何机器先验证配置。正式 V100 训练使用 CLI --device cuda:0。
+  device: cpu
+  dtype: float32
+
+  # 128×256=32768 个 on-policy 样本；先保证策略刷新频率，再优化 GPU 吞吐。
+  parallel_count: 128
+
+  # 全部并行实例累计的控制决策数，不是 episode 数，也不是物理仿真步数。
+  # 模版只跑一个 rollout；正式实验按需要扩大总预算，不扩大单轮 batch。
+  total_control_steps: 32768
+
+  # 相对路径以本配置文件所在目录为基准解析。
+  output_root: ../../runs
+
+  # 正式训练必须拒绝占位动力学/传感器 kernel。当前 SimEnv 已实现，保持 false。
+  allow_unimplemented_simulator: false
+
+environment:
+  # 环境工厂是 manifest/fingerprint 的一部分；当前适配器使用该 SimEnv 类型。
+  factory: "simenv:SimulationEnvironment"
+
+  # 独立的物理模型配置。相对路径同样以本文件所在目录为基准。
+  config_path: ../environment/sim_smoke.json
+
+  # 当前基线用 truth 姿态先验证控制和 PPO 闭环。
+  # 接入 EKF 输出后，student 正式训练应改成 sensor，并确保 SimEnv 发布 attitude_q_wb。
+  observation_source: truth
+
+# 虚拟飞手是训练环境中的外部命令源：它直接控制上桨油门，并产生自稳模式
+# roll/pitch 目标角和 yaw 目标角速度。部署时由真实遥控器输入替换此组件。
+command_source:
+  type: "flight_train.commands:VirtualPilotCommandSource"
+  version: "2"
+  # 必须与 static/dynamic 随机化 seed 不同。
+  seed: 51002
+  params:
+    throttle:
+      # 上桨电机 PWM 的硬边界；该通道不进入 PPO 动作分布。
+      minimum: 0.20
+      maximum: 0.85
+      spool:
+        # reset 后先缓慢升至启动油门，避免瞬时阶跃。
+        duration_s: 1.0
+        target_range: [0.30, 0.40]
+      height_controller:
+        # 允许 VirtualPilot 单独读取高度真值；高度仍不进入策略观测或姿态奖励。
+        observation_source: truth
+        # Train 将 NED position_n.z 取负，得到“向上为正”的高度；默认跟踪 0 m。
+        target_m: 0.0
+        # 每个 episode 采样的前馈工作点；增量式 PI 在此基础上修正上桨油门。
+        initial_throttle_range: [0.48, 0.60]
+        # Δu = Kp*(e-e_prev) + Ki*e*dt，e = target-height。
+        proportional_gain: 0.08
+        integral_gain: 0.04
+        # 控制器内部误差限幅，避免异常高度产生过大瞬时增量。
+        error_limit_m: 5.0
+      slew_rate:
+        # PWM 每秒最大上升/下降量，模拟飞手推杆而不是理想高度 PID。
+        rise_per_s: 0.50
+        fall_per_s: 0.35
+    sticks:
+      # roll/pitch 摇杆映射为姿态角；yaw 摇杆映射为角速度并积分成目标航向。
+      roll:  {mode: angle, limit_rad: 0.35, time_constant_s: 0.20}
+      pitch: {mode: angle, limit_rad: 0.35, time_constant_s: 0.20}
+      yaw:   {mode: rate,  limit_rad_s: 1.50, time_constant_s: 0.30}
+      target_sampling:
+        # 每个实例异步保持一个随机目标；centered 让小杆量更常见。
+        distribution: centered
+        center_exponent: 2.0
+        hold_duration_s:
+          range: [1.0, 4.0]
+      reset:
+        filtered_stick: zero
+        # episode 首段只使用完整随机范围的 25%，降低冷启动难度。
+        initial_target_scale: 0.25
+
+# 明确命令所有权和顺序。字段不完全匹配时配置解析直接失败，防止旧 5 维策略
+# checkpoint 被静默用于新的 4 维自稳策略。
+control_contract:
+  version: self_stabilize_v1
+  observation_profile: attitude_self_stabilize_21d_v3
+  action_transform:
+    # 应先在对应标称 SimEnv 上辨识；以下数值只与随模版提供的标称模型对应。
+    type: residual_around_trim
+    trim_command: [0.5539, 0.0, 0.0, 0.0]
+    residual_scale: [0.30, 1.0, 1.0, 1.0]
+  policy_action:
+    fields: [lower_motor, servo_1, servo_2, servo_3]
+  external_action:
+    fields: [upper_motor]
+  simulator_command:
+    fields: [upper_motor, lower_motor, servo_1, servo_2, servo_3]
+
+randomization:
+  # ---------------------------------------------------------------------------
+  # 静态随机化：由 Train 在 episode reset 时采样。
+  # 它描述“这架飞行器是谁”，一个 episode 内保持不变。
+  # ---------------------------------------------------------------------------
+  static:
+    # 必须与 dynamic.seed 不同。
+    seed: 31002
+    scope: episode
+    parameters:
+      # 字段路径必须与 SimEnv parameters 中的公开路径完全一致。
+      body.mass:
+        distribution: uniform
+        mode: relative
+        range: [-0.10, 0.10]      # 围绕 SimEnv body.mass.value 做 ±10% 扰动。
+        unit: ratio
+        seed_stream: static.body.mass
+
+      # 如需增加质心、惯量等静态随机化，可取消下方示例注释并校准范围。
+      # 每个向量元素分别写 [low, high]，不能只给一个模糊百分比。
+      # body.center_of_mass_b:
+      #   mode: absolute
+      #   range: [[-0.01, 0.01], [-0.01, 0.01], [0.07, 0.09]]
+      #   distribution: uniform
+      #   unit: m
+      #   seed_stream: static.body.center_of_mass
+      # body.inertia_diagonal_b:
+      #   mode: relative
+      #   range: [-0.10, 0.10]
+      #   distribution: uniform
+      #   unit: ratio
+      #   seed_stream: static.body.inertia
+
+  # ---------------------------------------------------------------------------
+  # 动态随机化：规格交给 SimEnv，由 SimEnv 持有 RNG 和动态过程状态。
+  # Train 不得在控制热路径中自行生成传感器噪声。
+  # ---------------------------------------------------------------------------
+  dynamic:
+    seed: 41002
+    scope: simulator
+    parameters:
+      sensors.gyro.noise.stddev:
+        # 围绕 SimEnv 中的三轴噪声标准差添加正态扰动，单位 rad/s。
+        stddev: [0.0002, 0.0002, 0.0002]
+        distribution: normal
+        valid_range: [0.0, 0.01]
+        on_out_of_range: clamp
+        unit: rad/s
+        seed_stream: dynamic.sensor.gyro.noise
+
+task:
+  # 目标文档规定约 30 s；500 Hz 下对应 15000 个控制步。
+  episode_duration_s: 30.0
+  # 生存优先课程：只有当前时长的成功率连续达标，才扩大时长和打杆范围。
+  episode_curriculum:
+    durations_s: [2.0, 5.0, 10.0, 30.0]
+    target_scales: [0.0, 0.15, 0.40, 1.0]
+    success_fraction: 0.80
+    evaluation_episodes_per_env: 1.0
+    consecutive_passes: 2
+
+  termination:
+    # 超过安全姿态/角速度后终止该实例并做 masked reset。
+    # 角速度阈值同时作为 21 维观测中角速度的固定归一化尺度。
+    max_tilt_rad: 1.3
+    max_angular_rate_rad_s: 20.0
+
+reward:
+  # 奖励实现通过注册器注入；更换类型或参数会改变实验 fingerprint。
+  calculator:
+    type: "flight_train.rewards.attitude:AttitudeRewardCalculator"
+    version: "3"
+    params:
+      roll_pitch_weight: 2.0
+      tilt_weight: 2.0
+      yaw_rate_weight: 0.05
+      angular_rate_weight: 0.05
+      action_rate_weight: 0.01
+      saturation_weight: 0.02
+      alive_bonus: 0.0
+      survival_progress_weight: 5.0
+      tilt_barrier_weight: 10.0
+      rate_barrier_weight: 0.50
+      barrier_start_fraction: 0.30
+      barrier_exponent: 2.0
+      termination_penalty: 500.0
+      early_termination_penalty: 2500.0
+
+  # 奖励可读取的公开张量。声明字段不等于把字段暴露给策略 observation。
+  context:
+    fields:
+      - name: attitude_geodesic_rad
+        source: task
+      - name: angular_velocity_b
+        source: sensor
+      - name: static_domain
+        source: train_randomizer
+        visibility: reward_only
+
+model:
+  # MLP 基线：21 维输入、4 维策略动作；上桨油门由虚拟飞手直接控制。
+  type: mlp_actor_critic
+  hidden_sizes: [256, 256, 128]
+  exploration:
+    initial_action_std: [0.12, 0.25, 0.25, 0.25]
+    final_action_std: [0.03, 0.05, 0.05, 0.05]
+    decay_control_steps: 24576
+
+algorithm:
+  # MLP 必须使用 ppo；GRU 配置使用 recurrent_ppo。
+  name: ppo
+
+  # 折扣和 GAE。500 Hz 下单步仅 2 ms，gamma 对有效时间尺度非常敏感。
+  gamma: 0.9995
+  gae_lambda: 0.9985
+
+  # PPO 新旧策略概率比裁剪范围。
+  clip_epsilon: 0.2
+
+  # 探索熵、value loss 和梯度裁剪。
+  entropy_coefficient: 0.0
+  value_coefficient: 0.25
+  actor_max_grad_norm: 1.0
+  critic_max_grad_norm: 5.0
+
+  # 每次 rollout 重复优化的轮数和 minibatch 数。
+  epochs_per_rollout: 4
+  minibatches: 2
+
+  # MLP 没有时间状态，必须为 1；GRU 使用例如 128。
+  sequence_length: 1
+
+  optimizer:
+    type: adam
+    actor_learning_rate: 0.0003
+    critic_learning_rate: 0.0001
+
+collector:
+  # 每个并行实例一次采集的控制步数；总样本数为 B × 此值。
+  # MLP 可自由选择；GRU 时必须能被 sequence_length 整除。
+  control_steps_per_rollout: 256
+
+# evaluation/recording 仍是预留调度接口；checkpoint 已由 runner 实际消费。
+evaluation: {}
+# 精确续训从一个带 .sha256 sidecar 的 checkpoint 启动。正常新实验保持 from: null；
+# 也可以不修改文件，使用 CLI --resume-from /absolute/path/step_N.pt。
+checkpoint:
+  resume:
+    from: null
+    mode: exact
+  # 周期阈值按所有并行环境累计控制步计数；实际保存点向上对齐到 update 安全边界。
+  # 设为 null 表示只保存最终 checkpoint；SIGINT/SIGTERM 仍会尝试保存 interrupt checkpoint。
+  interval_control_steps: null
+  # 只保留最近 N 个 checkpoint（周期、最终和中断合并计数）。
+  keep_last: 5
+recording: {}
+
+# =============================================================================
+# 切换 GRU 的最小修改（不要与上面的 model/algorithm 同时存在）
+# =============================================================================
+# model:
+#   type: gru_actor_critic
+#   encoder:
+#     hidden_sizes: [128, 128]
+#   recurrent:
+#     hidden_size: 128
+#   actor_head:
+#     hidden_sizes: [128]
+#
+# algorithm:
+#   name: recurrent_ppo
+#   gamma: 0.995
+#   gae_lambda: 0.95
+#   clip_epsilon: 0.2
+#   entropy_coefficient: 0.001
+#   value_coefficient: 0.5
+#   max_grad_norm: 1.0
+#   epochs_per_rollout: 2
+#   minibatches: 8
+#   sequence_length: 128
+#   optimizer:
+#     type: adam
+#     learning_rate: 0.0003
+#
+# collector:
+#   control_steps_per_rollout: 256   # 必须能被 128 整除。

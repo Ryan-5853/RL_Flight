@@ -1,0 +1,118 @@
+{
+  "schema_version": 2,
+  "experiment": {
+    "name": "attitude_mlp_sac_smoke",
+    "entrypoint": {"type": "flight_train.runner:run_experiment", "version": "train-framework-v1"}
+  },
+  "seed": {"base": 20260723, "deterministic_algorithms": true, "cudnn_benchmark": false},
+  "run": {
+    "device": "cpu", "dtype": "float32", "parallel_count": 8,
+    "total_control_steps": 256, "output_root": "../../runs", "allow_unimplemented_simulator": false
+  },
+  "environment": {
+    "factory": "simenv:SimulationEnvironment",
+    "config_path": "../environment/sim_smoke.json",
+    "observation_source": "truth"
+  },
+  "command_source": {
+    "type": "flight_train.commands:VirtualPilotCommandSource", "version": "2", "seed": 51003,
+    "params": {
+      "throttle": {
+        "minimum": 0.2, "maximum": 0.85,
+        "spool": {"duration_s": 1.0, "target_range": [0.3, 0.4]},
+        "height_controller": {
+          "observation_source": "truth", "target_m": 0.0,
+          "initial_throttle_range": [0.48, 0.60],
+          "proportional_gain": 0.08, "integral_gain": 0.04, "error_limit_m": 5.0
+        },
+        "slew_rate": {"rise_per_s": 0.5, "fall_per_s": 0.35}
+      },
+      "sticks": {
+        "roll": {"mode": "angle", "limit_rad": 0.35, "time_constant_s": 0.2},
+        "pitch": {"mode": "angle", "limit_rad": 0.35, "time_constant_s": 0.2},
+        "yaw": {"mode": "rate", "limit_rad_s": 1.5, "time_constant_s": 0.3},
+        "target_sampling": {
+          "distribution": "centered", "center_exponent": 2.0,
+          "hold_duration_s": {"range": [1.0, 4.0]}
+        },
+        "reset": {"filtered_stick": "zero", "initial_target_scale": 0.25}
+      }
+    }
+  },
+  "control_contract": {
+    "version": "self_stabilize_v1", "observation_profile": "attitude_self_stabilize_21d_v3",
+    "action_transform": {
+      "type": "residual_around_trim",
+      "trim_command": [0.5, 0.0, 0.0, 0.0],
+      "residual_scale": [0.5, 1.0, 1.0, 1.0]
+    },
+    "policy_action": {"fields": ["lower_motor", "servo_1", "servo_2", "servo_3"]},
+    "external_action": {"fields": ["upper_motor"]},
+    "simulator_command": {"fields": ["upper_motor", "lower_motor", "servo_1", "servo_2", "servo_3"]}
+  },
+  "randomization": {
+    "static": {"seed": 31003, "scope": "episode", "parameters": {}},
+    "dynamic": {"seed": 41003, "scope": "simulator", "parameters": {}}
+  },
+  "task": {
+    "episode_duration_s": 0.032,
+    "episode_curriculum": {
+      "durations_s": [0.008, 0.016, 0.032],
+      "target_scales": [0.0, 0.5, 1.0],
+      "success_fraction": 0.5,
+      "evaluation_episodes_per_env": 0.5,
+      "consecutive_passes": 1
+    },
+    "termination": {"max_tilt_rad": 1.3, "max_angular_rate_rad_s": 20.0}
+  },
+  "reward": {
+    "calculator": {
+      "type": "flight_train.rewards.attitude:AttitudeRewardCalculator",
+      "version": "3",
+      "params": {
+        "roll_pitch_weight": 0.02, "tilt_weight": 0.02,
+        "yaw_rate_weight": 0.0005, "angular_rate_weight": 0.0005,
+        "action_rate_weight": 0.0001, "saturation_weight": 0.0002,
+        "alive_bonus": 0.01, "termination_penalty": 5.0
+      }
+    },
+    "context": {"fields": [
+      {"name": "attitude_geodesic_rad", "source": "task"},
+      {"name": "angular_velocity_b", "source": "sensor"},
+      {"name": "static_domain", "source": "train_randomizer"}
+    ]}
+  },
+  "model": {
+    "type": "mlp_actor_critic",
+    "hidden_sizes": [64, 64],
+    "policy_distribution": {
+      "learnable_action_std": false,
+      "initial_action_std": [0.05, 0.08, 0.08, 0.08],
+      "minimum_action_std": [0.01, 0.02, 0.02, 0.02],
+      "maximum_action_std": [0.10, 0.15, 0.15, 0.15]
+    }
+  },
+  "algorithm": {
+    "name": "sac",
+    "gamma": 0.995,
+    "n_step_return": 4,
+    "replay": {"capacity_transitions": 1024, "warmup_transitions": 32, "batch_size": 32},
+    "critic_pretraining_updates": 2,
+    "updates_per_collection": 1,
+    "target_update": {"tau": 0.005, "interval_updates": 1},
+    "entropy": {
+      "automatic": true, "initial_alpha": 0.0001, "target_entropy": -4.0,
+      "min_alpha": 0.00001, "max_alpha": 0.0001
+    },
+    "actor_max_grad_norm": 1.0,
+    "critic_max_grad_norm": 5.0,
+    "optimizer": {
+      "type": "adam", "actor_learning_rate": 0.00003,
+      "critic_learning_rate": 0.0003, "alpha_learning_rate": 0.0001
+    }
+  },
+  "collector": {"control_steps_per_rollout": 8},
+  "evaluation": {},
+  "checkpoint": {"interval_control_steps": 128, "keep_last": 2},
+  "recording": {}
+}

@@ -54,6 +54,9 @@ wandb/
 mlruns/
 tensorboard/
 
+# Downloaded PX4 source archives; the pinned submodule is authoritative.
+/px4_trans/px4_official/
+
 # Editors and IDEs
 .idea/
 .vscode/

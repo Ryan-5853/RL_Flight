@@ -25,6 +25,9 @@ class LoggingConfig:
     chunk_steps: int
     queue_chunks: int
     overflow: str
+    mode: str
+    physics_step_stride: int
+    fields: tuple[str, ...] | None
 
 
 @dataclass(frozen=True)
@@ -142,16 +145,15 @@ def _body(node: Mapping[str, Any], r: ParameterRandomizer, out: dict[str, torch.
 
 
 def _motors(nodes: Sequence[Any], r: ParameterRandomizer, out: dict[str, torch.Tensor]) -> None:
-    _require(len(nodes) == 2, "motors must contain exactly left and right")
-    _require([_mapping_value(n, "name", f"motors[{i}]") for i, n in enumerate(nodes)] == ["left", "right"],
-             "motor order must be [left, right]")
-    fields = ("pwm_deadzone", "pwm_to_rpm_table", "tau_up", "tau_down", "thrust_curve", "torque_curve", "torque_sign")
+    _require(len(nodes) == 2, "motors must contain exactly upper and lower")
+    _require([_mapping_value(n, "name", f"motors[{i}]") for i, n in enumerate(nodes)] == ["upper", "lower"],
+             "motor order must be [upper, lower]")
+    fields = ("pwm_deadzone", "pwm_to_rpm_table", "time_constant", "torque_coefficient")
     for field in fields:
         tensors = [r.sample(_mapping_node(n, f"motors[{i}]").get(field), f"motors[{i}].{field}") for i, n in enumerate(nodes)]
         _same_tail_shape(tensors, f"motors.{field}")
         out[f"motors.{field}"] = torch.stack(tensors, dim=1)
-    for table in ("pwm_to_rpm_table", "thrust_curve", "torque_curve"):
-        _table(out[f"motors.{table}"], f"motors.{table}")
+    _table(out["motors.pwm_to_rpm_table"], "motors.pwm_to_rpm_table")
     noise_stddev = []
     for i, item in enumerate(nodes):
         noise = _mapping_node(
@@ -175,6 +177,9 @@ def _servos(nodes: Sequence[Any], r: ParameterRandomizer, out: dict[str, torch.T
 
 
 def _aerodynamics(node: Mapping[str, Any], r: ParameterRandomizer, out: dict[str, torch.Tensor]) -> None:
+    out["aerodynamics.thrust_coefficients"] = r.sample(
+        node.get("thrust_coefficients"), "aerodynamics.thrust_coefficients"
+    )
     out["aerodynamics.neutral_thrust_direction_b"] = r.sample(
         node.get("neutral_thrust_direction_b"), "aerodynamics.neutral_thrust_direction_b"
     )
@@ -265,15 +270,15 @@ def _validate_materialized(
     p: Mapping[str, torch.Tensor], state: Mapping[str, torch.Tensor], physics_hz: int
 ) -> None:
     _shape(p["motors.pwm_deadzone"], (2,), "motors.pwm_deadzone")
-    _shape(p["motors.tau_up"], (2,), "motors.tau_up")
-    _shape(p["motors.tau_down"], (2,), "motors.tau_down")
-    _shape(p["motors.torque_sign"], (2,), "motors.torque_sign")
+    _shape(p["motors.time_constant"], (2,), "motors.time_constant")
+    _shape(p["motors.torque_coefficient"], (2,), "motors.torque_coefficient")
     _shape(p["motors.noise.stddev"], (2,), "motors.noise.stddev")
     _shape(p["servos.tau"], (3,), "servos.tau")
     _shape(p["servos.max_speed"], (3,), "servos.max_speed")
     _shape(p["servos.backlash"], (3,), "servos.backlash")
     _shape(p["servos.deadzone"], (3,), "servos.deadzone")
     _shape(p["aerodynamics.neutral_thrust_direction_b"], (3,), "aerodynamics.neutral_thrust_direction_b")
+    _shape(p["aerodynamics.thrust_coefficients"], (3,), "aerodynamics.thrust_coefficients")
     _shape(p["aerodynamics.direct_thrust_center_b"], (3,), "aerodynamics.direct_thrust_center_b")
     _shape(p["aerodynamics.thrust_partition"], (4,), "aerodynamics.thrust_partition")
     _shape(p["aerodynamics.grids.aerodynamic_center_b"], (3, 3), "aerodynamics.grids.aerodynamic_center_b")
@@ -288,10 +293,9 @@ def _validate_materialized(
         (p["motors.pwm_deadzone"] >= 0) & (p["motors.pwm_deadzone"] <= 1),
         "motor pwm_deadzone must be within [0,1]",
     )
-    _all(p["motors.tau_up"] > 0, "motor tau_up must be positive")
-    _all(p["motors.tau_down"] > 0, "motor tau_down must be positive")
+    _all(p["motors.time_constant"] > 0, "motor time_constant must be positive")
+    _all(p["motors.torque_coefficient"] >= 0, "motor torque_coefficient must be non-negative")
     _all(p["motors.noise.stddev"] >= 0, "motor noise stddev must be non-negative")
-    _all(torch.abs(p["motors.torque_sign"]) == 1, "motor torque_sign must be -1 or 1")
     _all(
         p["motors.pwm_to_rpm_table"][..., 1] >= 0,
         "motor target speed table must be non-negative",
@@ -301,13 +305,12 @@ def _validate_materialized(
         & (p["motors.pwm_to_rpm_table"][..., 0] <= 1),
         "motor PWM table axis must be within [0,1]",
     )
+    thrust_coefficients = p["aerodynamics.thrust_coefficients"]
+    k1, k2, k3 = thrust_coefficients.unbind(dim=1)
+    _all((k1 >= 0) & (k2 >= 0), "thrust coefficients k1 and k2 must be non-negative")
     _all(
-        p["motors.thrust_curve"][..., 1] >= 0,
-        "motor thrust curve must be non-negative",
-    )
-    _all(
-        p["motors.torque_curve"][..., 1] >= 0,
-        "motor torque curve magnitude must be non-negative",
+        k3 + 2.0 * torch.sqrt(k1 * k2) >= 0,
+        "thrust coefficients must produce non-negative thrust for non-negative rotor speeds",
     )
     _all(p["servos.tau"] > 0, "servo tau must be positive")
     _all(p["servos.max_speed"] > 0, "servo max_speed must be positive")
@@ -371,15 +374,56 @@ def _validate_materialized(
 def _logging_config(node: Any, base_dir: Path) -> LoggingConfig:
     if not isinstance(node, Mapping):
         raise ConfigurationError("logging must be a mapping")
+    allowed = {
+        "directory",
+        "chunk_steps",
+        "flush_interval_steps",
+        "queue_chunks",
+        "overflow",
+        "mode",
+        "physics_step_stride",
+        "fields",
+    }
+    unknown = sorted(set(node) - allowed)
+    _require(not unknown, f"unknown logging fields: {unknown}")
     directory = Path(node.get("directory", "logs"))
     if not directory.is_absolute():
         directory = (base_dir / directory).resolve()
     chunk_steps = _require_int(node.get("chunk_steps", node.get("flush_interval_steps", 1024)), "logging.chunk_steps")
     queue_chunks = _require_int(node.get("queue_chunks", 2), "logging.queue_chunks")
     overflow = node.get("overflow", "block")
+    mode = node.get("mode", "full")
+    _require(mode in {"full", "compact"}, "logging.mode must be full or compact")
+    stride_default = 1 if mode == "full" else 10
+    physics_step_stride = _require_int(
+        node.get("physics_step_stride", stride_default),
+        "logging.physics_step_stride",
+    )
+    fields_node = node.get("fields")
+    fields: tuple[str, ...] | None
+    if fields_node is None:
+        fields = None
+    else:
+        _require(
+            isinstance(fields_node, list)
+            and bool(fields_node)
+            and all(isinstance(field, str) and field for field in fields_node),
+            "logging.fields must be a non-empty list of field names",
+        )
+        fields = tuple(fields_node)
+        _require(len(set(fields)) == len(fields), "logging.fields must not contain duplicates")
     _require(chunk_steps > 0 and queue_chunks > 0, "logging chunk sizes must be positive")
+    _require(physics_step_stride > 0, "logging.physics_step_stride must be positive")
     _require(overflow in {"block", "error"}, "logging.overflow must be block or error")
-    return LoggingConfig(directory, chunk_steps, queue_chunks, overflow)
+    return LoggingConfig(
+        directory,
+        chunk_steps,
+        queue_chunks,
+        overflow,
+        mode,
+        physics_step_stride,
+        fields,
+    )
 
 
 def _mapping(parent: Mapping[str, Any], key: str) -> Mapping[str, Any]:

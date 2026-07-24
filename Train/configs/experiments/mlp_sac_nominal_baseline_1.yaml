@@ -1,0 +1,246 @@
+# =============================================================================
+# 标称动力学 MLP-SAC 正式训练入口
+# =============================================================================
+#
+# 目标：
+#   先在不做物理参数随机化的标称 SimEnv 上，训练一个能够完成自稳、姿态
+#   指令跟踪和偏航角速度跟踪的 MLP 控制器。SAC 使用 GPU 经验回放反复利用
+#   成功轨迹，避免 PPO 晋级后立即丢弃旧悬停经验。
+#
+# V100 启动：
+#   flight-train run \
+#     --config configs/experiments/mlp_sac_nominal_baseline_1.yaml
+#
+# 重要说明：
+#   - SAC 是全新实验，不能从 PPO checkpoint 做 exact resume。
+#   - actor 输出 4 维残差动作；上桨油门仍由 VirtualPilot 高度 PI 直接控制。
+#   - replay buffer 驻留在训练设备，exact checkpoint 会保存完整 replay，
+#     因此 checkpoint 文件会明显大于 PPO。
+#   - 本配置先验证 MLP-SAC；不在第一版同时引入 GRU 或域随机化。
+# =============================================================================
+
+schema_version: 2
+
+experiment:
+  name: mlp_sac_nominal_baseline_1
+  entrypoint:
+    type: "flight_train.runner:run_experiment"
+    version: "train-framework-v1"
+
+seed:
+  # 模型初始化、经验回放采样和训练随机流的主 seed。
+  base: 20260723
+  deterministic_algorithms: true
+  cudnn_benchmark: false
+
+run:
+  device: cuda:0
+  dtype: float32
+
+  # 每个采集周期只推进 16 个控制步，即 0.032 s；256 个实例一次产生
+  # 4096 条 transition，使 SAC 可以比原 PPO 更频繁地刷新策略。
+  parallel_count: 256
+
+  # 先用约 8.39M 样本验证低熵 SAC 是否形成稳定确定性控制；通过固定评测
+  # 后再延长训练，避免错误探索尺度消耗整轮 33.5M 样本。
+  total_control_steps: 8388608
+  output_root: ../../runs
+  allow_unimplemented_simulator: false
+
+environment:
+  factory: "simenv:SimulationEnvironment"
+  config_path: ../environment/mlp_nominal_baseline_1.yaml
+  # 标称闭环阶段使用姿态真值；后续 student 实验再切换到传感器/EKF 输出。
+  observation_source: truth
+
+command_source:
+  type: "flight_train.commands:VirtualPilotCommandSource"
+  version: "2"
+  seed: 51003
+  params:
+    throttle:
+      minimum: 0.20
+      maximum: 0.85
+      spool:
+        duration_s: 0.10
+        target_range: [0.54, 0.58]
+      height_controller:
+        # 高度真值只给外部飞手增量 PI；策略本身不闭环控制高度。
+        observation_source: truth
+        target_m: 0.0
+        initial_throttle_range: [0.55, 0.58]
+        proportional_gain: 0.08
+        integral_gain: 0.04
+        error_limit_m: 5.0
+      slew_rate:
+        rise_per_s: 4.00
+        fall_per_s: 0.35
+    sticks:
+      # roll/pitch 为目标角，yaw 为目标角速度；一阶惯性由 VirtualPilot 实现。
+      roll:  {mode: angle, limit_rad: 0.10, time_constant_s: 0.20}
+      pitch: {mode: angle, limit_rad: 0.10, time_constant_s: 0.20}
+      yaw:   {mode: rate, limit_rad_s: 0.35, time_constant_s: 0.30}
+      target_sampling:
+        distribution: centered
+        center_exponent: 2.0
+        hold_duration_s:
+          range: [2.0, 4.0]
+      reset:
+        filtered_stick: zero
+        initial_target_scale: 0.25
+
+control_contract:
+  version: self_stabilize_v1
+  observation_profile: attitude_self_stabilize_21d_v3
+  action_transform:
+    # actor 的零动作对应标称悬停配平；SAC 只学习配平点附近的残差。
+    type: residual_around_trim
+    trim_command: [0.53523, 0.0, 0.0, 0.0]
+    residual_scale: [0.30, 1.0, 1.0, 1.0]
+  policy_action:
+    fields: [lower_motor, servo_1, servo_2, servo_3]
+  external_action:
+    fields: [upper_motor]
+  simulator_command:
+    fields: [upper_motor, lower_motor, servo_1, servo_2, servo_3]
+
+randomization:
+  static:
+    seed: 31003
+    scope: episode
+    # 标称 teacher 阶段不随机化物理参数。
+    parameters: {}
+  dynamic:
+    seed: 41003
+    scope: simulator
+    parameters: {}
+
+task:
+  episode_duration_s: 30.0
+  episode_curriculum:
+    # 与 PPO 的 2s/0 -> 5s/0.15 突变相比，SAC 使用更细的课程。
+    # duration 允许保持不变，只要 target_scale 继续增大。
+    durations_s:   [2.0, 3.0, 3.5, 5.0, 5.0, 10.0, 30.0]
+    target_scales: [0.0, 0.0, 0.05, 0.05, 0.15, 0.40, 1.0]
+    success_fraction: 0.80
+    evaluation_episodes_per_env: 1.0
+    consecutive_passes: 2
+  termination:
+    max_tilt_rad: 1.0
+    max_angular_rate_rad_s: 8.0
+
+reward:
+  calculator:
+    type: "flight_train.rewards.attitude:AttitudeRewardCalculator"
+    version: "3"
+    params:
+      # SAC 的 Q 值直接累积单步奖励。这里把原 PPO 奖励整体缩小约 100 倍，
+      # 避免双 Q target 和自动温度在训练初期出现数千量级的尺度差。
+      roll_pitch_weight: 0.02
+      tilt_weight: 0.02
+      yaw_rate_weight: 0.0005
+      angular_rate_weight: 0.0005
+      action_rate_weight: 0.0001
+      saturation_weight: 0.0002
+
+      # 每个有效控制步给固定生存奖励，避免 episode_age_fraction 随课程时长
+      # 改变而让 replay 中相同物理状态拥有不同即时奖励。
+      alive_bonus: 0.1
+      survival_progress_weight: 0.0
+
+      # barrier 在接近安全边界前提供连续梯度。
+      tilt_barrier_weight: 0.10
+      rate_barrier_weight: 0.005
+      barrier_start_fraction: 0.30
+      barrier_exponent: 2.0
+
+      # 使用固定终止惩罚；关闭依赖课程剩余比例的 early penalty，使跨阶段
+      # replay 的 reward 语义保持一致。
+      termination_penalty: 5.0
+      early_termination_penalty: 0.0
+  context:
+    fields:
+      - {name: attitude_geodesic_rad, source: task}
+      - {name: angular_velocity_b, source: sensor}
+      - {name: static_domain, source: train_randomizer, visibility: reward_only}
+
+model:
+  type: mlp_actor_critic
+  hidden_sizes: [256, 256, 128]
+  policy_distribution:
+    # 标称 teacher 阶段固定小方差：先学习局部稳定反馈，不允许 actor 通过
+    # 膨胀方差获得熵收益。以后进入域随机化阶段再单独验证是否解冻方差。
+    learnable_action_std: false
+    initial_action_std: [0.05, 0.08, 0.08, 0.08]
+    minimum_action_std: [0.01, 0.02, 0.02, 0.02]
+    maximum_action_std: [0.10, 0.15, 0.15, 0.15]
+
+algorithm:
+  name: sac
+
+  # 500 Hz 下 gamma=0.9995 的折扣指数时间常数约 4 秒。
+  gamma: 0.9995
+
+  # critic 使用 64-step（0.128 秒）累计回报，再从第 64 步的目标 Q
+  # bootstrap。相比原来的一步 TD，这会把执行器动作对角速度/姿态的短时影响
+  # 直接放入同一个监督 target，避免奖励信息只能以 500 Hz 的单步速度逐次传播。
+  # 实现会保存跨 rollout 的 63 步上下文，因此采集边界不会截断多步回报。
+  n_step_return: 64
+
+  replay:
+    # 4M 条 transition 约覆盖最近 8000 秒累计实例时间；GPU 张量本体约
+    # 1 GB 量级，适合 32 GB V100。超出容量后自动覆盖最旧经验。
+    capacity_transitions: 4000000
+    # 先积累 262144 条（256 环境下约 1024 个控制时刻）再开始反向传播。
+    warmup_transitions: 262144
+    batch_size: 4096
+
+  # replay 达到 warm-up 后，先进行 1024 次纯 critic 更新；期间 actor 均值和
+  # 固定方差完全不变。按每轮 16 次更新计，actor 约在总样本 2.4M 时解冻。
+  critic_pretraining_updates: 1024
+
+  # 稳态下每次新增 32768 条经验后做 16 次 4096 batch 更新，样本更新比约为 2。
+  # 首个 rollout 需要建立 63 步多步上下文，因此写入数量会略少。
+  updates_per_collection: 16
+
+  target_update:
+    # 每次梯度更新后把双 Q target 向在线 Q 软移动 0.5%。
+    tau: 0.005
+    interval_updates: 1
+
+  entropy:
+    automatic: true
+    # 固定方差时只保留极小的 SAC 熵正则；alpha 不能再主导局部姿态 Q 梯度。
+    initial_alpha: 0.0001
+    target_entropy: -4.0
+    min_alpha: 0.00001
+    max_alpha: 0.0001
+
+  actor_max_grad_norm: 1.0
+  critic_max_grad_norm: 5.0
+  optimizer:
+    type: adam
+    # actor 解冻后比 critic 慢十倍，保护已经验证可悬停的零残差初始化。
+    actor_learning_rate: 0.00003
+    critic_learning_rate: 0.0003
+    alpha_learning_rate: 0.0001
+
+collector:
+  # 总采集 batch = 256 × 128 = 32768，位于 16k～64k 范围内。
+  # 增大采集块只减少 Python/记录边界开销；多步回报会跨采集块连续。
+  control_steps_per_rollout: 128
+
+evaluation:
+  enabled: true
+  interval_control_steps: 2097152
+  suite_path: ../evaluation/fixed_attitude_v1.yaml
+
+checkpoint:
+  resume:
+    from: null
+    mode: exact
+  # 短验证实验每约 2.10M 样本保存，便于定位首次形成稳定控制的时刻。
+  interval_control_steps: 2097152
+  keep_last: 4
+
+recording: {}

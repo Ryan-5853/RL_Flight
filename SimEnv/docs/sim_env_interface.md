@@ -66,10 +66,18 @@ def create(
     parallel_count: int,
     device: torch.device | str,
     dtype: torch.dtype = torch.float32,
+    *,
+    dynamic_randomization: Mapping[str, Mapping[str, Any]] | None = None,
+    dynamic_seed: int | None = None,
 ) -> "SimulationEnvironment": ...
 ```
 
-`parallel_count` 即批量大小 `B`，必须为正整数。`create` 读取配置、校验参数、为 `B` 个实例独立采样参数并初始化状态。返回的环境具有一个 `batch_id`，同时为每个实例生成一个 UUID，保存在 `instance_ids[B]` 中。创建后立即开始记录逐物理时间步日志。
+`parallel_count` 即批量大小 `B`，必须为正整数。`create` 读取配置、校验参数、为 `B` 个实例独立采样参数并初始化状态。返回的环境具有一个 `batch_id`，同时为每个实例生成一个 UUID，保存在 `instance_ids[B]` 中。创建后立即按 `logging` 配置记录物理时间线。
+
+环境配置中的 `value` 是物理标称值的唯一来源。外部 `dynamic_randomization` 只能按
+公开参数路径声明 `distribution`、`stddev/range`、合法范围和 `seed_stream`，禁止包含
+重复的 `baseline` 或 `distribution: fixed`；不随机化时删除对应规格。正态分布默认
+围绕环境已解析参数采样，uniform 使用显式实际范围。未知字段在创建时失败。
 
 所有实际参数可通过只读属性查看：
 
@@ -129,55 +137,55 @@ I_b = diag(Ixx, Iyy, Izz)
 
 ### 3.3 推力电机参数
 
-`motors` 必须包含两个电机，顺序固定为 `left`、`right`。两个电机独立配置，下列每个量均可附带 `randomization`：
+`motors` 必须包含两个电机，顺序固定为 `upper`、`lower`，分别对应上桨和下桨。两个电机独立配置，下列每个量均可附带 `randomization`：
 
 ```yaml
 motors:
-  - name: left
+  - name: upper
     pwm_deadzone: {value: 0.08}
     pwm_to_rpm_table:
       value: [[0.00, 0.0], [0.08, 0.0], [0.50, 900.0], [1.00, 1800.0]]
-    tau_up: {value: 0.030}       # s
-    tau_down: {value: 0.050}     # s
-    thrust_curve:
-      value: [[0.0, 0.0], [900.0, 4.0], [1800.0, 16.0]]   # [rad/s, N]
-    torque_curve:
-      value: [[0.0, 0.0], [900.0, 0.08], [1800.0, 0.32]] # [rad/s, N m]
-    torque_sign: {value: 1.0}
+    time_constant: {value: 0.030}       # s
+    torque_coefficient: {value: 9.8765432e-8} # N m/(rad/s)^2
     noise:
       distribution: normal
       stddev: {value: 5.0}       # rad/s
+  - name: lower
+    # 其余字段同 upper；上下桨可以使用不同参数
+    time_constant: {value: 0.050}
+    torque_coefficient: {value: 1.10e-7}
 ```
 
 字段语义：
 
 - `pwm_deadzone`：`pwm <= pwm_deadzone` 时目标转速为 0。
 - `pwm_to_rpm_table`：`[pwm, rad/s]` 分段线性查表；横轴必须严格递增，区间外钳位到端点。
-- `tau_up`、`tau_down`：目标转速上升和下降时分别使用的一阶惯性时间常数。
-- `thrust_curve`：`[rad/s, N]` 分段线性查表，输入为实际电机转速。
-- `torque_curve`：`[rad/s, N m]` 分段线性查表；最终反扭矩乘以 `torque_sign`。
+- `time_constant`：该桨从转速指令到实际转速的一阶惯性时间常数；上、下桨分别配置，可以不同。加速和减速使用该桨的同一个时间常数。
+- `torque_coefficient`：该桨的反扭矩平方系数，必须非负；上下桨可以不同。
 - `noise`：叠加到用于推力和反扭矩计算的有效转速，每个物理步重采样；不改变电机内部转速状态。
 
-电机转速状态按下式更新，其中 `tau` 根据目标转速相对当前转速的方向选择：
+每个桨的转速状态按下式独立更新，其中 `tau_i` 取该桨自己的 `time_constant`：
 
 ```text
-d(rpm)/dt = (rpm_target - rpm) / tau
+d(rpm_i)/dt = (rpm_target_i - rpm_i) / tau_i
 ```
 
 每个物理步内 PWM 目标保持常数，因此实现使用该一阶方程的精确离散响应：
 
 ```text
-rpm_next = rpm + (1 - exp(-dt / tau)) * (rpm_target - rpm)
-rpm_effective = max(rpm_next + noise, 0)
+rpm_next_i = rpm_i + (1 - exp(-dt / tau_i)) * (rpm_target_i - rpm_i)
+rpm_effective_i = max(rpm_next_i + noise_i, 0)
 ```
 
-`rpm_effective` 只用于查 `thrust_curve` 和 `torque_curve`，内部 `motor_speed` 状态仍为 `rpm_next`。两台共轴反桨电机均以产生 `+z_b` 向下气流为正转速方向；配置中的 `neutral_thrust_direction_b` 是机体受到的推力方向，示例为 `-z_b`。反扭矩向量定义为：
+`rpm_effective` 只用于推力和反扭矩计算，内部 `motor_speed` 状态仍为 `rpm_next`；真值中的 `effective_motor_speed` 可用于核对噪声实际作用后的转速。两台共轴反桨电机均以产生 `+z_b` 向下气流为正转速方向。各桨反扭矩幅值和机体反扭矩向量定义为：
 
 ```text
-M_motor_b = (-neutral_thrust_direction_b) * sum(torque_sign_i * Q_i)
+Q_upper = torque_coefficient_upper * rpm_effective_upper^2
+Q_lower = torque_coefficient_lower * rpm_effective_lower^2
+M_motor_b = (-neutral_thrust_direction_b) * (Q_upper - Q_lower)
 ```
 
-因此相同转速且 `torque_sign` 相反的两台电机反扭矩抵消，差动转速产生绕共轴轴线的机体力矩。
+扭矩模型不含上下桨耦合项。只有两桨的反扭矩幅值相等时才完全抵消；系数不同意味着即使转速相同也可能存在净反扭矩。
 
 ### 3.4 舵机参数
 
@@ -212,6 +220,8 @@ servos:
 
 ```yaml
 aerodynamics:
+  # [k1, k2, k3]；转速按 rad/s
+  thrust_coefficients: {value: [4.0e-6, 4.0e-6, 2.0e-6]}
   neutral_thrust_direction_b: {value: [0.0, 0.0, -1.0]} # 单位向量
   direct_thrust_center_b: {value: [0.0, 0.0, 0.20]}      # m
   thrust_partition:
@@ -236,7 +246,15 @@ aerodynamics:
             [0.10, 0.10, 0.0]]
 ```
 
-`T_total` 是两台电机根据各自 `thrust_curve` 得到的推力之和；两台电机根据 `torque_curve` 得到的反扭矩不参与四路推力分配，按各自 `torque_sign` 直接累加到机体力矩。对格栅 `i`：
+总推力不再视为两个单桨推力的线性叠加，而由上下桨有效转速的耦合二次式直接计算：
+
+```text
+T_total = k1 * rpm_effective_upper^2
+        + k2 * rpm_effective_lower^2
+        + k3 * rpm_effective_upper * rpm_effective_lower
+```
+
+`thrust_coefficients` 依次保存 `[k1,k2,k3]`。`k1`、`k2` 必须非负，并要求 `k3 + 2*sqrt(k1*k2) >= 0`，从而保证任意非负上下桨转速下总推力非负。若转速单位为 rad/s，则三个系数的单位均为 `N/(rad/s)^2`。总推力随后进入四路推力分配；两桨反扭矩不参与该分配。对格栅 `i`：
 
 1. 由舵机机械角 `delta_i` 查表得到自身推力保留比例 `eta_i`，范围为 `[0,1]`。
 2. 其他格栅造成的耦合衰减按下式计算：
@@ -399,14 +417,14 @@ def advance(
 ) -> AdvanceResult: ...
 
 # control.shape == [B,5]
-# control[:,0:2]：left/right motor PWM，范围 [0,1]
+# control[:,0:2]：upper/lower motor PWM，范围 [0,1]
 # control[:,2:5]：servo_1/2/3 PWM，范围 [-1,1]
 # active_mask.shape == [B]；省略时全部为 True
 ```
 
 `control` 的 dtype、device 和批量大小必须与环境一致。环境逐实例检查越界和非有限控制量：合法且 `active_mask=True` 的实例推进；未激活实例保持状态和时钟不变；输入非法或已经数值失败的实例标记为无效并冻结，不得阻止其他实例推进。控制量在整个控制周期内保持不变。
 
-环境依次更新电机、舵机、气动力/力矩、六自由度状态和传感器，并为每个物理子步写日志。`physics_hz=5000`、`control_hz=500` 时，每个激活实例一次调用准确推进 10 个物理步和 2 ms。
+环境依次更新电机、舵机、气动力/力矩、六自由度状态和传感器，并将每个物理子步交给日志采样器。`full` 模式逐步保存；`compact` 模式按显式 stride/fields 保存。`physics_hz=5000`、`control_hz=500` 时，每个激活实例一次调用准确推进 10 个物理步和 2 ms。
 
 ```python
 @dataclass(frozen=True)
@@ -423,13 +441,48 @@ class AdvanceResult:
 
 返回值只报告时间推进结果；观测必须通过 `observe` 显式读取。
 
+### 6.1 完整动态状态与精确恢复
+
+```python
+state = env.state_dict()
+
+restored = SimulationEnvironment.create(
+    same_config,
+    parallel_count=env.parallel_count,
+    device=env.device,
+    dtype=env.dtype,
+    dynamic_randomization=same_dynamic_spec,
+    dynamic_seed=same_dynamic_seed,
+)
+restored.load_state_dict(state)
+```
+
+`state_dict` 的 schema version 1 包含所有会影响未来数值轨迹的状态：
+
+- 当前完整参数，包括 episode 静态参数和创建时动态随机化参数；
+- 六自由度 truth、上下桨实际/有效转速、舵机死区/回差/方向状态及气动力矩中间量；
+- 当前传感器表观输出和每种传感器的延迟环形历史缓冲；
+- 当前保持的 5 维控制量、物理步、控制步、valid、error code 和 generation；
+- 每个实例的随机 seed，以及电机和各传感器独立随机流的 sample counter；
+- batch size、dtype、时基、配置 SHA-256、动态参数字段和 dynamic seed 兼容元数据。
+
+`load_state_dict` 在任何写入前严格校验 schema、配置摘要、batch、dtype、时基、字段、
+shape、有限性、传感器历史容量和动态随机化身份。checkpoint 可以通过 `map_location=cpu`
+加载；通过校验后张量会复制到目标环境 device。字段缺失或不兼容时必须失败，不能使用
+默认初始状态填补。
+
+`batch_id`、`instance_ids` 和日志线程不参与物理数值演化，不从旧状态覆盖到新环境。
+恢复后的环境保留新日志身份，并追加 `event_code=3` 的 resume 边界。验收要求连续运行
+N+M 步与运行 N 步、保存、创建新环境、恢复后运行 M 步的 truth、传感器、随机计数器
+和下一状态逐张量完全一致。
+
 ## 7. 日志与校验
 
-创建批次时建立 `logs/<batch_id>/`，保存 `instance_ids`、原始配置、shape 为 `[B,...]` 的实际参数和逐物理步时间线。时间线以 `[time,B,...]` 分块保存，至少记录控制输入、执行器状态、动力学真值、传感器表观值、有效掩码、错误码、`generation`、`event_code`、各分量力/力矩和合力/合力矩。`event_code=-1` 表示该日志行对该槽位无事件，0 表示物理调度步，1 表示初始状态，2 表示重置事件。
+创建批次时建立 `logs/<batch_id>/`，保存 `instance_ids`、原始配置、shape 为 `[B,...]` 的实际参数和 `[time,B,...]` 分块时间线。`logging.mode=full` 时默认逐物理步保存全部控制、真值、传感器和状态字段，可用于逐步复盘；`compact` 时由 `physics_step_stride` 和 `fields` 显式声明降采样与字段裁剪，不能宣称物理级逐步可重放。初始化和恢复事件不受 stride 影响，始终写入共享时间线；`full` 模式的重置事件也写入共享时间线，`compact` 模式的重置后状态则按选中实例稀疏写入对应 reset snapshot 的 `post_reset_timeline`，避免为少量重置复制完整批次。实际模式、stride、字段清单写入 `metadata.json`。`event_code=-1` 表示该日志行对该槽位无事件，0 表示物理调度步，1 表示初始状态，2 表示重置事件，3 表示从完整动态状态恢复。
 
-每次非空重置还必须追加一条 UUID 映射事件，并保存 `reset_mask[B]`、该次重置的配置快照和完整 `[B,...]` 候选参数。候选参数中只有 mask 选中的同索引行被写入环境；保存完整候选批次可精确复现随机化结果。通过 `instance_index + generation` 可以将共享时间线无歧义地映射到对应 UUID。共享存储只是写入优化，不改变实例的逻辑隔离。
+每次非空重置还必须追加一条 UUID 映射事件，并保存 `reset_mask[B]`、该次重置的配置快照和参数。`full` 模式保存完整 `[B,...]` 候选参数；`compact` 模式保存 `parameter_instance_indices` 以及 mask 选中行，避免高并行训练反复复制未重置槽位。通过 `instance_index + generation` 可以将共享时间线无歧义地映射到对应 UUID。共享存储只是写入优化，不改变实例的逻辑隔离。
 
-创建时必须校验：`parallel.independent_rng` 为 true；质量和三轴惯量为正；四元数已归一化；所有表格横轴严格递增；时间常数为正；推力分配比例之和为 1；所有气动作用点和质心采用同一机体系；推力方向与格栅轴均为单位向量；衰减比例合法；传感器频率可由物理时间步调度；`physics_hz / control_hz` 为正整数。
+创建时必须校验：`parallel.independent_rng` 为 true；质量和三轴惯量为正；四元数已归一化；所有表格横轴严格递增；上下桨时间常数为正；反扭矩系数非负；推力系数组合对非负转速不产生负推力；推力分配比例之和为 1；所有气动作用点和质心采用同一机体系；推力方向与格栅轴均为单位向量；衰减比例合法；传感器频率可由物理时间步调度；`physics_hz / control_hz` 为正整数。
 
 相同配置、seed、`parallel_count` 和控制序列必须产生相同的实例参数、状态和传感器序列。检测到 `NaN`、`Inf` 或物理约束错误时，只冻结对应实例并记录具体字段；除非日志设备或执行设备发生批次级故障，否则不得停止其他实例。
 
@@ -486,7 +539,7 @@ angular_acceleration_b = (
 
 其中 NED 重力为 `gravity_n=[0,0,9.80665] m/s^2`。平动和角速度使用半隐式 Euler：先更新速度，再用新速度更新位置；Hamilton 四元数满足 `q_dot=0.5*q⊗[0,omega_b]`，每步更新后重新归一化。四元数积分使用更新后的机体系角速度。
 
-电机上升/下降时间常数、PWM 死区、舵机死区、回差、限速和实例有效状态都使用 `[B,...]` 布尔掩码配合 `torch.where` 实现，不能使用基于单个实例值的 Python `if`。
+上下桨各自的时间常数、PWM 死区、舵机死区、回差、限速和实例有效状态都使用 `[B,...]` 张量或布尔掩码实现，不能使用基于单个实例值的 Python `if`。耦合推力二次式和两个独立反扭矩平方项同样在整个批次上直接计算。
 
 分段曲线保持统一节点数 `K`，使用批量 `torch.searchsorted`、`torch.gather` 和线性插值计算。表格横轴和值均保留批量维 `[B,K]`；不允许在推进过程中调用 NumPy/SciPy 插值器或遍历实例。
 
@@ -499,7 +552,7 @@ grid_moment_b = torch.linalg.cross(
 ).sum(dim=1)  # 只对三个格栅求和，绝不对 B 求和
 ```
 
-时间线中的动力学分量至少包括 `motor_thrust[B,2]`、`motor_torque[B,2]`、`direct_force_b[B,3]`、`grid_force_b[B,3,3]`、`direct_moment_b[B,3]`、`grid_moment_b[B,3,3]`、`motor_reaction_moment_b[B,3]`、`force_b[B,3]` 和 `moment_b[B,3]`，可直接核对四路力与各作用点力矩。
+时间线中的动力学分量至少包括 `motor_speed[B,2]`、`effective_motor_speed[B,2]`、`total_thrust[B]`、`motor_torque[B,2]`、`direct_force_b[B,3]`、`grid_force_b[B,3,3]`、`direct_moment_b[B,3]`、`grid_moment_b[B,3,3]`、`motor_reaction_moment_b[B,3]`、`force_b[B,3]` 和 `moment_b[B,3]`。`motor_torque` 保存上、下桨各自的非负反扭矩幅值，最终机体轴向反扭矩取二者之差；`total_thrust` 是含 `k3` 耦合项的整体推力，不提供可线性求和的单桨推力字段。
 
 物理子步在时间上存在严格前后依赖，因此允许对固定的 `substeps = physics_hz // control_hz` 做循环；循环体内部必须完全张量化，不得包含 `for instance in range(B)`。固定子步循环可由 `torch.compile` 捕获并融合；是否启用自动微分由调用方决定，不影响接口。
 

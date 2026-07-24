@@ -1,0 +1,156 @@
+# SimEnv 完整中文配置模板（所有字段均为有效示例值，可直接加载运行）。
+# 使用时建议复制本文件后修改，不要改变 upper/lower、servo_1..3、grid_1..3 的顺序。
+#
+# 坐标和单位约定：
+#   世界系 NED：x 北、y 东、z 地。
+#   机体系 FRD：x 前、y 右、z 下。
+#   四元数采用 Hamilton [w,x,y,z]，q_wb 将机体系向量旋转到世界系。
+#   长度 m，速度 m/s，质量 kg，时间 s，角度 rad，转速 rad/s，力 N，力矩 N·m。
+#
+# 任意数值字段的基本形式：
+#   parameter: {value: 标称值}
+# 可选的正态相对随机化形式：
+#   parameter:
+#     value: 标称值
+#     randomization:
+#       distribution: normal        # none | normal | uniform
+#       mode: relative              # relative: value*(1+offset)；absolute: value+offset
+#       mean: 0.0
+#       stddev: 0.05
+#       clip: [-0.2, 0.2]           # clip 限制 offset，不限制最终值
+# 均匀绝对随机化则使用 distribution: uniform、mode: absolute、min 和 max。
+
+schema_version: 1                  # 当前固定为 1
+seed: 20260721                     # 固定种子可复现实例参数和运行时噪声
+
+parallel:
+  independent_rng: true            # 必须为 true；并行数量/device/dtype 由 create(...) 指定
+
+timing:
+  physics_hz: {value: 5000}        # 物理频率，正整数，不允许随机化
+  control_hz: {value: 500}         # 控制频率，正整数；必须整除 physics_hz
+
+initial_state:
+  position_n: {value: [0.0, 0.0, 0.0]}         # 质心 NED 位置 [北,东,地]，m
+  velocity_n: {value: [0.0, 0.0, 0.0]}         # 质心 NED 速度，m/s
+  attitude_q_wb: {value: [1.0, 0.0, 0.0, 0.0]} # Hamilton 单位四元数 [w,x,y,z]
+  angular_velocity_b: {value: [0.0, 0.0, 0.0]} # FRD 角速度 [p,q,r]，rad/s
+
+body:
+  mass:
+    value: 2.4                     # kg；随机化后的所有实例都必须 > 0
+    randomization:                 # 删除此段即可关闭质量随机化
+      distribution: normal
+      mode: relative
+      mean: 0.0
+      stddev: 0.05
+      clip: [-0.2, 0.2]
+  center_of_mass_b: {value: [0.0, 0.0, 0.08]} # 质心相对机体原点的 FRD 坐标，m
+  inertia_diagonal_b: {value: [0.030, 0.028, 0.012]} # [Ixx,Iyy,Izz]，kg·m²；不含惯量积
+
+# motors[0]/control[:,0] 为上桨，motors[1]/control[:,1] 为下桨。
+# 电机控制范围为 [0,1]；两个桨的 time_constant 和 torque_coefficient 可不同。
+motors:
+  - &motor_common
+    name: upper
+    pwm_deadzone: {value: 0.08}    # pwm <= deadzone 时目标转速为 0
+    pwm_to_rpm_table:              # [pwm, rad/s]，至少两点，pwm 横轴严格递增且位于 [0,1]
+      value: [[0.0, 0.0], [0.08, 0.0], [0.5, 900.0], [1.0, 1800.0]]
+    time_constant: {value: 0.030}  # 指令到转速的一阶惯性时间常数，s；必须 > 0
+    torque_coefficient: {value: 9.8765432e-8} # Q_upper=kq_upper*rpm_upper²，须非负
+    noise:
+      distribution: normal         # 运行时电机有效转速噪声目前固定支持 normal
+      stddev: {value: 5.0}          # rad/s；影响推力/反扭矩，不改变 motor_speed 内部状态
+  - <<: *motor_common
+    name: lower
+    time_constant: {value: 0.050}
+    torque_coefficient: {value: 1.10e-7} # Q_lower=kq_lower*rpm_lower²，须非负
+
+# servos 与 control[:,2:5] 一一对应，顺序不可改变；控制范围为 [-1,1]。
+servos:
+  - &servo_common
+    name: servo_1
+    pwm_angle_table:               # [归一化 PWM, 舵角 rad]，横轴严格递增
+      value: [[-1.0, -0.35], [0.0, 0.0], [1.0, 0.35]]
+    tau: {value: 0.020}            # 舵角一阶惯性时间常数，s；必须 > 0
+    max_speed: {value: 8.0}        # 最大舵角速度，rad/s；必须 > 0
+    backlash: {value: 0.010}       # 换向回差，rad；必须 >= 0
+    deadzone: {value: 0.015}       # 相对上次有效命令的 PWM 死区，[0,2]
+  - <<: *servo_common
+    name: servo_2
+  - <<: *servo_common
+    name: servo_3
+
+aerodynamics:
+  # T_total = k1*rpm_upper² + k2*rpm_lower² + k3*rpm_upper*rpm_lower。
+  # k1、k2 >= 0，且 k3 + 2*sqrt(k1*k2) >= 0，以保证非负转速下推力非负。
+  thrust_coefficients: {value: [4.0e-6, 4.0e-6, 2.0e-6]} # [k1,k2,k3]，N/(rad/s)²
+  neutral_thrust_direction_b: {value: [0.0, 0.0, -1.0]} # 中立受力方向，FRD 单位向量
+  direct_thrust_center_b: {value: [0.0, 0.0, 0.20]}      # 直接推力作用点，FRD，m
+  thrust_partition:                # direct + grid_1 + grid_2 + grid_3 必须等于 1
+    direct: {value: 0.40}
+    grid_1: {value: 0.20}
+    grid_2: {value: 0.20}
+    grid_3: {value: 0.20}
+
+  # 三个 deflection_axis_b 必须为单位向量、垂直于中立推力方向，并且两两相隔 120°。
+  grids:
+    - &grid_common
+      name: grid_1
+      aerodynamic_center_b: {value: [0.10, 0.00, 0.25]} # 气动中心 FRD 坐标，m
+      deflection_axis_b: {value: [1.0, 0.0, 0.0]}       # 正舵角按此轴右手定则旋转受力方向
+      self_attenuation_curve:      # [|舵角| rad, 推力保留比例]；横轴递增，比例在 [0,1]
+        value: [[0.0, 1.0], [0.35, 0.85]]
+      vector_deflection:
+        gain: {value: 1.0}         # vector_angle = gain*servo_angle + offset
+        offset: {value: 0.0}       # rad
+    - <<: *grid_common
+      name: grid_2
+      aerodynamic_center_b: {value: [-0.05, 0.087, 0.25]}
+      deflection_axis_b: {value: [-0.5, 0.8660254, 0.0]}
+    - <<: *grid_common
+      name: grid_3
+      aerodynamic_center_b: {value: [-0.05, -0.087, 0.25]}
+      deflection_axis_b: {value: [-0.5, -0.8660254, 0.0]}
+
+  # coupling[i,j] 表示格栅 j 偏转对格栅 i 的附加损失；对角线为 0，其余值在 [0,1]。
+  coupling_attenuation:
+    value:
+      - [0.0, 0.10, 0.10]
+      - [0.10, 0.0, 0.10]
+      - [0.10, 0.10, 0.0]
+
+# 当前只允许 gyro、accelerometer、motor_speed；可删去不需要的传感器，但至少保留一个。
+# sample_hz 必须 > 0 且能整除 physics_hz。若 delay*physics_hz 不是整数，必须增加：
+# interpolation: linear
+sensors:
+  gyro:
+    sample_hz: {value: 5000}      # Hz
+    noise:
+      distribution: normal
+      stddev: {value: [0.002, 0.002, 0.002]} # [x,y,z]，rad/s
+    bias: {value: [0.0, 0.0, 0.0]}           # [x,y,z]，rad/s
+    delay: {value: 0.001}         # s；固定延迟，此处为 5 个物理步
+  accelerometer:
+    sample_hz: {value: 5000}      # Hz；理想值为机体系比力，不包含重力直接读数
+    noise:
+      distribution: normal
+      stddev: {value: [0.02, 0.02, 0.02]} # [x,y,z]，m/s²
+    bias: {value: [0.0, 0.0, 0.0]}       # [x,y,z]，m/s²
+    delay: {value: 0.001}
+  motor_speed:
+    sample_hz: {value: 5000}      # Hz
+    noise:
+      distribution: normal
+      stddev: {value: [2.0, 2.0]} # [上桨,下桨]，rad/s
+    bias: {value: [0.0, 0.0]}     # [上桨,下桨]，rad/s
+    delay: {value: 0.0}
+
+logging:
+  directory: ../logs              # 相对路径以配置文件目录为基准；每次 create 会新建 batch_id 子目录
+  mode: full                      # full：每个物理步全字段；compact：允许降采样/字段裁剪
+  physics_step_stride: 1          # 普通物理日志每隔多少步保存；初始化/reset/resume 始终保存
+  # fields: [physics_step, control_step, control, event_code, truth.position_n]
+  chunk_steps: 1024               # 单个 timeline_*.pt 的最大“已记录”时间步数
+  queue_chunks: 2                 # 后台写线程队列容量，必须 > 0
+  overflow: block                 # block：队列满时等待；error：队列满时抛出 LoggingError

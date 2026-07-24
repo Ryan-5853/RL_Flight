@@ -20,14 +20,11 @@ def _randomizable(value, randomization=None):
 
 def _config(log_directory: str) -> dict:
     motor = {
-        "name": "left",
+        "name": "upper",
         "pwm_deadzone": _randomizable(0.08),
         "pwm_to_rpm_table": _randomizable([[0.0, 0.0], [0.08, 0.0], [1.0, 1800.0]]),
-        "tau_up": _randomizable(0.03),
-        "tau_down": _randomizable(0.05),
-        "thrust_curve": _randomizable([[0.0, 0.0], [900.0, 4.0], [1800.0, 16.0]]),
-        "torque_curve": _randomizable([[0.0, 0.0], [900.0, 0.08], [1800.0, 0.32]]),
-        "torque_sign": _randomizable(1.0),
+        "time_constant": _randomizable(0.03),
+        "torque_coefficient": _randomizable(1.0e-7),
         "noise": {"distribution": "normal", "stddev": _randomizable(5.0)},
     }
     servo = {
@@ -45,9 +42,10 @@ def _config(log_directory: str) -> dict:
         "self_attenuation_curve": _randomizable([[0.0, 1.0], [0.35, 0.85]]),
         "vector_deflection": {"gain": _randomizable(1.0), "offset": _randomizable(0.0)},
     }
-    right_motor = deepcopy(motor)
-    right_motor["name"] = "right"
-    right_motor["torque_sign"] = _randomizable(-1.0)
+    lower_motor = deepcopy(motor)
+    lower_motor["name"] = "lower"
+    lower_motor["time_constant"] = _randomizable(0.05)
+    lower_motor["torque_coefficient"] = _randomizable(1.2e-7)
     servos = []
     for index in range(3):
         item = deepcopy(servo)
@@ -89,9 +87,10 @@ def _config(log_directory: str) -> dict:
             "center_of_mass_b": _randomizable([0.0, 0.0, 0.08]),
             "inertia_diagonal_b": _randomizable([0.03, 0.028, 0.012]),
         },
-        "motors": [motor, right_motor],
+        "motors": [motor, lower_motor],
         "servos": servos,
         "aerodynamics": {
+            "thrust_coefficients": _randomizable([4.0e-6, 4.0e-6, 1.0e-6]),
             "neutral_thrust_direction_b": _randomizable([0.0, 0.0, -1.0]),
             "direct_thrust_center_b": _randomizable([0.0, 0.0, 0.2]),
             "thrust_partition": {
@@ -156,6 +155,32 @@ class SimulationEnvironmentTests(unittest.TestCase):
                 self.assertEqual(env.parameters["servos.pwm_angle_table"].shape, (4, 3, 3, 2))
                 self.assertEqual(env.parameters["aerodynamics.coupling_attenuation"].shape, (4, 3, 3))
 
+    def test_dynamic_randomization_uses_environment_nominal_and_rejects_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = self._write_config(root)
+            spec = {
+                "sensors.gyro.noise.stddev": {
+                    "distribution": "normal",
+                    "stddev": [0.0, 0.0, 0.0],
+                    "seed_stream": "dynamic.sensor.gyro.noise",
+                }
+            }
+            with SimulationEnvironment.create(
+                path, 3, "cpu", dynamic_randomization=spec, dynamic_seed=7
+            ) as env:
+                torch.testing.assert_close(
+                    env.parameters["sensors.gyro.noise.stddev"],
+                    torch.full((3, 3), 0.002),
+                )
+
+            duplicate = deepcopy(spec)
+            duplicate["sensors.gyro.noise.stddev"]["baseline"] = [0.002] * 3
+            with self.assertRaisesRegex(ConfigurationError, "unknown dynamic randomization fields"):
+                SimulationEnvironment.create(
+                    path, 3, "cpu", dynamic_randomization=duplicate, dynamic_seed=7
+                )
+
     def test_observation_is_batched_and_does_not_expose_internal_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -165,6 +190,91 @@ class SimulationEnvironmentTests(unittest.TestCase):
                 first.values["position_n"][0, 0] = 99
                 second = env.observe("truth", ("position_n",))
                 self.assertEqual(second.values["position_n"][0, 0].item(), 0.0)
+
+    def test_complete_state_round_trip_replays_next_steps_exactly(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = self._write_config(root)
+            batch = 3
+            prefix = [
+                torch.tensor([[0.52, 0.48, 0.1, -0.2, 0.3]]).expand(batch, -1),
+                torch.tensor([[0.61, 0.43, -0.3, 0.2, -0.1]]).expand(batch, -1),
+                torch.tensor([[0.57, 0.51, 0.2, 0.1, -0.2]]).expand(batch, -1),
+            ]
+            suffix = [
+                torch.tensor([[0.63, 0.46, -0.1, 0.3, 0.2]]).expand(batch, -1),
+                torch.tensor([[0.55, 0.54, 0.3, -0.1, -0.3]]).expand(batch, -1),
+            ]
+            env_a = SimulationEnvironment.create(path, batch, "cpu")
+            env_b = SimulationEnvironment.create(path, batch, "cpu")
+            try:
+                for control in prefix:
+                    env_a.advance(control)
+                checkpoint = env_a.state_dict()
+
+                expected = []
+                for control in suffix:
+                    result = env_a.advance(control)
+                    expected.append(
+                        (
+                            result,
+                            dict(env_a.observe("truth").values),
+                            dict(env_a.observe("sensor").values),
+                        )
+                    )
+
+                env_b.load_state_dict(checkpoint)
+                for control, (expected_result, expected_truth, expected_sensor) in zip(
+                    suffix, expected
+                ):
+                    actual_result = env_b.advance(control)
+                    for name in (
+                        "physics_step", "control_step", "sim_time_s",
+                        "physics_steps_advanced", "valid", "error_code",
+                    ):
+                        torch.testing.assert_close(
+                            getattr(actual_result, name), getattr(expected_result, name)
+                        )
+                    actual_truth = env_b.observe("truth").values
+                    actual_sensor = env_b.observe("sensor").values
+                    self.assertEqual(set(actual_truth), set(expected_truth))
+                    self.assertEqual(set(actual_sensor), set(expected_sensor))
+                    for name, value in expected_truth.items():
+                        torch.testing.assert_close(actual_truth[name], value, rtol=0, atol=0)
+                    for name, value in expected_sensor.items():
+                        torch.testing.assert_close(actual_sensor[name], value, rtol=0, atol=0)
+
+                final_a = env_a.state_dict()
+                final_b = env_b.state_dict()
+                for section in (
+                    "parameters", "truth", "sensors", "random_counters"
+                ):
+                    for name, value in final_a[section].items():
+                        torch.testing.assert_close(
+                            final_b[section][name], value, rtol=0, atol=0
+                        )
+                for name in (
+                    "physics_step", "control_step", "valid", "error_code",
+                    "generation", "instance_seeds", "control",
+                ):
+                    torch.testing.assert_close(final_b[name], final_a[name], rtol=0, atol=0)
+                for name, value in final_a["sensor_kernel"]["history"].items():
+                    torch.testing.assert_close(
+                        final_b["sensor_kernel"]["history"][name], value, rtol=0, atol=0
+                    )
+            finally:
+                env_a.close()
+                env_b.close()
+
+    def test_complete_state_rejects_incompatible_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = self._write_config(root)
+            with SimulationEnvironment.create(path, 2, "cpu") as source:
+                state = source.state_dict()
+            with SimulationEnvironment.create(path, 3, "cpu") as target:
+                with self.assertRaises(ConfigurationError):
+                    target.load_state_dict(state)
 
     def test_rigid_body_free_fall_uses_ned_gravity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -213,10 +323,11 @@ class SimulationEnvironmentTests(unittest.TestCase):
             for motor in config["motors"]:
                 motor["pwm_deadzone"] = _randomizable(0.0)
                 motor["pwm_to_rpm_table"] = _randomizable([[0.0, 0.0], [1.0, 100.0]])
-                motor["tau_up"] = _randomizable(0.01)
-                motor["tau_down"] = _randomizable(0.01)
-                motor["thrust_curve"] = _randomizable([[0.0, 0.0], [100.0, 10.0]])
-                motor["torque_curve"] = _randomizable([[0.0, 0.0], [100.0, 1.0]])
+                motor["time_constant"] = _randomizable(0.01)
+                motor["torque_coefficient"] = _randomizable(1.0e-4)
+            config["aerodynamics"]["thrust_coefficients"] = _randomizable(
+                [1.0e-3, 2.0e-3, 3.0e-4]
+            )
             self._disable_motor_noise(config)
             self._zero_sensor_delays(config)
             path = self._write_named_config(root, "coaxial.json", config)
@@ -233,10 +344,65 @@ class SimulationEnvironmentTests(unittest.TestCase):
                 )
                 self.assertAlmostEqual(truth["moment_b"][0, 2].item(), 0.0, places=6)
                 self.assertGreater(truth["moment_b"][1, 2].item(), 0.0)
+                speed = expected_speed.item()
+                self.assertAlmostEqual(
+                    truth["total_thrust"][0].item(),
+                    (1.0e-3 + 2.0e-3 + 3.0e-4) * speed * speed,
+                    places=5,
+                )
+                self.assertAlmostEqual(
+                    truth["total_thrust"][1].item(), 1.0e-3 * speed * speed, places=5
+                )
                 self.assertLess(truth["force_b"][0, 2].item(), 0.0)
                 torch.testing.assert_close(
                     truth["force_b"][0, :2], torch.zeros(2), atol=1e-6, rtol=0
                 )
+
+    def test_upper_and_lower_motor_parameters_are_independent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = _config(str(root / "logs"))
+            config["timing"] = {
+                "physics_hz": _randomizable(100),
+                "control_hz": _randomizable(100),
+            }
+            config["aerodynamics"]["thrust_coefficients"] = _randomizable(
+                [1.0e-3, 2.0e-3, 3.0e-4]
+            )
+            for motor in config["motors"]:
+                motor["pwm_deadzone"] = _randomizable(0.0)
+                motor["pwm_to_rpm_table"] = _randomizable(
+                    [[0.0, 0.0], [1.0, 100.0]]
+                )
+            config["motors"][0]["time_constant"] = _randomizable(0.01)
+            config["motors"][1]["time_constant"] = _randomizable(0.02)
+            config["motors"][0]["torque_coefficient"] = _randomizable(1.0e-4)
+            config["motors"][1]["torque_coefficient"] = _randomizable(2.0e-4)
+            self._disable_motor_noise(config)
+            self._zero_sensor_delays(config)
+            path = self._write_named_config(root, "independent-motors.json", config)
+
+            with SimulationEnvironment.create(path, 1, "cpu") as env:
+                env.advance(torch.tensor([[1.0, 1.0, 0.0, 0.0, 0.0]]))
+                truth = env.observe("truth").values
+                upper_speed = 100.0 * (1.0 - torch.exp(torch.tensor(-1.0)))
+                lower_speed = 100.0 * (1.0 - torch.exp(torch.tensor(-0.5)))
+                expected_speeds = torch.stack((upper_speed, lower_speed))
+                torch.testing.assert_close(truth["motor_speed"][0], expected_speeds)
+
+                expected_torques = torch.tensor([1.0e-4, 2.0e-4]) * expected_speeds.square()
+                torch.testing.assert_close(truth["motor_torque"][0], expected_torques)
+                self.assertAlmostEqual(
+                    truth["motor_reaction_moment_b"][0, 2].item(),
+                    (expected_torques[0] - expected_torques[1]).item(),
+                    places=5,
+                )
+                expected_thrust = (
+                    1.0e-3 * upper_speed.square()
+                    + 2.0e-3 * lower_speed.square()
+                    + 3.0e-4 * upper_speed * lower_speed
+                )
+                torch.testing.assert_close(truth["total_thrust"][0], expected_thrust)
 
     def test_body_thrust_is_rotated_to_ned_by_q_wb(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -259,16 +425,18 @@ class SimulationEnvironmentTests(unittest.TestCase):
             for motor in config["motors"]:
                 motor["pwm_deadzone"] = _randomizable(0.0)
                 motor["pwm_to_rpm_table"] = _randomizable([[0.0, 0.0], [1.0, 100.0]])
-                motor["tau_up"] = _randomizable(0.01)
-                motor["thrust_curve"] = _randomizable([[0.0, 0.0], [100.0, 10.0]])
-                motor["torque_curve"] = _randomizable([[0.0, 0.0], [100.0, 0.0]])
+                motor["time_constant"] = _randomizable(0.01)
+                motor["torque_coefficient"] = _randomizable(0.0)
+            config["aerodynamics"]["thrust_coefficients"] = _randomizable(
+                [1.0e-3, 1.0e-3, 0.0]
+            )
             self._disable_motor_noise(config)
             self._zero_sensor_delays(config)
             path = self._write_named_config(root, "rotated-thrust.json", config)
             with SimulationEnvironment.create(path, 1, "cpu") as env:
                 env.advance(torch.tensor([[1.0, 1.0, 0.0, 0.0, 0.0]]))
                 truth = env.observe("truth").values
-                total_thrust = truth["motor_thrust"].sum()
+                total_thrust = truth["total_thrust"].squeeze(0)
                 self.assertAlmostEqual(
                     truth["linear_acceleration_n"][0, 0].item(),
                     -total_thrust.item(),
@@ -309,10 +477,11 @@ class SimulationEnvironmentTests(unittest.TestCase):
             for motor in config["motors"]:
                 motor["pwm_deadzone"] = _randomizable(0.0)
                 motor["pwm_to_rpm_table"] = _randomizable([[0.0, 0.0], [1.0, 100.0]])
-                motor["tau_up"] = _randomizable(0.01)
-                motor["tau_down"] = _randomizable(0.01)
-                motor["thrust_curve"] = _randomizable([[0.0, 0.0], [100.0, 10.0]])
-                motor["torque_curve"] = _randomizable([[0.0, 0.0], [100.0, 0.0]])
+                motor["time_constant"] = _randomizable(0.01)
+                motor["torque_coefficient"] = _randomizable(0.0)
+            config["aerodynamics"]["thrust_coefficients"] = _randomizable(
+                [1.0e-3, 1.0e-3, 0.0]
+            )
             for servo in config["servos"]:
                 servo["pwm_angle_table"] = _randomizable(
                     [[-1.0, -1.5707963267948966], [0.0, 0.0], [1.0, 1.5707963267948966]]
@@ -329,7 +498,7 @@ class SimulationEnvironmentTests(unittest.TestCase):
                 control = torch.tensor([[1.0, 1.0, 1.0, 0.0, 0.0]])
                 env.advance(control)
                 truth = env.observe("truth").values
-                thrust = truth["motor_thrust"].sum().item()
+                thrust = truth["total_thrust"].item()
                 self.assertAlmostEqual(truth["grid_force_b"][0, 0, 0].item(), 0.0, places=5)
                 self.assertAlmostEqual(truth["grid_force_b"][0, 0, 1].item(), thrust, places=5)
                 self.assertAlmostEqual(truth["grid_force_b"][0, 0, 2].item(), 0.0, places=5)
@@ -343,7 +512,7 @@ class SimulationEnvironmentTests(unittest.TestCase):
             with SimulationEnvironment.create(config, 2, "cpu") as env:
                 components = env._dynamics._forces_and_moments(
                     env._parameters,
-                    torch.ones((2, 2)),
+                    torch.ones(2),
                     torch.zeros((2, 2)),
                     torch.tensor([[0.35, 0.0, 0.0], [0.0, 0.35, 0.0]]),
                 )
@@ -614,6 +783,108 @@ class SimulationEnvironmentTests(unittest.TestCase):
             self.assertEqual(timeline[0].tolist(), [0, 0])
             self.assertEqual(timeline[-1].tolist(), [10, 10])
 
+    def test_compact_timeline_downsamples_fields_but_keeps_events(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = _config(str(root / "logs"))
+            config["logging"].update(
+                {
+                    "mode": "compact",
+                    "physics_step_stride": 10,
+                    "fields": [
+                        "physics_step",
+                        "control_step",
+                        "event_code",
+                        "truth.position_n",
+                    ],
+                }
+            )
+            config_path = self._write_named_config(root, "compact.json", config)
+            with SimulationEnvironment.create(config_path, 2, "cpu") as env:
+                log_directory = env._logger.directory
+                env.advance(torch.zeros((2, 5), dtype=torch.float32))
+            records = [
+                torch.load(path, weights_only=True)
+                for path in sorted(log_directory.glob("timeline_*.pt"))
+            ]
+            self.assertEqual(set(records[0]), set(config["logging"]["fields"]))
+            physics_steps = torch.cat(
+                [chunk["physics_step"] for chunk in records], dim=0
+            )
+            event_codes = torch.cat(
+                [chunk["event_code"] for chunk in records], dim=0
+            )
+            self.assertEqual(physics_steps[:, 0].tolist(), [0, 10])
+            self.assertEqual(event_codes[0].tolist(), [1, 1])
+
+    def test_compact_timeline_does_not_build_skipped_records(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = _config(str(root / "logs"))
+            config["logging"].update(
+                {"mode": "compact", "physics_step_stride": 100}
+            )
+            config_path = self._write_named_config(root, "lazy_log.json", config)
+            with SimulationEnvironment.create(config_path, 1, "cpu") as env:
+                calls = 0
+                original = env._log_record
+
+                def counted_record(active_mask, event_code):
+                    nonlocal calls
+                    calls += 1
+                    return original(active_mask, event_code)
+
+                env._log_record = counted_record
+                env.advance(torch.zeros((1, 5), dtype=torch.float32))
+                self.assertEqual(calls, 0)
+
+    def test_compact_reset_saves_only_selected_post_reset_timeline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = _config(str(root / "logs"))
+            config["logging"].update(
+                {
+                    "mode": "compact",
+                    "physics_step_stride": 100,
+                    "fields": [
+                        "physics_step",
+                        "control_step",
+                        "event_code",
+                        "generation",
+                        "truth.position_n",
+                    ],
+                }
+            )
+            config_path = self._write_named_config(root, "compact_reset.json", config)
+            with SimulationEnvironment.create(config_path, 4, "cpu") as env:
+                log_directory = env._logger.directory
+                reset_mask = torch.tensor([True, False, True, False])
+                env.reset(reset_mask, config_path)
+
+            chunks = [
+                torch.load(path, weights_only=True)
+                for path in sorted(log_directory.glob("timeline_*.pt"))
+            ]
+            timeline_events = torch.cat(
+                [chunk["event_code"] for chunk in chunks], dim=0
+            )
+            self.assertEqual(timeline_events.shape, (1, 4))
+            self.assertEqual(timeline_events[0].tolist(), [1, 1, 1, 1])
+
+            snapshot = torch.load(
+                log_directory / "resets" / "000000" / "parameters.pt",
+                weights_only=True,
+            )
+            self.assertEqual(
+                snapshot["parameter_instance_indices"].tolist(), [0, 2]
+            )
+            sparse = snapshot["post_reset_timeline"]
+            self.assertEqual(set(sparse), set(config["logging"]["fields"]))
+            self.assertEqual(sparse["physics_step"].shape, (2,))
+            self.assertEqual(sparse["event_code"].tolist(), [2, 2])
+            self.assertEqual(sparse["generation"].tolist(), [1, 1])
+            self.assertEqual(sparse["truth.position_n"].shape, (2, 3))
+
     def test_mask_reset_replaces_selected_slots_and_matches_batched_create(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -712,6 +983,53 @@ class SimulationEnvironmentTests(unittest.TestCase):
             generations = torch.cat([chunk["generation"] for chunk in chunks], dim=0)
             self.assertEqual(event_codes[-1].tolist(), [2, -1, 2, -1])
             self.assertEqual(generations[-1].tolist(), [1, 0, 1, 0])
+
+    def test_mask_reset_refreshes_cached_derived_parameters(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base = _config(str(root / "base_logs"))
+            replacement = _config(str(root / "replacement_logs"))
+            replacement["seed"] = 9876
+            replacement["motors"][0]["time_constant"] = _randomizable(0.003)
+            replacement["motors"][0]["pwm_to_rpm_table"] = _randomizable(
+                [[0.0, 0.0], [0.08, 0.0], [1.0, 900.0]]
+            )
+            replacement["body"]["center_of_mass_b"] = _randomizable(
+                [0.0, 0.0, 0.02]
+            )
+            replacement["sensors"]["gyro"]["sample_hz"] = _randomizable(2500)
+            replacement["sensors"]["gyro"]["delay"] = _randomizable(0.0004)
+            base_path = self._write_named_config(root, "base.json", base)
+            replacement_path = self._write_named_config(
+                root, "replacement.json", replacement
+            )
+            control = torch.tensor(
+                [[0.8, 0.4, 0.2, -0.1, 0.3]] * 2, dtype=torch.float32
+            )
+
+            with SimulationEnvironment.create(base_path, 2, "cpu") as env:
+                env.reset(torch.tensor([True, False]), replacement_path)
+                env.advance(control)
+                env.advance(control)
+                actual_truth = env.observe("truth").values
+                actual_sensors = env.observe("sensor").values
+
+            with SimulationEnvironment.create(
+                replacement_path, 2, "cpu"
+            ) as standalone:
+                standalone.advance(control)
+                standalone.advance(control)
+                expected_truth = standalone.observe("truth").values
+                expected_sensors = standalone.observe("sensor").values
+
+            for name, expected in expected_truth.items():
+                torch.testing.assert_close(
+                    actual_truth[name][0], expected[0], rtol=0, atol=0
+                )
+            for name, expected in expected_sensors.items():
+                torch.testing.assert_close(
+                    actual_sensors[name][0], expected[0], rtol=0, atol=0
+                )
 
     def test_empty_reset_mask_is_noop_and_does_not_load_config(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

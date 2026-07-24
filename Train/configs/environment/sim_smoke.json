@@ -19,25 +19,19 @@
   },
   "motors": [
     {
-      "name": "left",
+      "name": "upper",
       "pwm_deadzone": {"value": 0.08},
       "pwm_to_rpm_table": {"value": [[0.0, 0.0], [0.08, 0.0], [1.0, 1800.0]]},
-      "tau_up": {"value": 0.03},
-      "tau_down": {"value": 0.05},
-      "thrust_curve": {"value": [[0.0, 0.0], [900.0, 4.0], [1800.0, 16.0]]},
-      "torque_curve": {"value": [[0.0, 0.0], [900.0, 0.08], [1800.0, 0.32]]},
-      "torque_sign": {"value": 1.0},
+      "time_constant": {"value": 0.04},
+      "torque_coefficient": {"value": 9.87654321e-8},
       "noise": {"distribution": "normal", "stddev": {"value": 5.0}}
     },
     {
-      "name": "right",
+      "name": "lower",
       "pwm_deadzone": {"value": 0.08},
       "pwm_to_rpm_table": {"value": [[0.0, 0.0], [0.08, 0.0], [1.0, 1800.0]]},
-      "tau_up": {"value": 0.03},
-      "tau_down": {"value": 0.05},
-      "thrust_curve": {"value": [[0.0, 0.0], [900.0, 4.0], [1800.0, 16.0]]},
-      "torque_curve": {"value": [[0.0, 0.0], [900.0, 0.08], [1800.0, 0.32]]},
-      "torque_sign": {"value": -1.0},
+      "time_constant": {"value": 0.04},
+      "torque_coefficient": {"value": 9.87654321e-8},
       "noise": {"distribution": "normal", "stddev": {"value": 5.0}}
     }
   ],
@@ -47,13 +41,14 @@
     {"name": "servo_3", "pwm_angle_table": {"value": [[-1.0, -0.35], [0.0, 0.0], [1.0, 0.35]]}, "tau": {"value": 0.02}, "max_speed": {"value": 8.0}, "backlash": {"value": 0.01}, "deadzone": {"value": 0.015}}
   ],
   "aerodynamics": {
+    "thrust_coefficients": {"value": [4.938271605e-6, 4.938271605e-6, 0.0]},
     "neutral_thrust_direction_b": {"value": [0.0, 0.0, -1.0]},
     "direct_thrust_center_b": {"value": [0.0, 0.0, 0.2]},
     "thrust_partition": {"direct": {"value": 0.4}, "grid_1": {"value": 0.2}, "grid_2": {"value": 0.2}, "grid_3": {"value": 0.2}},
     "grids": [
       {"name": "grid_1", "aerodynamic_center_b": {"value": [0.1, 0.0, 0.25]}, "deflection_axis_b": {"value": [1.0, 0.0, 0.0]}, "self_attenuation_curve": {"value": [[0.0, 1.0], [0.35, 0.85]]}, "vector_deflection": {"gain": {"value": 1.0}, "offset": {"value": 0.0}}},
-      {"name": "grid_2", "aerodynamic_center_b": {"value": [-0.05, 0.087, 0.25]}, "deflection_axis_b": {"value": [0.0, 1.0, 0.0]}, "self_attenuation_curve": {"value": [[0.0, 1.0], [0.35, 0.85]]}, "vector_deflection": {"gain": {"value": 1.0}, "offset": {"value": 0.0}}},
-      {"name": "grid_3", "aerodynamic_center_b": {"value": [-0.05, -0.087, 0.25]}, "deflection_axis_b": {"value": [1.0, 0.0, 0.0]}, "self_attenuation_curve": {"value": [[0.0, 1.0], [0.35, 0.85]]}, "vector_deflection": {"gain": {"value": 1.0}, "offset": {"value": 0.0}}}
+      {"name": "grid_2", "aerodynamic_center_b": {"value": [-0.05, 0.087, 0.25]}, "deflection_axis_b": {"value": [-0.5, 0.8660254, 0.0]}, "self_attenuation_curve": {"value": [[0.0, 1.0], [0.35, 0.85]]}, "vector_deflection": {"gain": {"value": 1.0}, "offset": {"value": 0.0}}},
+      {"name": "grid_3", "aerodynamic_center_b": {"value": [-0.05, -0.087, 0.25]}, "deflection_axis_b": {"value": [-0.5, -0.8660254, 0.0]}, "self_attenuation_curve": {"value": [[0.0, 1.0], [0.35, 0.85]]}, "vector_deflection": {"gain": {"value": 1.0}, "offset": {"value": 0.0}}}
     ],
     "coupling_attenuation": {"value": [[0.0, 0.1, 0.1], [0.1, 0.0, 0.1], [0.1, 0.1, 0.0]]}
   },
@@ -62,6 +57,13 @@
     "accelerometer": {"sample_hz": {"value": 5000}, "noise": {"distribution": "normal", "stddev": {"value": [0.02, 0.02, 0.02]}}, "bias": {"value": [0.0, 0.0, 0.0]}, "delay": {"value": 0.001}},
     "motor_speed": {"sample_hz": {"value": 5000}, "noise": {"distribution": "normal", "stddev": {"value": [2.0, 2.0]}}, "bias": {"value": [0.0, 0.0]}, "delay": {"value": 0.0}}
   },
-  "logging": {"directory": "../../runs/simulator", "chunk_steps": 1024, "queue_chunks": 2, "overflow": "block"}
+  "logging": {
+    "directory": "../../runs/simulator",
+    "mode": "compact",
+    "physics_step_stride": 10,
+    "fields": ["physics_step", "control_step", "sim_time_s", "control", "active_mask", "valid", "error_code", "generation", "event_code", "truth.position_n", "truth.attitude_q_wb", "truth.angular_velocity_b", "truth.motor_speed", "truth.total_thrust", "truth.servo_angle"],
+    "chunk_steps": 1024,
+    "queue_chunks": 2,
+    "overflow": "block"
+  }
 }
-
