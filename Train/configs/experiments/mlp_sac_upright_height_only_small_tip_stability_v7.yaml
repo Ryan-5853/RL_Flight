@@ -1,0 +1,225 @@
+# 128×128 MLP-SAC：在 v6 直立策略上加强 yaw-rate 控制的 v7。
+#
+# 相对 stability_v6：
+#   1. 从 v6 最佳保留 checkpoint 只热启动 actor；critic、优化器、replay、
+#      环境、课程和全局步数全部重新初始化，避免混用旧 reward 的 Q/replay；
+#   2. 角速度硬终止只检查机体系 p/q，不再因自由 yaw 达到 8 rad/s 而结束；
+#   3. 恢复 yaw-rate 奖励：1 rad/s 以上转为线性，再平滑饱和到代价 16，
+#      既保留高 yaw 区间的学习信号，也防止策略牺牲直立换取短时 yaw 收益；
+#   4. 课程同时要求 roll/pitch RMSE <= 10 deg、yaw-rate RMSE <= 1 rad/s；
+#   5. 固定评测恢复 yaw-rate 跟踪得分，并以 0.5 rad/s 作为 best 门槛；
+#   6. RP 在 20 deg 内保持二次代价，超过后线性增长，不再允许倾倒区“免费”；
+#   7. 冻结 v6 actor 作为训练期动作锚点，允许每维 0.08 的自由改进区间，
+#      超出后施加漂移正则。部署模型仍是原 314 -> 4 actor，接口完全不变；
+#   8. 每次固定评测独立保留 best_total、best_upright、best_yaw，并仅在全部
+#      质量门槛通过时更新 best_fixed，避免好阶段被 keep_last 轮转删除。
+#
+# 启动：
+#   flight-train run \
+#     --config configs/experiments/mlp_sac_upright_height_only_small_tip_stability_v7.yaml
+
+schema_version: 2
+
+experiment:
+  name: mlp_sac_upright_height_only_small_tip_stability_v7
+  entrypoint:
+    type: "flight_train.runner:run_experiment"
+    version: "train-framework-v1"
+
+seed:
+  base: 20260725
+  deterministic_algorithms: true
+  cudnn_benchmark: false
+
+run:
+  device: cuda:0
+  dtype: float32
+  parallel_count: 256
+  # policy 热启动后作为一轮全新的训练预算，从 0 重新计数。
+  total_control_steps: 16777216
+  output_root: ../../runs
+  allow_unimplemented_simulator: false
+
+environment:
+  factory: "simenv:SimulationEnvironment"
+  config_path: ../environment/gru_sac_upright_height_only_small_tip.yaml
+  observation_source: truth
+
+command_source:
+  type: "flight_train.commands:VirtualPilotCommandSource"
+  version: "2"
+  seed: 52025
+  params:
+    throttle:
+      minimum: 0.20
+      maximum: 0.85
+      spool:
+        duration_s: 0.10
+        target_range: [0.54, 0.58]
+      height_controller:
+        observation_source: truth
+        target_m: 0.0
+        initial_throttle_range: [0.55, 0.58]
+        proportional_gain: 0.08
+        integral_gain: 0.04
+        error_limit_m: 5.0
+      slew_rate:
+        rise_per_s: 4.0
+        fall_per_s: 0.35
+    sticks:
+      roll:  {mode: angle, limit_rad: 0.0, time_constant_s: 0.20}
+      pitch: {mode: angle, limit_rad: 0.0, time_constant_s: 0.20}
+      yaw:   {mode: rate, limit_rad_s: 0.0, time_constant_s: 0.30}
+      target_sampling:
+        distribution: centered
+        center_exponent: 2.0
+        hold_duration_s:
+          range: [2.0, 4.0]
+      reset:
+        filtered_stick: zero
+        initial_target_scale: 0.0
+
+control_contract:
+  version: self_stabilize_v1
+  observation_profile: attitude_self_stabilize_21d_v3
+  observation_history:
+    mode: multirate_actuator
+    dense_action_steps: 32
+    sparse_physical_frames: 15
+    sparse_physical_stride_steps: 4
+  action_transform:
+    type: residual_around_trim
+    trim_command: [0.53523, 0.0, 0.0, 0.0]
+    residual_scale: [0.30, 1.0, 1.0, 1.0]
+  policy_action:
+    fields: [lower_motor, servo_1, servo_2, servo_3]
+  external_action:
+    fields: [upper_motor]
+  simulator_command:
+    fields: [upper_motor, lower_motor, servo_1, servo_2, servo_3]
+
+randomization:
+  static:
+    seed: 32025
+    scope: episode
+    parameters: {}
+  dynamic:
+    seed: 42025
+    scope: simulator
+    parameters: {}
+
+task:
+  episode_duration_s: 30.0
+  episode_curriculum:
+    durations_s:   [2.5, 3.5, 5.0, 10.0, 30.0]
+    target_scales: [0.0, 0.0, 0.0,  0.0,  0.0]
+    success_fraction: 0.80
+    evaluation_episodes_per_env: 1.0
+    consecutive_passes: 2
+    quality_gate:
+      max_roll_pitch_rmse_rad: 0.17453292519943295
+      # 课程先要求抑制到 1 rad/s；best 固定评测再使用 0.5 rad/s。
+      max_yaw_rate_rmse_rad_s: 1.0
+  termination:
+    max_tilt_rad: 1.0
+    max_angular_rate_rad_s: 8.0
+    # 只以 p/q 角速度触发硬终止；yaw 由连续奖励控制，不再截断生存。
+    angular_rate_axes: roll_pitch
+
+reward:
+  calculator:
+    type: "flight_train.rewards.attitude:AttitudeRewardCalculator"
+    version: "3"
+    params:
+      roll_pitch_weight: 0.55
+      # 20 deg 内二次、以外线性：保留梯度，同时避免大倾角平方项击穿 Q。
+      roll_pitch_huber_delta_rad: 0.3490658503988659
+      tilt_weight: 0.08
+
+      # |yaw-rate error| <= 1 时二次，之后线性并平滑饱和；reward 代价 < 0.025。
+      yaw_rate_weight: 0.0015625
+      yaw_rate_huber_delta_rad_s: 1.0
+      yaw_rate_cost_cap: 16.0
+      angular_rate_weight: 0.0003125
+
+      action_rate_weight: 0.002
+      saturation_weight: 0.01
+      alive_bonus: 0.02
+      survival_progress_weight: 0.0
+
+      tilt_barrier_weight: 0.02
+      # v7 的 rate_ratio 只来自 p/q，因此恢复 barrier 不会间接惩罚 yaw。
+      rate_barrier_weight: 0.002
+      barrier_start_fraction: 0.30
+      barrier_exponent: 2.0
+
+      termination_penalty: 10.0
+      early_termination_penalty: 10.0
+  context:
+    fields:
+      - {name: attitude_geodesic_rad, source: task}
+      - {name: angular_velocity_b, source: truth}
+      - {name: static_domain, source: train_randomizer, visibility: reward_only}
+
+model:
+  type: mlp_actor_critic
+  hidden_sizes: [128, 128]
+  policy_distribution:
+    learnable_action_std: false
+    initial_action_std: [0.04, 0.035, 0.035, 0.035]
+    minimum_action_std: [0.01, 0.01, 0.01, 0.01]
+    maximum_action_std: [0.06, 0.05, 0.05, 0.05]
+
+algorithm:
+  name: sac
+  gamma: 0.999
+  n_step_return: 16
+  replay:
+    capacity_transitions: 2097152
+    warmup_transitions: 262144
+    batch_size: 4096
+  # 新 reward 下重新拟合 critic；此阶段 actor 保持 v6 热启动权重不动。
+  critic_pretraining_updates: 1024
+  actor_update_interval: 8
+  # 参考策略只参与训练损失；不包装、不扩展实际 actor 的端到端接口。
+  policy_anchor:
+    weight: 10.0
+    max_action_deviation: 0.08
+  updates_per_collection: 64
+  target_update:
+    tau: 0.0025
+    interval_updates: 1
+  entropy:
+    automatic: true
+    initial_alpha: 0.001
+    target_entropy: -4.0
+    min_alpha: 0.0001
+    max_alpha: 0.005
+  actor_max_grad_norm: 1.0
+  critic_max_grad_norm: 2.5
+  optimizer:
+    type: adam
+    actor_learning_rate: 0.000015
+    critic_learning_rate: 0.0002
+    alpha_learning_rate: 0.0001
+
+collector:
+  control_steps_per_rollout: 512
+
+evaluation:
+  enabled: true
+  interval_control_steps: 1048576
+  suite_path: ../evaluation/fixed_self_stabilize_v2.yaml
+
+checkpoint:
+  # checkpoint 预计约 5 GiB；写前还必须保留 8 GiB 给状态和日志收尾。
+  minimum_free_space_bytes: 8589934592
+  resume:
+    # v6 保留点中，最终 checkpoint 的训练生存最高、动作最小，且完整
+    # p/q-only 悬停评测能跑满 10 s；这里只加载 actor，不加载旧 Q/replay。
+    from: ../../runs/mlp_sac_upright_height_only_small_tip_stability_v6/20260725T231938Z_ef791427f690_d8f8c4a0/checkpoints/step_16777216.pt
+    mode: policy
+  interval_control_steps: 524288
+  keep_last: 4
+
+recording: {}

@@ -6,6 +6,7 @@ from typing import Any, Mapping
 
 import torch
 from tensordict import TensorDictBase
+from simenv import InsufficientDiskSpaceError as SimulatorDiskSpaceError
 
 from .algorithms import TorchRLPPO, TorchRLSAC
 from .collector import TensorDictRolloutCollector
@@ -15,7 +16,11 @@ from .envs import SimEnvAdapter
 from .models import build_actor_critic, build_sac_actor_critic
 from .progress import LiveTrainingProgress
 from .randomization import StaticRandomizer
-from .recording import RunRecorder, load_checkpoint
+from .recording import (
+    InsufficientDiskSpaceError as CheckpointDiskSpaceError,
+    RunRecorder,
+    load_checkpoint,
+)
 from .registry import ComponentRegistry
 
 
@@ -132,6 +137,10 @@ def run_experiment(config: ExperimentConfig) -> dict[str, Any]:
     global_steps = 0
     status = "failed"
     stop_signal: int | None = None
+    stop_reason: str | None = None
+    stop_detail: str | None = None
+    last_checkpoint_step: int | None = None
+    last_checkpoint_kind: str | None = None
     previous_signal_handlers: dict[int, Any] = {}
 
     def request_safe_stop(signum: int, _frame: Any) -> None:
@@ -142,6 +151,12 @@ def run_experiment(config: ExperimentConfig) -> dict[str, Any]:
             raise KeyboardInterrupt
         stop_signal = signum
     try:
+        recorder = RunRecorder(config)
+        progress = LiveTrainingProgress(config, recorder.run_id)
+        # A policy/exact resume checkpoint gives a useful estimate before the
+        # first rollout. Fresh runs are checked again with their concrete state
+        # immediately before the first checkpoint.
+        recorder.ensure_checkpoint_capacity()
         registry = ComponentRegistry()
         reward_calculator = registry.build_reward(
             {
@@ -209,31 +224,47 @@ def run_experiment(config: ExperimentConfig) -> dict[str, Any]:
             if config.ppo is None:
                 raise RuntimeError("parsed PPO configuration is missing")
             algorithm = TorchRLPPO(model, config.ppo, device)
-        resume_state = None
+        resume_parent_run_id: str | None = None
+        resume_source_global_control_steps: int | None = None
         if config.checkpoint.resume_from is not None:
             resume_state = load_checkpoint(config.checkpoint.resume_from)
-            global_steps = _restore_exact(
-                config,
-                resume_state,
-                env=env,
-                model=model,
-                algorithm=algorithm,
-                collector=collector,
-                static_randomizer=static_randomizer,
-                reward_calculator=reward_calculator,
-                device=device,
+            resume_parent_run_id = (
+                str(resume_state.get("run_id") or "") or None
             )
-        recorder = RunRecorder(config)
-        progress = LiveTrainingProgress(config, recorder.run_id)
+            resume_source_global_control_steps = int(
+                resume_state.get("global_control_steps", -1)
+            )
+            if config.checkpoint.resume_mode == "exact":
+                global_steps = _restore_exact(
+                    config,
+                    resume_state,
+                    env=env,
+                    model=model,
+                    algorithm=algorithm,
+                    collector=collector,
+                    static_randomizer=static_randomizer,
+                    reward_calculator=reward_calculator,
+                    device=device,
+                )
+            else:
+                _restore_policy(resume_state, model=model)
+                if isinstance(algorithm, TorchRLSAC):
+                    algorithm.initialize_policy_anchor()
+            # policy 热启动只需 actor；exact restore 也已把所有状态复制到对应
+            # 组件。及时释放包含完整 replay 的 CPU checkpoint，避免训练全程
+            # 额外占用约 5 GB 主存。
+            del resume_state
         recorder.bind_environment(
             batch_id=env.simulator.batch_id,
             instance_ids=env.simulator.instance_ids,
             simulator_log_directory=env.simulator.log_directory,
         )
-        if resume_state is not None:
+        if config.checkpoint.resume_from is not None:
             recorder.bind_resume(
                 checkpoint=config.checkpoint.resume_from,
-                parent_run_id=str(resume_state.get("run_id") or "") or None,
+                parent_run_id=resume_parent_run_id,
+                mode=config.checkpoint.resume_mode,
+                source_global_control_steps=resume_source_global_control_steps,
             )
         if threading.current_thread() is threading.main_thread():
             for signum in (signal.SIGINT, signal.SIGTERM):
@@ -253,12 +284,13 @@ def run_experiment(config: ExperimentConfig) -> dict[str, Any]:
             )
             * config.evaluation.interval_control_steps
         )
-        last_checkpoint_step: int | None = None
-        last_checkpoint_kind: str | None = None
         rollout_index = global_steps // (
             config.run.parallel_count * config.run.rollout_steps
         )
         while global_steps < config.run.total_control_steps:
+            # Stop at a rollout boundary before subsequent logs can consume the
+            # capacity reserved for the next atomic checkpoint.
+            recorder.ensure_checkpoint_capacity()
             rollout_index += 1
             model.set_exploration_progress(
                 global_steps / float(config.model.exploration_decay_control_steps)
@@ -277,9 +309,14 @@ def run_experiment(config: ExperimentConfig) -> dict[str, Any]:
                     > 0.5
                 )
             )
+            curriculum_quality_success = rollout.get(
+                ("next", "curriculum_quality_success"),
+                None,
+            )
             curriculum_metrics = env.update_episode_curriculum(
                 rollout[("next", "terminated")],
                 rollout[("next", "truncated")],
+                curriculum_quality_success,
                 allow_promotion=not sac_learning_locked,
             )
             # TensorDict 的 [B,T] batch 元素数就是本轮新增的控制决策总数。
@@ -366,20 +403,55 @@ def run_experiment(config: ExperimentConfig) -> dict[str, Any]:
                     hover_survival = float(
                         hover["metrics"]["survival_time_s"]["mean"]
                     )
-                    promoted_best = recorder.promote_best_evaluation_checkpoint(
+                    hover_roll_pitch_rmse = float(
+                        hover["metrics"]["roll_pitch_rmse_deg"]["mean"]
+                    )
+                    hover_yaw_rate_rmse = float(
+                        hover["metrics"]["yaw_rate_rmse_rad_s"]["mean"]
+                    )
+                    selection = suite.checkpoint_selection
+                    best_quality_passed = (
+                        hover_survival
+                        >= selection.minimum_hover_survival_s
+                        and hover_roll_pitch_rmse
+                        <= selection.maximum_hover_roll_pitch_rmse_deg
+                        and (
+                            selection.maximum_hover_yaw_rate_rmse_rad_s is None
+                            or hover_yaw_rate_rmse
+                            <= selection.maximum_hover_yaw_rate_rmse_rad_s
+                        )
+                    )
+                    promoted = recorder.promote_evaluation_checkpoints(
                         checkpoint_path,
                         control_steps=global_steps,
                         hover_survival_s=hover_survival,
+                        hover_roll_pitch_rmse_deg=hover_roll_pitch_rmse,
+                        hover_yaw_rate_rmse_rad_s=hover_yaw_rate_rmse,
                         total_score=float(
                             evaluation_result["report"]["total_score"]
                         ),
+                        minimum_hover_survival_s=(
+                            selection.minimum_hover_survival_s
+                        ),
+                        quality_passed=best_quality_passed,
                     )
                     print(
                         "固定评测完成 | "
                         f"控制步={global_steps} | "
                         f"总分={evaluation_result['report']['total_score']:.2f} | "
-                        f"悬停生存={hover_survival:.2f}s"
-                        + (" | 已更新 best" if promoted_best else ""),
+                        f"悬停生存={hover_survival:.2f}s | "
+                        f"横滚俯仰RMSE={hover_roll_pitch_rmse:.2f}deg | "
+                        f"偏航角速度RMSE={hover_yaw_rate_rmse:.2f}rad/s"
+                        + (
+                            ""
+                            if best_quality_passed
+                            else " | 未通过 best 质量门槛"
+                        )
+                        + (
+                            f" | 已更新 best={','.join(promoted)}"
+                            if promoted
+                            else ""
+                        ),
                         flush=True,
                     )
                     while next_evaluation_step <= global_steps:
@@ -438,21 +510,51 @@ def run_experiment(config: ExperimentConfig) -> dict[str, Any]:
             last_checkpoint_kind = "final"
         if status != "interrupted":
             status = "completed"
-        return {
-            "run_directory": recorder.directory,
-            "global_control_steps": global_steps,
-            "status": status,
-        }
+    except (CheckpointDiskSpaceError, SimulatorDiskSpaceError) as exc:
+        status = "interrupted"
+        stop_reason = "insufficient_disk_space"
+        stop_detail = str(exc)
+        print(
+            "磁盘空间不足，已在安全边界停止训练"
+            f" | 控制步={global_steps:,}"
+            f" | 最近完整 checkpoint={last_checkpoint_step}"
+            f" | {exc}",
+            flush=True,
+        )
     finally:
-        # 即使创建或训练中途抛错，也释放仿真资源并留下 failed 状态记录。
+        # 即使创建或训练中途抛错，也释放仿真资源并留下状态记录。SimEnv
+        # 可能只在关闭时等待到后台写入结果，因此这里仍识别空间保护异常。
+        close_error: BaseException | None = None
         if env is not None:
-            env.close()
+            try:
+                env.close()
+            except SimulatorDiskSpaceError as exc:
+                status = "interrupted"
+                stop_reason = "insufficient_disk_space"
+                stop_detail = str(exc)
+            except BaseException as exc:
+                close_error = exc
         if recorder is not None:
-            recorder.close(status, global_steps)
+            recorder.close(
+                status,
+                global_steps,
+                reason=stop_reason,
+                detail=stop_detail,
+                last_checkpoint_step=last_checkpoint_step,
+            )
         if progress is not None:
             progress.finish(status, global_steps)
         for signum, handler in previous_signal_handlers.items():
             signal.signal(signum, handler)
+        if close_error is not None:
+            raise close_error
+    return {
+        "run_directory": recorder.directory,
+        "global_control_steps": global_steps,
+        "status": status,
+        "reason": stop_reason,
+        "last_checkpoint_step": last_checkpoint_step,
+    }
 
 
 def _checkpoint_state(
@@ -488,6 +590,14 @@ def _checkpoint_state(
             "observation_history_index": env.observation_history_index,
             "episode_id": env.episode_id,
             "episode_step": env.episode_step,
+            "episode_roll_pitch_squared_sum": (
+                env.episode_roll_pitch_squared_sum
+            ),
+            "episode_yaw_rate_squared_sum": env.episode_yaw_rate_squared_sum,
+            "episode_angular_rate_squared_sum": (
+                env.episode_angular_rate_squared_sum
+            ),
+            "episode_quality_steps": env.episode_quality_steps,
             "command_source": env.command_source.state_dict(),
             "static_parameters": env.current_static_parameters,
             "dynamic_parameters": {
@@ -557,6 +667,23 @@ def _restore_exact(
     _copy_training_tensor(env.previous_action, training, "previous_policy_action")
     _copy_training_tensor(env.episode_id, training, "episode_id")
     _copy_training_tensor(env.episode_step, training, "episode_step")
+    for tensor, name in (
+        (
+            env.episode_roll_pitch_squared_sum,
+            "episode_roll_pitch_squared_sum",
+        ),
+        (env.episode_yaw_rate_squared_sum, "episode_yaw_rate_squared_sum"),
+        (
+            env.episode_angular_rate_squared_sum,
+            "episode_angular_rate_squared_sum",
+        ),
+        (env.episode_quality_steps, "episode_quality_steps"),
+    ):
+        stored = training.get(name)
+        if stored is None:
+            tensor.zero_()
+        else:
+            _copy_training_tensor(tensor, training, name)
     env.command_source.load_state_dict(training["command_source"])
     curriculum = training.get("episode_curriculum")
     if not isinstance(curriculum, Mapping):
@@ -633,6 +760,15 @@ def _restore_exact(
             raise ValueError("checkpoint CUDA RNG state is incompatible with visible devices")
         torch.cuda.set_rng_state_all(cuda_rng)
     return global_steps
+
+
+def _restore_policy(state: Mapping[str, Any], *, model) -> None:
+    """只恢复策略权重；新目标下的 critic、replay 与优化器从头初始化。"""
+
+    actor_state = state.get("actor")
+    if not isinstance(actor_state, Mapping):
+        raise ValueError("checkpoint actor state is missing")
+    model.actor.load_state_dict(actor_state, strict=True)
 
 
 def _copy_training_tensor(

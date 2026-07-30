@@ -1,0 +1,200 @@
+# 双层 128 单元 GRU-SAC：直立定高，修复 replay/信用分配/探索并简化奖励。
+#
+# 相对 gru_sac_upright_height_only_small_tip.yaml，本配置只处理：
+#   2. collector 长于 recurrent replay 样本，使 SliceSampler 可生成滑动窗口；
+#   3. 使用覆盖舵机主要响应时间的 16-step return；
+#   4. actor 延迟到 critic 完成 512 次更新后再开始学习；
+#   6. 限制 SAC 探索方差，避免随机舵量淹没策略均值；
+#   7. 每 1,048,576 控制步执行一次固定确定性评测。
+# 奖励只表达“存活并保持机体竖直、抑制角速度”，删除重复 shaping。
+# GRU 结构保持不变。
+#
+# 启动：
+#   flight-train run \
+#     --config configs/experiments/gru_sac_upright_height_only_small_tip_credit_fixed.yaml
+
+schema_version: 2
+
+experiment:
+  name: gru_sac_upright_height_only_small_tip_credit_fixed
+  entrypoint:
+    type: "flight_train.runner:run_experiment"
+    version: "train-framework-v1"
+
+seed:
+  # 保持与原实验相同，确保差异只来自下面列出的训练配置。
+  base: 20260725
+  deterministic_algorithms: true
+  cudnn_benchmark: false
+
+run:
+  device: cuda:0
+  dtype: float32
+  parallel_count: 256
+  total_control_steps: 16777216
+  output_root: ../../runs
+  allow_unimplemented_simulator: false
+
+environment:
+  factory: "simenv:SimulationEnvironment"
+  config_path: ../environment/gru_sac_upright_height_only_small_tip.yaml
+  observation_source: truth
+
+command_source:
+  type: "flight_train.commands:VirtualPilotCommandSource"
+  version: "2"
+  seed: 52025
+  params:
+    throttle:
+      minimum: 0.20
+      maximum: 0.85
+      spool:
+        duration_s: 0.10
+        target_range: [0.54, 0.58]
+      height_controller:
+        observation_source: truth
+        target_m: 0.0
+        initial_throttle_range: [0.55, 0.58]
+        proportional_gain: 0.08
+        integral_gain: 0.04
+        error_limit_m: 5.0
+      slew_rate:
+        rise_per_s: 4.0
+        fall_per_s: 0.35
+    sticks:
+      roll:  {mode: angle, limit_rad: 0.0, time_constant_s: 0.20}
+      pitch: {mode: angle, limit_rad: 0.0, time_constant_s: 0.20}
+      yaw:   {mode: rate, limit_rad_s: 0.0, time_constant_s: 0.30}
+      target_sampling:
+        distribution: centered
+        center_exponent: 2.0
+        hold_duration_s:
+          range: [2.0, 4.0]
+      reset:
+        filtered_stick: zero
+        initial_target_scale: 0.0
+
+control_contract:
+  version: self_stabilize_v1
+  observation_profile: attitude_self_stabilize_21d_v3
+  action_transform:
+    type: residual_around_trim
+    trim_command: [0.53523, 0.0, 0.0, 0.0]
+    residual_scale: [0.30, 1.0, 1.0, 1.0]
+  policy_action:
+    fields: [lower_motor, servo_1, servo_2, servo_3]
+  external_action:
+    fields: [upper_motor]
+  simulator_command:
+    fields: [upper_motor, lower_motor, servo_1, servo_2, servo_3]
+
+randomization:
+  static:
+    seed: 32025
+    scope: episode
+    parameters: {}
+  dynamic:
+    seed: 42025
+    scope: simulator
+    parameters: {}
+
+task:
+  episode_duration_s: 30.0
+  termination:
+    max_tilt_rad: 1.0
+    max_angular_rate_rad_s: 8.0
+
+reward:
+  calculator:
+    type: "flight_train.rewards.attitude:AttitudeRewardCalculator"
+    version: "3"
+    params:
+      # tilt 终止阈值为 1 rad，因此这里等价于
+      # -0.08 * (tilt_rad / 1.0 rad)^2。
+      roll_pitch_weight: 0
+      tilt_weight: 0.08
+      # 角速度终止阈值为 8 rad/s；0.01 / 8^2 = 0.00015625。
+      # p/q 和 yaw 均按同一阈值归一化，防止 yaw 再次主导总奖励。
+      yaw_rate_weight: 0.00015625
+      angular_rate_weight: 0.00015625
+      action_rate_weight: 0
+      saturation_weight: 0
+      alive_bonus: 0.02
+      survival_progress_weight: 0.0
+      tilt_barrier_weight: 0
+      rate_barrier_weight: 0
+      barrier_start_fraction: 0.30
+      barrier_exponent: 2.0
+      termination_penalty: 10.0
+      early_termination_penalty: 0.0
+  context:
+    fields:
+      - {name: attitude_geodesic_rad, source: task}
+      - {name: angular_velocity_b, source: truth}
+      - {name: static_domain, source: train_randomizer, visibility: reward_only}
+
+model:
+  type: gru_actor_critic
+  encoder:
+    hidden_sizes: [128, 128]
+  recurrent:
+    hidden_sizes: [128, 128]
+  actor_head:
+    hidden_sizes: [128]
+  policy_distribution:
+    learnable_action_std: true
+    initial_action_std: [0.06, 0.05, 0.05, 0.05]
+    minimum_action_std: [0.01, 0.015, 0.015, 0.015]
+    maximum_action_std: [0.10, 0.08, 0.08, 0.08]
+
+algorithm:
+  name: sac
+  gamma: 0.999
+  # 16 control steps = 32 ms，覆盖 20 ms 舵机时间常数的主要响应区间。
+  n_step_return: 16
+  replay:
+    capacity_transitions: 1048576
+    # 目标为约两轮 512-step collector 的数据规模；16-step pending 会使首次
+    # 达到阈值的更新自然落在第三轮 collector。
+    warmup_transitions: 262144
+    batch_size: 4096
+    burn_in_steps: 128
+    sequence_length: 128
+  # 512 次只更新 critic；按每轮 64 次更新，约 8 个学习轮次后启用 actor。
+  critic_pretraining_updates: 512
+  # 每轮新增 131,072 步；64 次更新各使用 2,048 个有效训练步，
+  # 有效训练样本量与新增样本量约为 1:1。
+  updates_per_collection: 64
+  target_update:
+    tau: 0.005
+    interval_updates: 1
+  entropy:
+    automatic: true
+    initial_alpha: 0.05
+    target_entropy: auto
+  actor_max_grad_norm: 1.0
+  critic_max_grad_norm: 5.0
+  optimizer:
+    type: adam
+    actor_learning_rate: 0.0003
+    critic_learning_rate: 0.0003
+    alpha_learning_rate: 0.0003
+
+collector:
+  # 总 replay 样本长度仍为 256；512 步片段可产生多个滑动窗口。
+  control_steps_per_rollout: 512
+
+evaluation:
+  enabled: true
+  interval_control_steps: 1048576
+  suite_path: ../evaluation/fixed_attitude_v1.yaml
+
+checkpoint:
+  resume:
+    from: null
+    mode: exact
+  # 评测只能在 checkpoint 边界执行；每 4 个 collector 保存一次。
+  interval_control_steps: 524288
+  keep_last: 4
+
+recording: {}

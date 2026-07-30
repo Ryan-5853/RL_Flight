@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import tempfile
 import unittest
@@ -275,6 +276,57 @@ class SimulationEnvironmentTests(unittest.TestCase):
             with SimulationEnvironment.create(path, 3, "cpu") as target:
                 with self.assertRaises(ConfigurationError):
                     target.load_state_dict(state)
+
+    def test_complete_state_ignores_logging_config_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_config = _config(str(root / "source-logs"))
+            source_config["logging"]["minimum_free_space_bytes"] = 0
+            target_config = deepcopy(source_config)
+            target_config["logging"].update(
+                {
+                    "directory": str(root / "target-logs"),
+                    "chunk_steps": 8,
+                    "queue_chunks": 3,
+                    "minimum_free_space_bytes": 1,
+                }
+            )
+            source_path = self._write_named_config(
+                root, "source.json", source_config
+            )
+            target_path = self._write_named_config(
+                root, "target.json", target_config
+            )
+
+            with SimulationEnvironment.create(source_path, 2, "cpu") as source:
+                state = source.state_dict()
+            with SimulationEnvironment.create(target_path, 2, "cpu") as target:
+                target.load_state_dict(state)
+
+    def test_complete_state_accepts_hash_before_disk_reserve_field(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = _config(str(root / "logs"))
+            config["logging"]["minimum_free_space_bytes"] = 0
+            path = self._write_named_config(root, "config.json", config)
+
+            with SimulationEnvironment.create(path, 2, "cpu") as source:
+                state = source.state_dict()
+
+            legacy_config = deepcopy(config)
+            legacy_config["logging"].pop("minimum_free_space_bytes")
+            payload = json.dumps(
+                legacy_config,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+            state["compatibility"]["config_sha256"] = hashlib.sha256(
+                payload.encode("utf-8")
+            ).hexdigest()
+
+            with SimulationEnvironment.create(path, 2, "cpu") as target:
+                target.load_state_dict(state)
 
     def test_rigid_body_free_fall_uses_ned_gravity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

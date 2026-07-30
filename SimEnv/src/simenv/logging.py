@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import errno
 import json
+import os
 import queue
 import shutil
 import threading
@@ -10,7 +12,7 @@ from typing import Any, Callable, Mapping
 import torch
 
 from .config import LoggingConfig
-from .errors import LoggingError
+from .errors import InsufficientDiskSpaceError, LoggingError
 
 
 class TensorChunkLogger:
@@ -32,6 +34,7 @@ class TensorChunkLogger:
         self._mode = config.mode
         self._physics_step_stride = config.physics_step_stride
         self._fields = config.fields
+        self._minimum_free_space_bytes = config.minimum_free_space_bytes
         self._physics_append_count = 0
         self._queue: queue.Queue[object] = queue.Queue(maxsize=config.queue_chunks)
         self._sentinel = object()
@@ -42,29 +45,42 @@ class TensorChunkLogger:
         self._closed = False
         self._writer_error: BaseException | None = None
 
-        shutil.copyfile(config_path, self.directory / f"config{config_path.suffix or '.yaml'}")
-        (self.directory / "metadata.json").write_text(
-            json.dumps(
-                {
-                    "batch_id": batch_id,
-                    "instance_ids": instance_ids,
-                    "schema_version": raw_config.get("schema_version"),
-                    "logging_mode": config.mode,
-                    "physics_step_stride": config.physics_step_stride,
-                    "timeline_fields": list(config.fields) if config.fields is not None else "all",
-                    "reset_parameters": "selected_instances" if config.mode == "compact" else "full_batch",
-                    "reset_event_storage": (
-                        "sparse_snapshot" if config.mode == "compact" else "full_batch_timeline"
-                    ),
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
+        self._ensure_disk_space(0, "initialize simulator logging")
+        shutil.copyfile(
+            config_path,
+            self.directory / f"config{config_path.suffix or '.yaml'}",
         )
-        torch.save(
+        metadata = json.dumps(
+            {
+                "batch_id": batch_id,
+                "instance_ids": instance_ids,
+                "schema_version": raw_config.get("schema_version"),
+                "logging_mode": config.mode,
+                "physics_step_stride": config.physics_step_stride,
+                "timeline_fields": (
+                    list(config.fields) if config.fields is not None else "all"
+                ),
+                "reset_parameters": (
+                    "selected_instances" if config.mode == "compact" else "full_batch"
+                ),
+                "reset_event_storage": (
+                    "sparse_snapshot"
+                    if config.mode == "compact"
+                    else "full_batch_timeline"
+                ),
+                "minimum_free_space_bytes": config.minimum_free_space_bytes,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        self._ensure_disk_space(
+            len(metadata.encode("utf-8")), "write simulator log metadata"
+        )
+        (self.directory / "metadata.json").write_text(metadata, encoding="utf-8")
+        self._atomic_torch_save(
             {name: value.detach().cpu() for name, value in parameters.items()},
             self.directory / "parameters.pt",
+            operation="write simulator parameters",
         )
 
         self._thread = threading.Thread(target=self._writer_loop, name=f"simlog-{batch_id}", daemon=True)
@@ -88,6 +104,7 @@ class TensorChunkLogger:
         """Persist one masked reset and, in compact mode, its selected post-reset state."""
         self._check_open()
         self._check_writer()
+        self._ensure_disk_space(0, "write simulator reset")
         reset_directory = self.directory / "resets" / f"{self._reset_index:06d}"
         reset_directory.mkdir(parents=True, exist_ok=False)
         shutil.copyfile(
@@ -123,9 +140,10 @@ class TensorChunkLogger:
         }
         if saved_timeline is not None:
             snapshot["post_reset_timeline"] = saved_timeline
-        torch.save(
+        self._atomic_torch_save(
             snapshot,
             reset_directory / "parameters.pt",
+            operation="write simulator reset parameters",
         )
         event = {
             "reset_index": self._reset_index,
@@ -141,8 +159,14 @@ class TensorChunkLogger:
             ],
             "config": str(config_path),
         }
-        with (self.directory / "resets.jsonl").open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(event, ensure_ascii=False) + "\n")
+        event_line = json.dumps(event, ensure_ascii=False) + "\n"
+        self._ensure_disk_space(
+            len(event_line.encode("utf-8")), "append simulator reset event"
+        )
+        with (self.directory / "resets.jsonl").open(
+            "a", encoding="utf-8"
+        ) as stream:
+            stream.write(event_line)
         self._reset_index += 1
 
     def append(self, record: Mapping[str, torch.Tensor], *, force: bool = False) -> None:
@@ -207,8 +231,29 @@ class TensorChunkLogger:
             self._enqueue(self._sentinel, force_block=True)
             self._thread.join()
             self._check_writer()
+        except BaseException:
+            self._stop_writer_without_flushing()
+            raise
         finally:
             self._closed = True
+
+    def _stop_writer_without_flushing(self) -> None:
+        """Release a failed writer without attempting any additional disk writes."""
+
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
+            else:
+                self._queue.task_done()
+        if self._thread.is_alive():
+            try:
+                self._queue.put_nowait(self._sentinel)
+            except queue.Full:
+                # The queue was drained above; this is only a defensive race.
+                pass
+            self._thread.join()
 
     def _allocate(self, record: Mapping[str, torch.Tensor]) -> None:
         for name, value in record.items():
@@ -251,7 +296,11 @@ class TensorChunkLogger:
                     chunk_index, payload, event = item
                     if event is not None:
                         event.synchronize()
-                    torch.save(payload, self.directory / f"timeline_{chunk_index:06d}.pt")
+                    self._atomic_torch_save(
+                        payload,
+                        self.directory / f"timeline_{chunk_index:06d}.pt",
+                        operation=f"write simulator timeline chunk {chunk_index}",
+                    )
                 finally:
                     self._queue.task_done()
         except BaseException as exc:
@@ -279,4 +328,129 @@ class TensorChunkLogger:
 
     def _check_writer(self) -> None:
         if self._writer_error is not None:
+            if isinstance(self._writer_error, InsufficientDiskSpaceError):
+                raise self._writer_error
             raise LoggingError("timeline writer failed") from self._writer_error
+
+    def _atomic_torch_save(
+        self,
+        value: Any,
+        destination: Path,
+        *,
+        operation: str,
+    ) -> None:
+        """Preflight, write to a temporary file, then atomically publish it."""
+
+        estimated_bytes = _tensor_storage_bytes(value)
+        self._ensure_disk_space(estimated_bytes, operation)
+        temporary = destination.with_suffix(destination.suffix + ".tmp")
+        temporary.unlink(missing_ok=True)
+        try:
+            torch.save(value, temporary)
+            _fsync_file(temporary)
+            temporary.replace(destination)
+            _fsync_directory(destination.parent)
+        except BaseException as exc:
+            available = _available_bytes(destination.parent)
+            partial_bytes = temporary.stat().st_size if temporary.exists() else 0
+            if (
+                _is_no_space_error(exc)
+                or available < self._minimum_free_space_bytes
+            ):
+                error = InsufficientDiskSpaceError(
+                    str(destination),
+                    available_bytes=available,
+                    required_bytes=max(
+                        estimated_bytes,
+                        partial_bytes,
+                    )
+                    + self._minimum_free_space_bytes,
+                    reserve_bytes=self._minimum_free_space_bytes,
+                    operation=operation,
+                )
+                self._writer_error = error
+                temporary.unlink(missing_ok=True)
+                raise error from exc
+            temporary.unlink(missing_ok=True)
+            raise
+
+    def _ensure_disk_space(self, write_bytes: int, operation: str) -> None:
+        available = _available_bytes(self.directory)
+        required = max(0, write_bytes) + self._minimum_free_space_bytes
+        if available < required:
+            error = InsufficientDiskSpaceError(
+                str(self.directory),
+                available_bytes=available,
+                required_bytes=required,
+                reserve_bytes=self._minimum_free_space_bytes,
+                operation=operation,
+            )
+            self._writer_error = error
+            raise error
+
+
+def _tensor_storage_bytes(value: Any) -> int:
+    """Conservatively estimate tensor payload bytes without serializing it."""
+
+    seen_objects: set[int] = set()
+    seen_storages: set[tuple[str, int, int]] = set()
+
+    def visit(item: Any) -> int:
+        object_id = id(item)
+        if object_id in seen_objects:
+            return 0
+        seen_objects.add(object_id)
+        if isinstance(item, torch.Tensor):
+            storage = item.untyped_storage()
+            key = (str(item.device), storage.data_ptr(), storage.nbytes())
+            if key in seen_storages:
+                return 0
+            seen_storages.add(key)
+            return storage.nbytes()
+        if isinstance(item, Mapping):
+            return sum(visit(child) for child in item.values())
+        if isinstance(item, (tuple, list)):
+            return sum(visit(child) for child in item)
+        return 0
+
+    return visit(value)
+
+
+def _available_bytes(path: Path) -> int:
+    return shutil.disk_usage(path).free
+
+
+def _is_no_space_error(error: BaseException) -> bool:
+    current: BaseException | None = error
+    while current is not None:
+        if isinstance(current, OSError) and current.errno in {
+            errno.ENOSPC,
+            errno.EDQUOT,
+        }:
+            return True
+        message = str(current).lower()
+        if (
+            "no space left on device" in message
+            or "disk quota exceeded" in message
+            or "iostream error" in message
+            or "unexpected pos" in message
+        ):
+            return True
+        current = current.__cause__
+    return False
+
+
+def _fsync_file(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)

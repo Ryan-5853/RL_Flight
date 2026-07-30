@@ -124,6 +124,13 @@ command_source:
 control_contract:
   version: self_stabilize_v1
   observation_profile: attitude_self_stabilize_21d_v3
+  # uniform 模式可把 21 维整帧等间隔堆叠；默认保持原 21 维输入。
+  # 需要同时保留高频动作和较长物理响应时可改用 multirate_actuator，
+  # 参数示例见 mlp_sac_upright_height_only_small_tip_credit_fixed.yaml。
+  observation_history:
+    mode: uniform
+    frames: 1
+    stride_steps: 1
   action_transform:
     # 应先在对应标称 SimEnv 上辨识；以下数值只与随模版提供的标称模型对应。
     type: residual_around_trim
@@ -283,6 +290,8 @@ evaluation: {}
 # 精确续训从一个带 .sha256 sidecar 的 checkpoint 启动。正常新实验保持 from: null；
 # 也可以不修改文件，使用 CLI --resume-from /absolute/path/step_N.pt。
 checkpoint:
+  # 新 checkpoint 的估算大小之外必须继续保留的可用空间。
+  minimum_free_space_bytes: 2147483648
   resume:
     from: null
     mode: exact

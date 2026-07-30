@@ -1,0 +1,221 @@
+# 128×128 MLP-SAC：直立定高稳定性 v5。
+#
+# 相对 stability_v4：
+#   1. 显式加入 roll/pitch 误差奖励，使训练目标与 10 deg 课程门槛对齐；
+#   2. actor 更新节奏放在 v3 与 v4 之间，避免过慢或快速追逐暂态 Q；
+#   3. 降低 critic 学习率、目标网络 tau 和 critic 梯度上限，抑制后期震荡；
+#   4. yaw 仍只抑制持续旋转，不锁定航向；
+#   5. replay、critic-only 预训练、课程、探索和固定评测保持不变。
+#
+# v4 后期能把 yaw-rate RMSE 降至约 0.40 rad/s，但 roll/pitch RMSE 恶化至
+# 约 23 deg、生存降至约 1.17 s。根因是原 reward 中 roll_pitch_weight=0，
+# 仅有的 tilt 代价在 10 deg 和 23 deg 附近都小于 alive bonus。
+#
+# 这是全新训练，不能 exact-resume v4 checkpoint。
+#
+# 启动：
+#   flight-train run \
+#     --config configs/experiments/mlp_sac_upright_height_only_small_tip_stability_v5.yaml
+
+schema_version: 2
+
+experiment:
+  name: mlp_sac_upright_height_only_small_tip_stability_v5
+  entrypoint:
+    type: "flight_train.runner:run_experiment"
+    version: "train-framework-v1"
+
+seed:
+  # 与 v4 保持相同随机流，使结果差异主要来自 reward 与更新稳定性。
+  base: 20260725
+  deterministic_algorithms: true
+  cudnn_benchmark: false
+
+run:
+  device: cuda:0
+  dtype: float32
+  parallel_count: 256
+  total_control_steps: 16777216
+  output_root: ../../runs
+  allow_unimplemented_simulator: false
+
+environment:
+  factory: "simenv:SimulationEnvironment"
+  config_path: ../environment/gru_sac_upright_height_only_small_tip.yaml
+  observation_source: truth
+
+command_source:
+  type: "flight_train.commands:VirtualPilotCommandSource"
+  version: "2"
+  seed: 52025
+  params:
+    throttle:
+      minimum: 0.20
+      maximum: 0.85
+      spool:
+        duration_s: 0.10
+        target_range: [0.54, 0.58]
+      height_controller:
+        observation_source: truth
+        target_m: 0.0
+        initial_throttle_range: [0.55, 0.58]
+        proportional_gain: 0.08
+        integral_gain: 0.04
+        error_limit_m: 5.0
+      slew_rate:
+        rise_per_s: 4.0
+        fall_per_s: 0.35
+    sticks:
+      roll:  {mode: angle, limit_rad: 0.0, time_constant_s: 0.20}
+      pitch: {mode: angle, limit_rad: 0.0, time_constant_s: 0.20}
+      yaw:   {mode: rate, limit_rad_s: 0.0, time_constant_s: 0.30}
+      target_sampling:
+        distribution: centered
+        center_exponent: 2.0
+        hold_duration_s:
+          range: [2.0, 4.0]
+      reset:
+        filtered_stick: zero
+        initial_target_scale: 0.0
+
+control_contract:
+  version: self_stabilize_v1
+  observation_profile: attitude_self_stabilize_21d_v3
+  observation_history:
+    mode: multirate_actuator
+    dense_action_steps: 32
+    sparse_physical_frames: 15
+    sparse_physical_stride_steps: 4
+  action_transform:
+    type: residual_around_trim
+    trim_command: [0.53523, 0.0, 0.0, 0.0]
+    residual_scale: [0.30, 1.0, 1.0, 1.0]
+  policy_action:
+    fields: [lower_motor, servo_1, servo_2, servo_3]
+  external_action:
+    fields: [upper_motor]
+  simulator_command:
+    fields: [upper_motor, lower_motor, servo_1, servo_2, servo_3]
+
+randomization:
+  static:
+    seed: 32025
+    scope: episode
+    parameters: {}
+  dynamic:
+    seed: 42025
+    scope: simulator
+    parameters: {}
+
+task:
+  episode_duration_s: 30.0
+  episode_curriculum:
+    # 零动作固定评测约 2.07 s；第一关设为 2.5 s，必须产生真正的稳定收益。
+    durations_s:   [2.5, 3.5, 5.0, 10.0, 30.0]
+    target_scales: [0.0, 0.0, 0.0,  0.0,  0.0]
+    success_fraction: 0.80
+    evaluation_episodes_per_env: 1.0
+    consecutive_passes: 2
+    quality_gate:
+      # 10 deg 的 roll/pitch 合成 RMSE；yaw 不锁航向，只限制角速度。
+      max_roll_pitch_rmse_rad: 0.17453292519943295
+      max_yaw_rate_rmse_rad_s: 0.50
+      max_angular_rate_rms_rad_s: 1.00
+  termination:
+    max_tilt_rad: 1.0
+    max_angular_rate_rad_s: 8.0
+
+reward:
+  calculator:
+    type: "flight_train.rewards.attitude:AttitudeRewardCalculator"
+    version: "3"
+    params:
+      # roll/pitch 合成误差为 10 deg 时，roll/pitch 与 tilt 总代价约为：
+      # (0.55 + 0.08) * radians(10)^2 = 0.0192，接近 alive_bonus=0.02。
+      # 因此课程质量门槛附近不再是明显的正奖励区域。
+      roll_pitch_weight: 0.55
+      tilt_weight: 0.08
+
+      # 只惩罚 yaw 角速度误差；静态 yaw 航向偏差仍不受惩罚。
+      yaw_rate_weight: 0.0015625
+      # 只抑制 p/q 方向的快速过度修正，不与 yaw-rate 代价重复。
+      angular_rate_weight: 0.0003125
+
+      action_rate_weight: 0.002
+      saturation_weight: 0.01
+      alive_bonus: 0.02
+      survival_progress_weight: 0.0
+
+      tilt_barrier_weight: 0.02
+      rate_barrier_weight: 0.002
+      barrier_start_fraction: 0.30
+      barrier_exponent: 2.0
+
+      termination_penalty: 10.0
+      early_termination_penalty: 10.0
+  context:
+    fields:
+      - {name: attitude_geodesic_rad, source: task}
+      - {name: angular_velocity_b, source: truth}
+      - {name: static_domain, source: train_randomizer, visibility: reward_only}
+
+model:
+  type: mlp_actor_critic
+  hidden_sizes: [128, 128]
+  policy_distribution:
+    learnable_action_std: false
+    initial_action_std: [0.04, 0.035, 0.035, 0.035]
+    minimum_action_std: [0.01, 0.01, 0.01, 0.01]
+    maximum_action_std: [0.06, 0.05, 0.05, 0.05]
+
+algorithm:
+  name: sac
+  gamma: 0.999
+  n_step_return: 16
+  replay:
+    # 保持 16-rollout replay，避免扩大 5 GB checkpoint 的磁盘占用。
+    capacity_transitions: 2097152
+    warmup_transitions: 262144
+    batch_size: 4096
+  # 保持完整 critic-only 阶段，不让 actor 在 Q 尚未拟合前移动。
+  critic_pretraining_updates: 1024
+  # v3 为 8、v4 为 4；取中间值 6，每轮约执行 10～11 次 actor/alpha 更新。
+  actor_update_interval: 6
+  updates_per_collection: 64
+  target_update:
+    # v4 为 0.005；减半以降低策略与目标 Q 同时漂移造成的追逐振荡。
+    tau: 0.0025
+    interval_updates: 1
+  entropy:
+    automatic: true
+    initial_alpha: 0.001
+    target_entropy: -4.0
+    min_alpha: 0.0001
+    max_alpha: 0.005
+  actor_max_grad_norm: 1.0
+  # v4 后期 critic 原始梯度曾超过 40；降低实际更新的裁剪上限。
+  critic_max_grad_norm: 2.5
+  optimizer:
+    type: adam
+    # 保持 v4 单次 actor 步长，但通过 interval=6 降低总体更新强度。
+    actor_learning_rate: 0.00002
+    # v4 为 3e-4；降低三分之一以减弱 replay 分布切换时的 Q 震荡。
+    critic_learning_rate: 0.0002
+    alpha_learning_rate: 0.0001
+
+collector:
+  control_steps_per_rollout: 512
+
+evaluation:
+  enabled: true
+  interval_control_steps: 1048576
+  suite_path: ../evaluation/fixed_self_stabilize_v2.yaml
+
+checkpoint:
+  resume:
+    from: null
+    mode: exact
+  interval_control_steps: 524288
+  keep_last: 4
+
+recording: {}

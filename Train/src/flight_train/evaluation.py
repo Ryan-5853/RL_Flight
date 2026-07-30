@@ -93,16 +93,28 @@ class ScoreLimits:
     settling_error_deg: float
     settling_window_s: float
     phase_lag_max_s: float
+    yaw_rate_rmse_bad_rad_s: float = 2.0
+
+
+@dataclass(frozen=True)
+class CheckpointSelectionCriteria:
+    minimum_hover_survival_s: float = 0.0
+    maximum_hover_roll_pitch_rmse_deg: float = float("inf")
+    maximum_hover_yaw_rate_rmse_rad_s: float | None = float("inf")
 
 
 @dataclass(frozen=True)
 class FixedEvaluationSuite:
+    schema_version: int
     name: str
     seed: int
     parallel_count: int
     scenarios: tuple[FixedScenario, ...]
     limits: ScoreLimits
     score_weights: Mapping[str, float]
+    self_stabilize_tracking: bool
+    yaw_rate_tracking_weight: float
+    checkpoint_selection: CheckpointSelectionCriteria
     output_root: Path
     source_path: Path
     raw: Mapping[str, Any]
@@ -192,11 +204,21 @@ def load_fixed_evaluation_suite(path: str | Path) -> FixedEvaluationSuite:
     raw = _load_mapping(source)
     _only_keys(
         raw,
-        {"schema_version", "name", "seed", "parallel_count", "output_root", "scenarios", "scoring"},
+        {
+            "schema_version",
+            "name",
+            "seed",
+            "parallel_count",
+            "output_root",
+            "scenarios",
+            "scoring",
+            "checkpoint_selection",
+        },
         "evaluation suite",
     )
-    if raw.get("schema_version") != 1:
-        raise ValueError("evaluation schema_version must equal 1")
+    schema_version = int(raw.get("schema_version", -1))
+    if schema_version not in {1, 2, 3}:
+        raise ValueError("evaluation schema_version must equal 1, 2, or 3")
     scenarios_node = raw.get("scenarios")
     if not isinstance(scenarios_node, list) or not scenarios_node:
         raise ValueError("evaluation scenarios must be a non-empty list")
@@ -209,9 +231,17 @@ def load_fixed_evaluation_suite(path: str | Path) -> FixedEvaluationSuite:
         raise ValueError(f"evaluation scenarios must contain exactly {sorted(required_types)}")
 
     scoring = _mapping(raw.get("scoring"), "scoring")
-    _only_keys(scoring, {"limits", "weights"}, "scoring")
+    scoring_fields = {"limits", "weights"}
+    if schema_version >= 3:
+        scoring_fields.add("self_stabilize_tracking")
+    _only_keys(scoring, scoring_fields, "scoring")
     limits_node = _mapping(scoring.get("limits"), "scoring.limits")
-    limit_names = tuple(ScoreLimits.__dataclass_fields__)
+    legacy_limit_names = tuple(ScoreLimits.__dataclass_fields__)[:-1]
+    limit_names = (
+        tuple(ScoreLimits.__dataclass_fields__)
+        if schema_version >= 2
+        else legacy_limit_names
+    )
     _only_keys(limits_node, set(limit_names), "scoring.limits")
     limits_values = {name: _positive_float(limits_node.get(name), f"scoring.limits.{name}") for name in limit_names}
     limits = ScoreLimits(**limits_values)
@@ -222,18 +252,85 @@ def load_fixed_evaluation_suite(path: str | Path) -> FixedEvaluationSuite:
     total_weight = sum(parsed_weights.values())
     if not math.isclose(total_weight, 1.0, abs_tol=1e-6):
         raise ValueError("scoring.weights must sum to 1")
+    if schema_version >= 3:
+        stabilization_scoring = _mapping(
+            scoring.get("self_stabilize_tracking"),
+            "scoring.self_stabilize_tracking",
+        )
+        _only_keys(
+            stabilization_scoring,
+            {"yaw_rate_weight"},
+            "scoring.self_stabilize_tracking",
+        )
+        yaw_rate_tracking_weight = _nonnegative_float(
+            stabilization_scoring.get("yaw_rate_weight"),
+            "scoring.self_stabilize_tracking.yaw_rate_weight",
+        )
+        if yaw_rate_tracking_weight > 1.0:
+            raise ValueError(
+                "scoring.self_stabilize_tracking.yaw_rate_weight must not exceed 1"
+            )
+    else:
+        yaw_rate_tracking_weight = 0.25
     output_root = Path(str(raw.get("output_root", "evaluation_runs")))
     if not output_root.is_absolute():
         output_root = (source.parent / output_root).resolve()
     parallel_count = _positive_int(raw.get("parallel_count"), "parallel_count")
     seed = _nonnegative_int(raw.get("seed"), "seed")
+    selection_node = raw.get("checkpoint_selection", {})
+    if not isinstance(selection_node, Mapping):
+        raise ValueError("checkpoint_selection must be a mapping")
+    selection_names = {
+        "minimum_hover_survival_s",
+        "maximum_hover_roll_pitch_rmse_deg",
+        "maximum_hover_yaw_rate_rmse_rad_s",
+    }
+    _only_keys(selection_node, selection_names, "checkpoint_selection")
+    required_selection_names = (
+        selection_names
+        if schema_version <= 2
+        else selection_names - {"maximum_hover_yaw_rate_rmse_rad_s"}
+    )
+    if (schema_version >= 2 or selection_node) and not (
+        required_selection_names.issubset(selection_node)
+    ):
+        missing = sorted(required_selection_names - set(selection_node))
+        raise ValueError(
+            f"checkpoint_selection is missing required fields: {missing}"
+        )
+    checkpoint_selection = (
+        CheckpointSelectionCriteria()
+        if not selection_node
+        else CheckpointSelectionCriteria(
+            minimum_hover_survival_s=_nonnegative_float(
+                selection_node["minimum_hover_survival_s"],
+                "checkpoint_selection.minimum_hover_survival_s",
+            ),
+            maximum_hover_roll_pitch_rmse_deg=_positive_float(
+                selection_node["maximum_hover_roll_pitch_rmse_deg"],
+                "checkpoint_selection.maximum_hover_roll_pitch_rmse_deg",
+            ),
+            maximum_hover_yaw_rate_rmse_rad_s=(
+                _positive_float(
+                    selection_node["maximum_hover_yaw_rate_rmse_rad_s"],
+                    "checkpoint_selection.maximum_hover_yaw_rate_rmse_rad_s",
+                )
+                if "maximum_hover_yaw_rate_rmse_rad_s" in selection_node
+                else None
+            ),
+        )
+    )
     return FixedEvaluationSuite(
+        schema_version=schema_version,
         name=str(raw.get("name") or "fixed_attitude_v1"),
         seed=seed,
         parallel_count=parallel_count,
         scenarios=scenarios,
         limits=limits,
         score_weights=parsed_weights,
+        self_stabilize_tracking=schema_version >= 2,
+        yaw_rate_tracking_weight=yaw_rate_tracking_weight,
+        checkpoint_selection=checkpoint_selection,
         output_root=output_root,
         source_path=source,
         raw=raw,
@@ -261,10 +358,15 @@ def run_fixed_evaluation(
 
     # 先用一个短生命周期环境确定观测/动作契约；每个科目再创建全新环境，
     # 防止前一科目的动力学、传感器历史或高度 PI 状态泄漏。
+    observation_dim = config.control_contract.observation_dim
     model = (
-        build_sac_actor_critic(21, 4, config.model, device, config.torch_dtype)
+        build_sac_actor_critic(
+            observation_dim, 4, config.model, device, config.torch_dtype
+        )
         if config.algorithm_name == "sac"
-        else build_actor_critic(21, 4, config.model, device, config.torch_dtype)
+        else build_actor_critic(
+            observation_dim, 4, config.model, device, config.torch_dtype
+        )
     )
     model.actor.load_state_dict(state["actor"], strict=True)
     model.actor.eval()
@@ -279,7 +381,7 @@ def run_fixed_evaluation(
     archived_suite = directory / f"suite{suite.source_path.suffix or '.yaml'}"
     shutil.copyfile(suite.source_path, archived_suite)
     report: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": suite.schema_version,
         "evaluation_id": evaluation_id,
         "suite": suite.name,
         "suite_config": archived_suite.name,
@@ -292,8 +394,16 @@ def run_fixed_evaluation(
         "dtype": str(config.torch_dtype),
         "parallel_count": suite.parallel_count,
         "seed": suite.seed,
+        "termination": {
+            "max_tilt_rad": config.task.terminate_tilt_rad,
+            "max_angular_rate_rad_s": (
+                config.task.terminate_angular_rate_rad_s
+            ),
+            "angular_rate_axes": config.task.terminate_angular_rate_axes,
+        },
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "score_weights": dict(suite.score_weights),
+        "yaw_rate_tracking_weight": suite.yaw_rate_tracking_weight,
         "scenarios": {},
     }
     scenario_scores: list[float] = []
@@ -302,7 +412,13 @@ def run_fixed_evaluation(
             env = _create_evaluation_environment(config, suite, scenario, device)
             try:
                 result, trajectory = _run_scenario(
-                    env, model, scenario, suite.limits, suite.score_weights
+                    env,
+                    model,
+                    scenario,
+                    suite.limits,
+                    suite.score_weights,
+                    self_stabilize_tracking=suite.self_stabilize_tracking,
+                    yaw_rate_tracking_weight=suite.yaw_rate_tracking_weight,
                 )
                 report["scenarios"][scenario.name] = result
                 scenario_scores.append(float(result["total_score"]))
@@ -373,6 +489,9 @@ def _run_scenario(
     scenario: FixedScenario,
     limits: ScoreLimits,
     score_weights: Mapping[str, float],
+    *,
+    self_stabilize_tracking: bool = False,
+    yaw_rate_tracking_weight: float = 0.25,
 ) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
     batch = env.spec.parallel_count
     device = env.spec.device
@@ -391,6 +510,7 @@ def _run_scenario(
             "time_s", "alive", "action", "position_n", "velocity_n",
             "attitude_q_wb", "target_position_n", "target_velocity_n",
             "target_attitude_q_wb", "target_euler_rad", "actual_euler_rad",
+            "yaw_rate_error_rad_s",
         )
     }
 
@@ -429,6 +549,9 @@ def _run_scenario(
             "target_attitude_q_wb": target_attitude,
             "target_euler_rad": target_euler,
             "actual_euler_rad": actual_euler,
+            "yaw_rate_error_rad_s": transition[
+                ("info", "yaw_rate_error_rad_s")
+            ].squeeze(-1),
         }
         for name, value in values.items():
             traces[name].append(value.detach().clone())
@@ -446,6 +569,8 @@ def _run_scenario(
         limits,
         env.spec.control_hz,
         score_weights,
+        self_stabilize_tracking=self_stabilize_tracking,
+        yaw_rate_tracking_weight=yaw_rate_tracking_weight,
     )
     return metrics, trajectory
 
@@ -457,6 +582,9 @@ def _score_trajectory(
     limits: ScoreLimits,
     control_hz: int,
     score_weights: Mapping[str, float],
+    *,
+    self_stabilize_tracking: bool = False,
+    yaw_rate_tracking_weight: float = 0.25,
 ) -> dict[str, Any]:
     alive = trajectory["alive"].bool()
     attitude_error_deg = torch.rad2deg(
@@ -464,6 +592,25 @@ def _score_trajectory(
             trajectory["attitude_q_wb"], trajectory["target_attitude_q_wb"]
         ).squeeze(-1)
     )
+    roll_pitch_error_rad = torch.atan2(
+        torch.sin(
+            trajectory["actual_euler_rad"][..., :2]
+            - trajectory["target_euler_rad"][..., :2]
+        ),
+        torch.cos(
+            trajectory["actual_euler_rad"][..., :2]
+            - trajectory["target_euler_rad"][..., :2]
+        ),
+    )
+    roll_pitch_error_deg = torch.rad2deg(
+        torch.linalg.vector_norm(roll_pitch_error_rad, dim=-1)
+    )
+    yaw_rate_error = trajectory.get("yaw_rate_error_rad_s")
+    if yaw_rate_error is None:
+        yaw_rate_error = torch.zeros_like(attitude_error_deg)
+    elif yaw_rate_error.ndim == alive.ndim + 1:
+        yaw_rate_error = yaw_rate_error.squeeze(-1)
+    yaw_rate_error = yaw_rate_error.abs()
     position_error = torch.linalg.vector_norm(
         trajectory["position_n"] - trajectory["target_position_n"], dim=-1
     )
@@ -479,6 +626,10 @@ def _score_trajectory(
         ) / math.sqrt(4.0)
     attitude_rmse = _masked_rmse(attitude_error_deg, alive)
     attitude_p95 = _masked_quantile(attitude_error_deg, alive, 0.95)
+    roll_pitch_rmse = _masked_rmse(roll_pitch_error_deg, alive)
+    roll_pitch_p95 = _masked_quantile(roll_pitch_error_deg, alive, 0.95)
+    yaw_rate_rmse = _masked_rmse(yaw_rate_error, alive)
+    yaw_rate_p95 = _masked_quantile(yaw_rate_error, alive, 0.95)
     position_rmse = _masked_rmse(position_error, alive)
     position_p95 = _masked_quantile(position_error, alive, 0.95)
     velocity_rmse = _masked_rmse(velocity_error, alive)
@@ -486,6 +637,9 @@ def _score_trajectory(
     action_peak = _masked_quantile(trajectory["action"].abs().amax(dim=-1), alive, 1.0)
     action_delta_rms = _masked_rmse(action_delta, alive)
     saturation_fraction = _masked_mean(saturation, alive)
+    response_error_deg = (
+        roll_pitch_error_deg if self_stabilize_tracking else attitude_error_deg
+    )
     if scenario.type == "circle":
         response_s = _circle_phase_lag(
             trajectory["target_euler_rad"], trajectory["actual_euler_rad"], alive,
@@ -493,25 +647,41 @@ def _score_trajectory(
         )
     elif scenario.type == "hover":
         response_s = _recovery_time_after_peak(
-            attitude_error_deg, alive, control_hz,
+            response_error_deg, alive, control_hz,
             limits.settling_error_deg, limits.settling_window_s,
             scenario.duration_s,
         )
     else:
         response_s = _settling_time(
-            attitude_error_deg, alive, control_hz,
+            response_error_deg, alive, control_hz,
             limits.settling_error_deg, limits.settling_window_s,
             scenario.duration_s,
         )
 
     survival_score = 100.0 * (survival_s / scenario.duration_s).clamp(0.0, 1.0)
     attitude_score = _lower_is_better(attitude_rmse, limits.attitude_rmse_bad_deg)
+    roll_pitch_score = _lower_is_better(
+        roll_pitch_rmse, limits.attitude_rmse_bad_deg
+    )
+    yaw_rate_score = _lower_is_better(
+        yaw_rate_rmse, limits.yaw_rate_rmse_bad_rad_s
+    )
+    inner_attitude_score = (
+        (1.0 - yaw_rate_tracking_weight) * roll_pitch_score
+        + yaw_rate_tracking_weight * yaw_rate_score
+        if self_stabilize_tracking
+        else attitude_score
+    )
     position_score = _lower_is_better(position_rmse, limits.position_rmse_bad_m)
     velocity_score = _lower_is_better(velocity_rmse, limits.velocity_rmse_bad_m_s)
     if scenario.type == "hover":
-        tracking_score = 0.6 * attitude_score + 0.4 * position_score
+        tracking_score = 0.6 * inner_attitude_score + 0.4 * position_score
     else:
-        tracking_score = 0.5 * attitude_score + 0.3 * position_score + 0.2 * velocity_score
+        tracking_score = (
+            0.5 * inner_attitude_score
+            + 0.3 * position_score
+            + 0.2 * velocity_score
+        )
     action_score = (
         0.5 * _lower_is_better(action_rms, limits.action_rms_bad)
         + 0.3 * _lower_is_better(action_delta_rms, limits.action_delta_rms_bad)
@@ -529,6 +699,10 @@ def _score_trajectory(
         "survival_time_s": survival_s,
         "attitude_rmse_deg": attitude_rmse,
         "attitude_error_p95_deg": attitude_p95,
+        "roll_pitch_rmse_deg": roll_pitch_rmse,
+        "roll_pitch_error_p95_deg": roll_pitch_p95,
+        "yaw_rate_rmse_rad_s": yaw_rate_rmse,
+        "yaw_rate_error_p95_rad_s": yaw_rate_p95,
         "position_rmse_m": position_rmse,
         "position_error_p95_m": position_p95,
         "velocity_rmse_m_s": velocity_rmse,

@@ -590,7 +590,7 @@ valid = valid & candidate_is_finite
 
 每个物理步直接写入设备上的预分配日志块 `[chunk_steps,B,...]`。块满后使用 pinned memory 和非阻塞复制交给后台写线程，推进路径中禁止逐实例写文件、调用 `.item()` 或每步执行同步 `.cpu()`。日志块带有 `active_mask`、`valid` 和 `instance_index`，因此暂停实例和失败实例仍可被准确解释。
 
-若日志写入速度低于仿真速度，环境必须按配置选择阻塞或报告溢出错误，不得静默丢弃记录。日志缓冲区大小属于批次结构，在创建时完成分配。
+若日志写入速度低于仿真速度，环境必须按配置选择阻塞或报告溢出错误，不得静默丢弃记录。日志缓冲区大小属于批次结构，在创建时完成分配。`logging.minimum_free_space_bytes` 指定日志写入后必须保留的磁盘余量（默认 512 MiB）；每个 tensor 文件写入前按实际 storage 大小预检，并通过临时文件、`fsync` 和原子替换发布。余量不足时抛出 `InsufficientDiskSpaceError`，不发布半截 timeline，调用方应在最近的训练安全边界停止。
 
 ### 8.7 验收标准
 

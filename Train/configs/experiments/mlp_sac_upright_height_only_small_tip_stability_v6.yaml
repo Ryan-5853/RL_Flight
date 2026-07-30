@@ -1,0 +1,210 @@
+# 128×128 MLP-SAC：生存与直立优先 v6。
+#
+# 相对 stability_v5：
+#   1. yaw-rate 奖励权重归零，不再把 yaw 角速度作为本阶段学习目标；
+#   2. 课程晋级只检查生存率与 roll/pitch RMSE，不检查 yaw 或总角速度 RMS；
+#   3. 固定评测仍记录 yaw-rate，但不将其计入得分或 best checkpoint 门槛；
+#   4. roll/pitch 二次代价在合成误差 20 deg 处封顶，保留 10 deg 门槛附近
+#      的纠偏梯度，同时避免大姿态样本继续放大 critic 的 Q/梯度尺度；
+#   5. rate barrier 归零，避免总角速度 barrier 间接约束 yaw；
+#   6. 极端总角速度终止条件仍保留，只作为数值与飞行安全护栏。
+#
+# 这是全新训练，不能 exact-resume v5 checkpoint。
+#
+# 启动：
+#   flight-train run \
+#     --config configs/experiments/mlp_sac_upright_height_only_small_tip_stability_v6.yaml
+
+schema_version: 2
+
+experiment:
+  name: mlp_sac_upright_height_only_small_tip_stability_v6
+  entrypoint:
+    type: "flight_train.runner:run_experiment"
+    version: "train-framework-v1"
+
+seed:
+  # 与 v5 保持相同随机流，方便直接比较优化目标变化带来的差异。
+  base: 20260725
+  deterministic_algorithms: true
+  cudnn_benchmark: false
+
+run:
+  device: cuda:0
+  dtype: float32
+  parallel_count: 256
+  total_control_steps: 16777216
+  output_root: ../../runs
+  allow_unimplemented_simulator: false
+
+environment:
+  factory: "simenv:SimulationEnvironment"
+  config_path: ../environment/gru_sac_upright_height_only_small_tip.yaml
+  observation_source: truth
+
+command_source:
+  type: "flight_train.commands:VirtualPilotCommandSource"
+  version: "2"
+  seed: 52025
+  params:
+    throttle:
+      minimum: 0.20
+      maximum: 0.85
+      spool:
+        duration_s: 0.10
+        target_range: [0.54, 0.58]
+      height_controller:
+        observation_source: truth
+        target_m: 0.0
+        initial_throttle_range: [0.55, 0.58]
+        proportional_gain: 0.08
+        integral_gain: 0.04
+        error_limit_m: 5.0
+      slew_rate:
+        rise_per_s: 4.0
+        fall_per_s: 0.35
+    sticks:
+      roll:  {mode: angle, limit_rad: 0.0, time_constant_s: 0.20}
+      pitch: {mode: angle, limit_rad: 0.0, time_constant_s: 0.20}
+      yaw:   {mode: rate, limit_rad_s: 0.0, time_constant_s: 0.30}
+      target_sampling:
+        distribution: centered
+        center_exponent: 2.0
+        hold_duration_s:
+          range: [2.0, 4.0]
+      reset:
+        filtered_stick: zero
+        initial_target_scale: 0.0
+
+control_contract:
+  version: self_stabilize_v1
+  observation_profile: attitude_self_stabilize_21d_v3
+  observation_history:
+    mode: multirate_actuator
+    dense_action_steps: 32
+    sparse_physical_frames: 15
+    sparse_physical_stride_steps: 4
+  action_transform:
+    type: residual_around_trim
+    trim_command: [0.53523, 0.0, 0.0, 0.0]
+    residual_scale: [0.30, 1.0, 1.0, 1.0]
+  policy_action:
+    fields: [lower_motor, servo_1, servo_2, servo_3]
+  external_action:
+    fields: [upper_motor]
+  simulator_command:
+    fields: [upper_motor, lower_motor, servo_1, servo_2, servo_3]
+
+randomization:
+  static:
+    seed: 32025
+    scope: episode
+    parameters: {}
+  dynamic:
+    seed: 42025
+    scope: simulator
+    parameters: {}
+
+task:
+  episode_duration_s: 30.0
+  episode_curriculum:
+    # 零动作固定评测约 2.07 s；第一关设为 2.5 s，必须产生真正的稳定收益。
+    durations_s:   [2.5, 3.5, 5.0, 10.0, 30.0]
+    target_scales: [0.0, 0.0, 0.0,  0.0,  0.0]
+    success_fraction: 0.80
+    evaluation_episodes_per_env: 1.0
+    consecutive_passes: 2
+    quality_gate:
+      # 只要求 roll/pitch 合成 RMSE；本阶段不以 yaw 或总角速度阻止晋级。
+      max_roll_pitch_rmse_rad: 0.17453292519943295
+  termination:
+    max_tilt_rad: 1.0
+    # 仅保留极端总角速度硬终止，防止数值发散；它不是训练质量目标。
+    max_angular_rate_rad_s: 8.0
+
+reward:
+  calculator:
+    type: "flight_train.rewards.attitude:AttitudeRewardCalculator"
+    version: "3"
+    params:
+      # 10 deg 内保持 v5 的纠偏强度；20 deg 后不再扩大显式 RP 二次代价。
+      roll_pitch_weight: 0.55
+      roll_pitch_cost_cap_rad: 0.3490658503988659
+      tilt_weight: 0.08
+
+      # yaw 在 v6 中完全退出优化目标；p/q 快速修正仍保留很轻的阻尼。
+      yaw_rate_weight: 0.0
+      angular_rate_weight: 0.0003125
+
+      action_rate_weight: 0.002
+      saturation_weight: 0.01
+      alive_bonus: 0.02
+      survival_progress_weight: 0.0
+
+      tilt_barrier_weight: 0.02
+      # rate_ratio 是三轴总角速度，归零以免间接惩罚 yaw。
+      rate_barrier_weight: 0.0
+      barrier_start_fraction: 0.30
+      barrier_exponent: 2.0
+
+      termination_penalty: 10.0
+      early_termination_penalty: 10.0
+  context:
+    fields:
+      - {name: attitude_geodesic_rad, source: task}
+      - {name: angular_velocity_b, source: truth}
+      - {name: static_domain, source: train_randomizer, visibility: reward_only}
+
+model:
+  type: mlp_actor_critic
+  hidden_sizes: [128, 128]
+  policy_distribution:
+    learnable_action_std: false
+    initial_action_std: [0.04, 0.035, 0.035, 0.035]
+    minimum_action_std: [0.01, 0.01, 0.01, 0.01]
+    maximum_action_std: [0.06, 0.05, 0.05, 0.05]
+
+algorithm:
+  name: sac
+  gamma: 0.999
+  n_step_return: 16
+  replay:
+    capacity_transitions: 2097152
+    warmup_transitions: 262144
+    batch_size: 4096
+  critic_pretraining_updates: 1024
+  actor_update_interval: 6
+  updates_per_collection: 64
+  target_update:
+    tau: 0.0025
+    interval_updates: 1
+  entropy:
+    automatic: true
+    initial_alpha: 0.001
+    target_entropy: -4.0
+    min_alpha: 0.0001
+    max_alpha: 0.005
+  actor_max_grad_norm: 1.0
+  critic_max_grad_norm: 2.5
+  optimizer:
+    type: adam
+    actor_learning_rate: 0.00002
+    critic_learning_rate: 0.0002
+    alpha_learning_rate: 0.0001
+
+collector:
+  control_steps_per_rollout: 512
+
+evaluation:
+  enabled: true
+  interval_control_steps: 1048576
+  suite_path: ../evaluation/fixed_upright_survival_v3.yaml
+
+checkpoint:
+  resume:
+    from: null
+    mode: exact
+  interval_control_steps: 524288
+  keep_last: 4
+
+recording: {}

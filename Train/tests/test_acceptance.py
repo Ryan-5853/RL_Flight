@@ -576,6 +576,164 @@ class FrameworkAcceptanceTests(unittest.TestCase):
             finally:
                 recorder.close("failed", 4)
 
+    def test_11a_best_checkpoint_requires_quality_and_uses_composite_score(self):
+        with tempfile.TemporaryDirectory() as raw:
+            config = load_experiment_config(
+                _write_run_config(Path(raw), name="best-selection")
+            )
+            recorder = RunRecorder(config)
+            try:
+                first = recorder.checkpoint(
+                    4, {"value": torch.tensor([1.0])}, kind="periodic"
+                )
+                second = recorder.checkpoint(
+                    8, {"value": torch.tensor([2.0])}, kind="periodic"
+                )
+                self.assertFalse(
+                    recorder.promote_best_evaluation_checkpoint(
+                        first,
+                        control_steps=4,
+                        hover_survival_s=5.0,
+                        hover_roll_pitch_rmse_deg=20.0,
+                        hover_yaw_rate_rmse_rad_s=1.0,
+                        total_score=90.0,
+                        quality_passed=False,
+                    )
+                )
+                self.assertTrue(
+                    recorder.promote_best_evaluation_checkpoint(
+                        first,
+                        control_steps=4,
+                        hover_survival_s=4.0,
+                        hover_roll_pitch_rmse_deg=5.0,
+                        hover_yaw_rate_rmse_rad_s=0.2,
+                        total_score=80.0,
+                    )
+                )
+                # 更长生存不能覆盖综合得分更高的已选模型。
+                self.assertFalse(
+                    recorder.promote_best_evaluation_checkpoint(
+                        second,
+                        control_steps=8,
+                        hover_survival_s=8.0,
+                        hover_roll_pitch_rmse_deg=5.0,
+                        hover_yaw_rate_rmse_rad_s=0.2,
+                        total_score=70.0,
+                    )
+                )
+                self.assertTrue(
+                    recorder.promote_best_evaluation_checkpoint(
+                        second,
+                        control_steps=8,
+                        hover_survival_s=3.0,
+                        hover_roll_pitch_rmse_deg=5.0,
+                        hover_yaw_rate_rmse_rad_s=0.2,
+                        total_score=85.0,
+                    )
+                )
+                metadata = json.loads(
+                    (
+                        recorder.directory
+                        / "checkpoints"
+                        / "best_fixed_evaluation.json"
+                    ).read_text(encoding="utf-8")
+                )
+                self.assertEqual(metadata["global_control_steps"], 8)
+                self.assertEqual(metadata["total_score"], 85.0)
+                self.assertEqual(metadata["source_checkpoint"], second.name)
+            finally:
+                recorder.close("completed", 8)
+
+    def test_11b_evaluation_checkpoints_preserve_independent_objectives(self):
+        with tempfile.TemporaryDirectory() as raw:
+            config = load_experiment_config(
+                _write_run_config(Path(raw), name="multi-best-selection")
+            )
+            recorder = RunRecorder(config)
+            try:
+                first = recorder.checkpoint(
+                    4, {"value": torch.tensor([1.0])}, kind="periodic"
+                )
+                second = recorder.checkpoint(
+                    8, {"value": torch.tensor([2.0])}, kind="periodic"
+                )
+                third = recorder.checkpoint(
+                    12, {"value": torch.tensor([3.0])}, kind="periodic"
+                )
+                self.assertEqual(
+                    recorder.promote_evaluation_checkpoints(
+                        first,
+                        control_steps=4,
+                        hover_survival_s=5.0,
+                        hover_roll_pitch_rmse_deg=20.0,
+                        hover_yaw_rate_rmse_rad_s=0.1,
+                        total_score=90.0,
+                        minimum_hover_survival_s=8.0,
+                        quality_passed=False,
+                    ),
+                    ("total", "upright", "yaw"),
+                )
+                self.assertEqual(
+                    recorder.promote_evaluation_checkpoints(
+                        second,
+                        control_steps=8,
+                        hover_survival_s=10.0,
+                        hover_roll_pitch_rmse_deg=5.0,
+                        hover_yaw_rate_rmse_rad_s=2.0,
+                        total_score=80.0,
+                        minimum_hover_survival_s=8.0,
+                        quality_passed=False,
+                    ),
+                    ("upright",),
+                )
+                self.assertEqual(
+                    recorder.promote_evaluation_checkpoints(
+                        third,
+                        control_steps=12,
+                        hover_survival_s=10.0,
+                        hover_roll_pitch_rmse_deg=6.0,
+                        hover_yaw_rate_rmse_rad_s=0.05,
+                        total_score=70.0,
+                        minimum_hover_survival_s=8.0,
+                        quality_passed=True,
+                    ),
+                    ("yaw", "fixed"),
+                )
+                checkpoint_dir = recorder.directory / "checkpoints"
+                selections = {
+                    name: json.loads(
+                        (
+                            checkpoint_dir / f"best_{name}_evaluation.json"
+                        ).read_text(encoding="utf-8")
+                    )
+                    for name in ("total", "upright", "yaw", "fixed")
+                }
+                self.assertEqual(
+                    selections["total"]["global_control_steps"], 4
+                )
+                self.assertEqual(
+                    selections["upright"]["global_control_steps"], 8
+                )
+                self.assertEqual(
+                    selections["yaw"]["global_control_steps"], 12
+                )
+                self.assertEqual(
+                    selections["fixed"]["global_control_steps"], 12
+                )
+                self.assertFalse(
+                    selections["total"]["quality_gate_passed"]
+                )
+                self.assertTrue(
+                    selections["fixed"]["quality_gate_passed"]
+                )
+                # 同一次保存的 best 使用硬链接，不重复占用 checkpoint 数据块。
+                self.assertEqual(
+                    first.stat().st_ino,
+                    (checkpoint_dir / "best_total_evaluation.pt").stat().st_ino,
+                )
+            finally:
+                recorder.close("completed", 12)
+
     def test_12_minimal_learning_smoke_updates_evaluates_saves_and_loads(self):
         torch.manual_seed(14)
         model = _model()

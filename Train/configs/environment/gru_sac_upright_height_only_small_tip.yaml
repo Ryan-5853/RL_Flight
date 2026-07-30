@@ -1,0 +1,147 @@
+# 直立定高 GRU-SAC 环境。
+# 机体、执行器、气动和传感器参数保持标称值；只改变初始条件：
+#   - 初始姿态为 roll=+2.0 deg、pitch=-1.5 deg、yaw=0；
+#   - 初始 roll/pitch 角速度保持很小但方向与倾角一致，并在并行实例间作
+#     可复现的微小变化，用来产生明确而不过强的翻倒趋势。
+
+schema_version: 1
+seed: 20260725
+
+parallel:
+  independent_rng: true
+
+timing:
+  physics_hz: {value: 5000}
+  control_hz: {value: 500}
+
+initial_state:
+  position_n: {value: [0.0, 0.0, 0.0]}
+  velocity_n: {value: [0.0, 0.0, 0.0]}
+  # Hamilton [w,x,y,z]，对应 ZYX 欧拉角 (2.0 deg, -1.5 deg, 0 deg)。
+  attitude_q_wb:
+    value: [0.9997620357787237, 0.0174509112472846, -0.0130876019625380, 0.0002284449420108]
+  # p 始终为正、q 始终为负，使机体沿初始倾角继续缓慢翻倒；r 仅作极小扰动。
+  angular_velocity_b:
+    value: [0.03, -0.02, 0.0]
+    randomization:
+      distribution: uniform
+      mode: absolute
+      min: [-0.01, -0.01, -0.005]
+      max: [0.01, 0.01, 0.005]
+
+body:
+  mass: {value: 1.0}
+  center_of_mass_b: {value: [0.0, 0.0, 0.05]}
+  inertia_diagonal_b: {value: [0.01, 0.01, 0.02]}
+
+motors:
+  - &motor_common
+    name: upper
+    pwm_deadzone: {value: 0.08}
+    pwm_to_rpm_table:
+      value: [[0.0, 0.0], [0.08, 0.0], [0.5, 900.0], [1.0, 1800.0]]
+    time_constant: {value: 0.030}
+    torque_coefficient: {value: 9.8765432e-8}
+    noise:
+      distribution: normal
+      stddev: {value: 0.0}
+  - <<: *motor_common
+    name: lower
+    time_constant: {value: 0.050}
+    torque_coefficient: {value: 1.10e-7}
+
+servos:
+  - &servo_common
+    name: servo_1
+    pwm_angle_table:
+      value: [[-1.0, -0.35], [0.0, 0.0], [1.0, 0.35]]
+    tau: {value: 0.020}
+    max_speed: {value: 8.0}
+    backlash: {value: 0.010}
+    deadzone: {value: 0.015}
+  - <<: *servo_common
+    name: servo_2
+  - <<: *servo_common
+    name: servo_3
+
+aerodynamics:
+  thrust_coefficients: {value: [4.0e-6, 4.0e-6, -2.0e-6]}
+  neutral_thrust_direction_b: {value: [0.0, 0.0, -1.0]}
+  direct_thrust_center_b: {value: [0.0, 0.0, 0.20]}
+  thrust_partition:
+    direct: {value: 0.40}
+    grid_1: {value: 0.20}
+    grid_2: {value: 0.20}
+    grid_3: {value: 0.20}
+  grids:
+    - &grid_common
+      name: grid_1
+      aerodynamic_center_b: {value: [0.10, 0.00, 0.25]}
+      deflection_axis_b: {value: [1.0, 0.0, 0.0]}
+      self_attenuation_curve:
+        value: [[0.0, 1.0], [0.35, 0.85]]
+      vector_deflection:
+        gain: {value: 1.0}
+        offset: {value: 0.0}
+    - <<: *grid_common
+      name: grid_2
+      aerodynamic_center_b: {value: [-0.05, 0.087, 0.25]}
+      deflection_axis_b: {value: [-0.5, 0.8660254, 0.0]}
+    - <<: *grid_common
+      name: grid_3
+      aerodynamic_center_b: {value: [-0.05, -0.087, 0.25]}
+      deflection_axis_b: {value: [-0.5, -0.8660254, 0.0]}
+  coupling_attenuation:
+    value:
+      - [0.0, 0.10, 0.10]
+      - [0.10, 0.0, 0.10]
+      - [0.10, 0.10, 0.0]
+
+sensors:
+  gyro:
+    sample_hz: {value: 5000}
+    noise:
+      distribution: normal
+      stddev: {value: [0.0, 0.0, 0.0]}
+    bias: {value: [0.0, 0.0, 0.0]}
+    delay: {value: 0.001}
+  accelerometer:
+    sample_hz: {value: 5000}
+    noise:
+      distribution: normal
+      stddev: {value: [0.0, 0.0, 0.0]}
+    bias: {value: [0.0, 0.0, 0.0]}
+    delay: {value: 0.001}
+  motor_speed:
+    sample_hz: {value: 5000}
+    noise:
+      distribution: normal
+      stddev: {value: [0.0, 0.0]}
+    bias: {value: [0.0, 0.0]}
+    delay: {value: 0.0}
+
+logging:
+  directory: ../logs
+  # 日志不得侵占训练器保存下一份大型 checkpoint 所需的安全余量。
+  minimum_free_space_bytes: 8589934592
+  mode: compact
+  physics_step_stride: 200
+  fields:
+    - physics_step
+    - control_step
+    - sim_time_s
+    - control
+    - active_mask
+    - valid
+    - error_code
+    - generation
+    - event_code
+    - truth.position_n
+    - truth.attitude_q_wb
+    - truth.angular_velocity_b
+    - truth.motor_speed
+    - truth.total_thrust
+    - truth.servo_angle
+  chunk_steps: 64
+  queue_chunks: 2
+  overflow: block

@@ -28,6 +28,7 @@ class LoggingConfig:
     mode: str
     physics_step_stride: int
     fields: tuple[str, ...] | None
+    minimum_free_space_bytes: int
 
 
 @dataclass(frozen=True)
@@ -383,6 +384,7 @@ def _logging_config(node: Any, base_dir: Path) -> LoggingConfig:
         "mode",
         "physics_step_stride",
         "fields",
+        "minimum_free_space_bytes",
     }
     unknown = sorted(set(node) - allowed)
     _require(not unknown, f"unknown logging fields: {unknown}")
@@ -400,6 +402,10 @@ def _logging_config(node: Any, base_dir: Path) -> LoggingConfig:
         "logging.physics_step_stride",
     )
     fields_node = node.get("fields")
+    minimum_free_space_bytes = _require_int(
+        node.get("minimum_free_space_bytes", 512 * 1024 * 1024),
+        "logging.minimum_free_space_bytes",
+    )
     fields: tuple[str, ...] | None
     if fields_node is None:
         fields = None
@@ -414,6 +420,10 @@ def _logging_config(node: Any, base_dir: Path) -> LoggingConfig:
         _require(len(set(fields)) == len(fields), "logging.fields must not contain duplicates")
     _require(chunk_steps > 0 and queue_chunks > 0, "logging chunk sizes must be positive")
     _require(physics_step_stride > 0, "logging.physics_step_stride must be positive")
+    _require(
+        minimum_free_space_bytes >= 0,
+        "logging.minimum_free_space_bytes must be non-negative",
+    )
     _require(overflow in {"block", "error"}, "logging.overflow must be block or error")
     return LoggingConfig(
         directory,
@@ -423,6 +433,7 @@ def _logging_config(node: Any, base_dir: Path) -> LoggingConfig:
         mode,
         physics_step_stride,
         fields,
+        minimum_free_space_bytes,
     )
 
 

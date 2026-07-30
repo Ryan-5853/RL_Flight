@@ -50,11 +50,15 @@ class TaskConfig:
     terminate_tilt_rad: float
     terminate_angular_rate_rad_s: float
     attitude_source: str
+    terminate_angular_rate_axes: str = "all"
     curriculum_durations_s: tuple[float, ...] = ()
     curriculum_target_scales: tuple[float, ...] = ()
     curriculum_success_fraction: float = 1.0
     curriculum_evaluation_episodes_per_env: float = 1.0
     curriculum_consecutive_passes: int = 1
+    curriculum_max_roll_pitch_rmse_rad: float | None = None
+    curriculum_max_yaw_rate_rmse_rad_s: float | None = None
+    curriculum_max_angular_rate_rms_rad_s: float | None = None
 
 
 @dataclass(frozen=True)
@@ -88,8 +92,12 @@ class VirtualPilotConfig:
 class ControlContractConfig:
     version: str
     observation_profile: str
+    observation_history_mode: str
     observation_history_frames: int
     observation_history_stride_steps: int
+    observation_history_dense_action_steps: int
+    observation_history_sparse_physical_frames: int
+    observation_history_sparse_physical_stride_steps: int
     policy_action_fields: tuple[str, ...]
     external_action_fields: tuple[str, ...]
     simulator_command_fields: tuple[str, ...]
@@ -98,13 +106,46 @@ class ControlContractConfig:
 
     @property
     def observation_dim(self) -> int:
-        return 21 * self.observation_history_frames
+        if self.observation_history_mode == "uniform":
+            return 21 * self.observation_history_frames
+        if self.observation_history_mode == "multirate_actuator":
+            return (
+                21
+                + 4 * self.observation_history_dense_action_steps
+                + 11 * self.observation_history_sparse_physical_frames
+            )
+        raise RuntimeError(
+            f"unsupported observation history mode "
+            f"{self.observation_history_mode!r}"
+        )
 
     @property
     def observation_history_span_steps(self) -> int:
-        return (
-            self.observation_history_frames - 1
-        ) * self.observation_history_stride_steps
+        if self.observation_history_mode == "uniform":
+            return (
+                self.observation_history_frames - 1
+            ) * self.observation_history_stride_steps
+        if self.observation_history_mode == "multirate_actuator":
+            return max(
+                self.observation_history_dense_action_steps,
+                self.observation_history_sparse_physical_frames
+                * self.observation_history_sparse_physical_stride_steps,
+            )
+        raise RuntimeError(
+            f"unsupported observation history mode "
+            f"{self.observation_history_mode!r}"
+        )
+
+    @property
+    def current_observation_offset(self) -> int:
+        if self.observation_history_mode == "uniform":
+            return (self.observation_history_frames - 1) * 21
+        if self.observation_history_mode == "multirate_actuator":
+            return 0
+        raise RuntimeError(
+            f"unsupported observation history mode "
+            f"{self.observation_history_mode!r}"
+        )
 
 
 @dataclass(frozen=True)
@@ -113,6 +154,7 @@ class CheckpointConfig:
     resume_mode: str
     interval_control_steps: int | None
     keep_last: int
+    minimum_free_space_bytes: int = 2 * 1024 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -180,6 +222,8 @@ class SACConfig:
     replay_burn_in_steps: int = 0
     critic_pretraining_updates: int = 0
     actor_update_interval: int = 1
+    policy_anchor_weight: float = 0.0
+    policy_anchor_max_action_deviation: float = 0.0
 
     @property
     def replay_sample_length(self) -> int:
@@ -323,12 +367,22 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
         "task",
     )
     termination = _map(task_node, "termination")
-    _keys(termination, {"max_tilt_rad", "max_angular_rate_rad_s"}, "task.termination")
+    _keys(
+        termination,
+        {"max_tilt_rad", "max_angular_rate_rad_s", "angular_rate_axes"},
+        "task.termination",
+    )
+    angular_rate_axes = str(termination.get("angular_rate_axes", "all"))
+    if angular_rate_axes not in {"all", "roll_pitch"}:
+        raise ConfigError(
+            "task.termination.angular_rate_axes must be all or roll_pitch"
+        )
     task = TaskConfig(
         episode_duration_s=_positive_float(task_node, "episode_duration_s"),
         terminate_tilt_rad=_positive_float(termination, "max_tilt_rad"),
         terminate_angular_rate_rad_s=_positive_float(termination, "max_angular_rate_rad_s"),
         attitude_source=str(environment.get("observation_source", "sensor")),
+        terminate_angular_rate_axes=angular_rate_axes,
     )
     curriculum_node = task_node.get("episode_curriculum")
     if curriculum_node is not None:
@@ -342,6 +396,7 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
                 "success_fraction",
                 "evaluation_episodes_per_env",
                 "consecutive_passes",
+                "quality_gate",
             },
             "task.episode_curriculum",
         )
@@ -377,6 +432,29 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
             raise ConfigError(
                 "last curriculum duration must equal task.episode_duration_s"
             )
+        quality_gate = curriculum_node.get("quality_gate", {})
+        if not isinstance(quality_gate, Mapping):
+            raise ConfigError(
+                "task.episode_curriculum.quality_gate must be a mapping"
+            )
+        _keys(
+            quality_gate,
+            {
+                "max_roll_pitch_rmse_rad",
+                "max_yaw_rate_rmse_rad_s",
+                "max_angular_rate_rms_rad_s",
+            },
+            "task.episode_curriculum.quality_gate",
+        )
+
+        def optional_positive_quality_limit(name: str) -> float | None:
+            value = quality_gate.get(name)
+            if value is None:
+                return None
+            return _positive_float_value(
+                value, f"task.episode_curriculum.quality_gate.{name}"
+            )
+
         task = replace(
             task,
             curriculum_durations_s=durations,
@@ -389,6 +467,15 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
             ),
             curriculum_consecutive_passes=_positive_int(
                 curriculum_node, "consecutive_passes"
+            ),
+            curriculum_max_roll_pitch_rmse_rad=(
+                optional_positive_quality_limit("max_roll_pitch_rmse_rad")
+            ),
+            curriculum_max_yaw_rate_rmse_rad_s=(
+                optional_positive_quality_limit("max_yaw_rate_rmse_rad_s")
+            ),
+            curriculum_max_angular_rate_rms_rad_s=(
+                optional_positive_quality_limit("max_angular_rate_rms_rad_s")
             ),
         )
     else:
@@ -663,6 +750,24 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
         replay = _map(algorithm, "replay")
         target_update = _map(algorithm, "target_update")
         entropy = _map(algorithm, "entropy")
+        policy_anchor_raw = algorithm.get("policy_anchor", {})
+        if not isinstance(policy_anchor_raw, Mapping):
+            raise ConfigError("algorithm.policy_anchor must be a mapping")
+        policy_anchor_weight = _nonnegative_float(
+            policy_anchor_raw, "weight"
+        )
+        policy_anchor_max_action_deviation = _nonnegative_float(
+            policy_anchor_raw, "max_action_deviation"
+        )
+        if policy_anchor_weight > 0:
+            if model.architecture != "mlp":
+                raise ConfigError(
+                    "algorithm.policy_anchor currently requires an MLP SAC policy"
+                )
+            if checkpoint.resume_from is None:
+                raise ConfigError(
+                    "algorithm.policy_anchor requires checkpoint.resume.from"
+                )
         if not bool(entropy.get("automatic", True)):
             raise ConfigError("SAC currently requires automatic entropy tuning")
         target_entropy_raw = entropy.get("target_entropy", "auto")
@@ -754,6 +859,10 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
             actor_update_interval=_positive_int_value(
                 algorithm.get("actor_update_interval", 1),
                 "algorithm.actor_update_interval",
+            ),
+            policy_anchor_weight=policy_anchor_weight,
+            policy_anchor_max_action_deviation=(
+                policy_anchor_max_action_deviation
             ),
         )
     else:
@@ -852,7 +961,16 @@ def _component(node: Mapping[str, Any], path: str) -> ComponentConfig:
 
 
 def _checkpoint_config(node: Mapping[str, Any], source: Path) -> CheckpointConfig:
-    _keys(node, {"resume", "interval_control_steps", "keep_last"}, "checkpoint")
+    _keys(
+        node,
+        {
+            "resume",
+            "interval_control_steps",
+            "keep_last",
+            "minimum_free_space_bytes",
+        },
+        "checkpoint",
+    )
     interval_value = node.get("interval_control_steps")
     interval = (
         None
@@ -860,22 +978,46 @@ def _checkpoint_config(node: Mapping[str, Any], source: Path) -> CheckpointConfi
         else _positive_int_value(interval_value, "checkpoint.interval_control_steps")
     )
     keep_last = _positive_int_value(node.get("keep_last", 3), "checkpoint.keep_last")
+    minimum_free_space_bytes = _nonnegative_int_value(
+        node.get("minimum_free_space_bytes", 2 * 1024 * 1024 * 1024),
+        "checkpoint.minimum_free_space_bytes",
+    )
     resume = node.get("resume")
     if resume is None:
-        return CheckpointConfig(None, "exact", interval, keep_last)
+        return CheckpointConfig(
+            None,
+            "exact",
+            interval,
+            keep_last,
+            minimum_free_space_bytes,
+        )
     if not isinstance(resume, Mapping):
         raise ConfigError("checkpoint.resume must be a mapping")
     _keys(resume, {"from", "mode"}, "checkpoint.resume")
     mode = str(resume.get("mode", "exact"))
-    if mode != "exact":
-        raise ConfigError("only checkpoint.resume.mode=exact is currently supported")
+    if mode not in {"exact", "policy"}:
+        raise ConfigError(
+            "checkpoint.resume.mode must be exact or policy"
+        )
     value = resume.get("from")
     if value is None or value == "":
-        return CheckpointConfig(None, mode, interval, keep_last)
+        return CheckpointConfig(
+            None,
+            mode,
+            interval,
+            keep_last,
+            minimum_free_space_bytes,
+        )
     path = (source.parent / str(value)).resolve()
     if not path.is_file():
         raise ConfigError(f"resume checkpoint does not exist: {path}")
-    return CheckpointConfig(path, mode, interval, keep_last)
+    return CheckpointConfig(
+        path,
+        mode,
+        interval,
+        keep_last,
+        minimum_free_space_bytes,
+    )
 
 
 def _evaluation_config(
@@ -1009,20 +1151,69 @@ def _control_contract(node: Mapping[str, Any]) -> ControlContractConfig:
         raise ConfigError("control_contract.observation_history must be a mapping")
     _keys(
         history_raw,
-        {"frames", "stride_steps"},
+        {
+            "mode",
+            "frames",
+            "stride_steps",
+            "dense_action_steps",
+            "sparse_physical_frames",
+            "sparse_physical_stride_steps",
+        },
         "control_contract.observation_history",
     )
-    history_frames = _positive_int_value(
-        history_raw.get("frames", 1),
-        "control_contract.observation_history.frames",
-    )
-    history_stride_steps = _positive_int_value(
-        history_raw.get("stride_steps", 1),
-        "control_contract.observation_history.stride_steps",
-    )
-    if history_frames == 1 and history_stride_steps != 1:
+    history_mode = str(history_raw.get("mode", "uniform"))
+    if history_mode == "uniform":
+        unexpected = {
+            "dense_action_steps",
+            "sparse_physical_frames",
+            "sparse_physical_stride_steps",
+        }.intersection(history_raw)
+        if unexpected:
+            raise ConfigError(
+                "uniform observation history does not accept "
+                f"{sorted(unexpected)}"
+            )
+        history_frames = _positive_int_value(
+            history_raw.get("frames", 1),
+            "control_contract.observation_history.frames",
+        )
+        history_stride_steps = _positive_int_value(
+            history_raw.get("stride_steps", 1),
+            "control_contract.observation_history.stride_steps",
+        )
+        if history_frames == 1 and history_stride_steps != 1:
+            raise ConfigError(
+                "single-frame observation history requires stride_steps=1"
+            )
+        dense_action_steps = 0
+        sparse_physical_frames = 0
+        sparse_physical_stride_steps = 1
+    elif history_mode == "multirate_actuator":
+        unexpected = {"frames", "stride_steps"}.intersection(history_raw)
+        if unexpected:
+            raise ConfigError(
+                "multirate_actuator observation history does not accept "
+                f"{sorted(unexpected)}"
+            )
+        dense_action_steps = _positive_int_value(
+            history_raw.get("dense_action_steps"),
+            "control_contract.observation_history.dense_action_steps",
+        )
+        sparse_physical_frames = _positive_int_value(
+            history_raw.get("sparse_physical_frames"),
+            "control_contract.observation_history.sparse_physical_frames",
+        )
+        sparse_physical_stride_steps = _positive_int_value(
+            history_raw.get("sparse_physical_stride_steps"),
+            "control_contract.observation_history."
+            "sparse_physical_stride_steps",
+        )
+        history_frames = 1
+        history_stride_steps = 1
+    else:
         raise ConfigError(
-            "single-frame observation history requires stride_steps=1"
+            "control_contract.observation_history.mode must be uniform or "
+            "multirate_actuator"
         )
     transform = _map(node, "action_transform")
     _keys(
@@ -1061,8 +1252,14 @@ def _control_contract(node: Mapping[str, Any]) -> ControlContractConfig:
     return ControlContractConfig(
         version=version,
         observation_profile=profile,
+        observation_history_mode=history_mode,
         observation_history_frames=history_frames,
         observation_history_stride_steps=history_stride_steps,
+        observation_history_dense_action_steps=dense_action_steps,
+        observation_history_sparse_physical_frames=sparse_physical_frames,
+        observation_history_sparse_physical_stride_steps=(
+            sparse_physical_stride_steps
+        ),
         policy_action_fields=policy,
         external_action_fields=external,
         simulator_command_fields=simulator,

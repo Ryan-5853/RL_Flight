@@ -91,6 +91,8 @@ class LiveTrainingProgress:
             (
                 f"课程={_metric(metrics, 'curriculum_episode_duration_s'):.3g}s"
                 f"/成功率={100.0 * _metric(metrics, 'curriculum_last_success_fraction'):.1f}%"
+                f"/生存={100.0 * _metric(metrics, 'curriculum_rollout_survival_fraction'):.1f}%"
+                f"/质量={100.0 * _metric(metrics, 'curriculum_rollout_quality_fraction'):.1f}%"
             ),
             f"终止={100.0 * _metric(metrics, 'terminated_fraction'):.2f}%",
             f"动作饱和={100.0 * _metric(metrics, 'action_saturation_fraction'):.2f}%",

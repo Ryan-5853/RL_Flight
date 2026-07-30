@@ -30,6 +30,108 @@ class FixedEvaluationTests(unittest.TestCase):
         )
         self.assertAlmostEqual(sum(suite.score_weights.values()), 1.0)
 
+    def test_self_stabilize_suite_scores_yaw_rate_not_yaw_heading(self):
+        suite = load_fixed_evaluation_suite(
+            ROOT / "configs/evaluation/fixed_self_stabilize_v2.yaml"
+        )
+        self.assertTrue(suite.self_stabilize_tracking)
+        self.assertEqual(suite.schema_version, 2)
+        self.assertEqual(
+            suite.checkpoint_selection.minimum_hover_survival_s, 2.5
+        )
+
+        steps, batch = 100, 2
+        zeros_3 = torch.zeros(steps, batch, 3)
+        target_q = euler_to_quaternion(
+            torch.zeros(steps, batch),
+            torch.zeros(steps, batch),
+            torch.zeros(steps, batch),
+        )
+        yaw_offset = torch.full((steps, batch), torch.pi / 2.0)
+        actual_euler = zeros_3.clone()
+        actual_euler[..., 2] = yaw_offset
+        actual_q = euler_to_quaternion(
+            actual_euler[..., 0],
+            actual_euler[..., 1],
+            actual_euler[..., 2],
+        )
+        trajectory = {
+            "alive": torch.ones(steps, batch, dtype=torch.bool),
+            "action": torch.zeros(steps, batch, 4),
+            "position_n": zeros_3.clone(),
+            "velocity_n": zeros_3.clone(),
+            "attitude_q_wb": actual_q,
+            "target_position_n": zeros_3.clone(),
+            "target_velocity_n": zeros_3.clone(),
+            "target_attitude_q_wb": target_q,
+            "target_euler_rad": zeros_3.clone(),
+            "actual_euler_rad": actual_euler,
+            "yaw_rate_error_rad_s": torch.zeros(steps, batch),
+        }
+        result = _score_trajectory(
+            trajectory,
+            torch.full((batch,), 10.0),
+            suite.scenarios[0],
+            suite.limits,
+            100,
+            suite.score_weights,
+            self_stabilize_tracking=True,
+        )
+        self.assertGreater(result["metrics"]["attitude_rmse_deg"]["mean"], 89.0)
+        self.assertAlmostEqual(
+            result["metrics"]["roll_pitch_rmse_deg"]["mean"], 0.0
+        )
+        self.assertAlmostEqual(
+            result["metrics"]["yaw_rate_rmse_rad_s"]["mean"], 0.0
+        )
+        self.assertAlmostEqual(result["total_score"], 100.0)
+
+    def test_upright_survival_suite_records_but_does_not_score_yaw_rate(self):
+        suite = load_fixed_evaluation_suite(
+            ROOT / "configs/evaluation/fixed_upright_survival_v3.yaml"
+        )
+        self.assertEqual(suite.schema_version, 3)
+        self.assertTrue(suite.self_stabilize_tracking)
+        self.assertEqual(suite.yaw_rate_tracking_weight, 0.0)
+        self.assertIsNone(
+            suite.checkpoint_selection.maximum_hover_yaw_rate_rmse_rad_s
+        )
+
+        steps, batch = 100, 2
+        zeros_3 = torch.zeros(steps, batch, 3)
+        target_q = euler_to_quaternion(
+            torch.zeros(steps, batch),
+            torch.zeros(steps, batch),
+            torch.zeros(steps, batch),
+        )
+        trajectory = {
+            "alive": torch.ones(steps, batch, dtype=torch.bool),
+            "action": torch.zeros(steps, batch, 4),
+            "position_n": zeros_3.clone(),
+            "velocity_n": zeros_3.clone(),
+            "attitude_q_wb": target_q.clone(),
+            "target_position_n": zeros_3.clone(),
+            "target_velocity_n": zeros_3.clone(),
+            "target_attitude_q_wb": target_q,
+            "target_euler_rad": zeros_3.clone(),
+            "actual_euler_rad": zeros_3.clone(),
+            "yaw_rate_error_rad_s": torch.full((steps, batch), 10.0),
+        }
+        result = _score_trajectory(
+            trajectory,
+            torch.full((batch,), 10.0),
+            suite.scenarios[0],
+            suite.limits,
+            100,
+            suite.score_weights,
+            self_stabilize_tracking=suite.self_stabilize_tracking,
+            yaw_rate_tracking_weight=suite.yaw_rate_tracking_weight,
+        )
+        self.assertAlmostEqual(
+            result["metrics"]["yaw_rate_rmse_rad_s"]["mean"], 10.0
+        )
+        self.assertAlmostEqual(result["total_score"], 100.0)
+
     def test_circle_reference_starts_at_origin_with_tangent_velocity(self):
         scenario = load_fixed_evaluation_suite(
             ROOT / "configs/evaluation/fixed_attitude_v1.yaml"

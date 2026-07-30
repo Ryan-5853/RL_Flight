@@ -1,0 +1,212 @@
+# 128×128 MLP-SAC：直立定高稳定性 v3。
+#
+# 相对 stability_v2：
+#   1. 第一课程阶段从 2.0 s 提高到 2.5 s，高于零动作约 2.07 s 的自然存活；
+#   2. 晋级同时要求 roll/pitch、yaw-rate 和总角速度的整回合 RMS 达标；
+#   3. yaw 仍是角速度自稳，不锁定航向；提高 yaw-rate 代价以抑制持续旋转；
+#   4. replay 扩大一倍，critic-only 阶段扩大一倍，actor 更新频率减半；
+#   5. 使用 self_stabilize v2 固定评测和复合 best 质量门槛。
+#
+# 这是全新训练，不能 exact-resume v2 checkpoint。
+#
+# 启动：
+#   flight-train run \
+#     --config configs/experiments/mlp_sac_upright_height_only_small_tip_stability_v3.yaml
+
+schema_version: 2
+
+experiment:
+  name: mlp_sac_upright_height_only_small_tip_stability_v3
+  entrypoint:
+    type: "flight_train.runner:run_experiment"
+    version: "train-framework-v1"
+
+seed:
+  # 与 v2 保持相同随机流，便于直接比较配置差异。
+  base: 20260725
+  deterministic_algorithms: true
+  cudnn_benchmark: false
+
+run:
+  device: cuda:0
+  dtype: float32
+  parallel_count: 256
+  total_control_steps: 16777216
+  output_root: ../../runs
+  allow_unimplemented_simulator: false
+
+environment:
+  factory: "simenv:SimulationEnvironment"
+  config_path: ../environment/gru_sac_upright_height_only_small_tip.yaml
+  observation_source: truth
+
+command_source:
+  type: "flight_train.commands:VirtualPilotCommandSource"
+  version: "2"
+  seed: 52025
+  params:
+    throttle:
+      minimum: 0.20
+      maximum: 0.85
+      spool:
+        duration_s: 0.10
+        target_range: [0.54, 0.58]
+      height_controller:
+        observation_source: truth
+        target_m: 0.0
+        initial_throttle_range: [0.55, 0.58]
+        proportional_gain: 0.08
+        integral_gain: 0.04
+        error_limit_m: 5.0
+      slew_rate:
+        rise_per_s: 4.0
+        fall_per_s: 0.35
+    sticks:
+      roll:  {mode: angle, limit_rad: 0.0, time_constant_s: 0.20}
+      pitch: {mode: angle, limit_rad: 0.0, time_constant_s: 0.20}
+      yaw:   {mode: rate, limit_rad_s: 0.0, time_constant_s: 0.30}
+      target_sampling:
+        distribution: centered
+        center_exponent: 2.0
+        hold_duration_s:
+          range: [2.0, 4.0]
+      reset:
+        filtered_stick: zero
+        initial_target_scale: 0.0
+
+control_contract:
+  version: self_stabilize_v1
+  observation_profile: attitude_self_stabilize_21d_v3
+  observation_history:
+    mode: multirate_actuator
+    dense_action_steps: 32
+    sparse_physical_frames: 15
+    sparse_physical_stride_steps: 4
+  action_transform:
+    type: residual_around_trim
+    trim_command: [0.53523, 0.0, 0.0, 0.0]
+    residual_scale: [0.30, 1.0, 1.0, 1.0]
+  policy_action:
+    fields: [lower_motor, servo_1, servo_2, servo_3]
+  external_action:
+    fields: [upper_motor]
+  simulator_command:
+    fields: [upper_motor, lower_motor, servo_1, servo_2, servo_3]
+
+randomization:
+  static:
+    seed: 32025
+    scope: episode
+    parameters: {}
+  dynamic:
+    seed: 42025
+    scope: simulator
+    parameters: {}
+
+task:
+  episode_duration_s: 30.0
+  episode_curriculum:
+    # 零动作固定评测约 2.07 s；第一关设为 2.5 s，必须产生真正的稳定收益。
+    durations_s:   [2.5, 3.5, 5.0, 10.0, 30.0]
+    target_scales: [0.0, 0.0, 0.0,  0.0,  0.0]
+    success_fraction: 0.80
+    evaluation_episodes_per_env: 1.0
+    consecutive_passes: 2
+    quality_gate:
+      # 10 deg 的 roll/pitch 合成 RMSE；yaw 不锁航向，只限制角速度。
+      max_roll_pitch_rmse_rad: 0.17453292519943295
+      max_yaw_rate_rmse_rad_s: 0.50
+      max_angular_rate_rms_rad_s: 1.00
+  termination:
+    max_tilt_rad: 1.0
+    max_angular_rate_rad_s: 8.0
+
+reward:
+  calculator:
+    type: "flight_train.rewards.attitude:AttitudeRewardCalculator"
+    version: "3"
+    params:
+      roll_pitch_weight: 0
+      tilt_weight: 0.08
+
+      # v2 被动策略的 yaw-rate 奖励项仅约 -0.002，远小于 alive bonus。
+      # 提高十倍后，持续旋转约产生 -0.02 量级代价，但不惩罚静态航向偏差。
+      yaw_rate_weight: 0.0015625
+      # p/q 角速度代价提高两倍，抑制主动策略的快速过度修正。
+      angular_rate_weight: 0.0003125
+
+      action_rate_weight: 0.002
+      saturation_weight: 0.01
+      alive_bonus: 0.02
+      survival_progress_weight: 0.0
+
+      tilt_barrier_weight: 0.02
+      rate_barrier_weight: 0.002
+      barrier_start_fraction: 0.30
+      barrier_exponent: 2.0
+
+      termination_penalty: 10.0
+      early_termination_penalty: 10.0
+  context:
+    fields:
+      - {name: attitude_geodesic_rad, source: task}
+      - {name: angular_velocity_b, source: truth}
+      - {name: static_domain, source: train_randomizer, visibility: reward_only}
+
+model:
+  type: mlp_actor_critic
+  hidden_sizes: [128, 128]
+  policy_distribution:
+    learnable_action_std: false
+    initial_action_std: [0.04, 0.035, 0.035, 0.035]
+    minimum_action_std: [0.01, 0.01, 0.01, 0.01]
+    maximum_action_std: [0.06, 0.05, 0.05, 0.05]
+
+algorithm:
+  name: sac
+  gamma: 0.999
+  n_step_return: 16
+  replay:
+    # 由约 8 个 rollout 扩大到约 16 个，减弱短期坏策略对 critic 的支配。
+    capacity_transitions: 2097152
+    warmup_transitions: 262144
+    batch_size: 4096
+  # 先进行约 16 个 collector 的纯 critic 更新，再允许 actor 改变策略。
+  critic_pretraining_updates: 1024
+  # 每 8 次 critic 更新才做 1 次 actor/alpha 更新。
+  actor_update_interval: 8
+  updates_per_collection: 64
+  target_update:
+    tau: 0.005
+    interval_updates: 1
+  entropy:
+    automatic: true
+    initial_alpha: 0.001
+    target_entropy: -4.0
+    min_alpha: 0.0001
+    max_alpha: 0.005
+  actor_max_grad_norm: 1.0
+  critic_max_grad_norm: 5.0
+  optimizer:
+    type: adam
+    # v2 为 3e-5；进一步减半，降低 actor 追逐暂态 Q 峰值的速度。
+    actor_learning_rate: 0.000015
+    critic_learning_rate: 0.0003
+    alpha_learning_rate: 0.0001
+
+collector:
+  control_steps_per_rollout: 512
+
+evaluation:
+  enabled: true
+  interval_control_steps: 1048576
+  suite_path: ../evaluation/fixed_self_stabilize_v2.yaml
+
+checkpoint:
+  resume:
+    from: null
+    mode: exact
+  interval_control_steps: 524288
+  keep_last: 4
+
+recording: {}

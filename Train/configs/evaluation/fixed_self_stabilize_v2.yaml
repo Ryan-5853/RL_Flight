@@ -1,0 +1,58 @@
+schema_version: 2
+name: fixed_self_stabilize_v2
+
+# self_stabilize_v1 的 yaw 目标是角速度而不是航向角。本套件仍保存完整四元数
+# 姿态误差用于诊断，但跟踪得分只使用 roll/pitch 误差与 yaw-rate 误差。
+seed: 72001
+parallel_count: 8
+output_root: ../../evaluation_runs
+
+scenarios:
+  - name: hover
+    type: hover
+    duration_s: 10.0
+    fixed_euler_deg: [0.0, 0.0, 0.0]
+
+  - name: constant_translation
+    type: constant_translation
+    duration_s: 12.0
+    fixed_euler_deg: [0.0, 5.0, 0.0]
+    target_velocity_n_m_s: [1.0, 0.0, 0.0]
+
+  - name: circle
+    type: circle
+    duration_s: 16.0
+    fixed_euler_deg: [0.0, 0.0, 0.0]
+    circle_radius_m: 1.0
+    circle_period_s: 8.0
+    roll_amplitude_deg: 6.0
+    pitch_amplitude_deg: 6.0
+
+scoring:
+  limits:
+    # v2 中 attitude_rmse_bad_deg 用作 roll/pitch 合成误差的坏值阈值；
+    # report 仍额外保存 legacy 的完整姿态 attitude_rmse_deg。
+    attitude_rmse_bad_deg: 15.0
+    yaw_rate_rmse_bad_rad_s: 2.0
+    position_rmse_bad_m: 5.0
+    velocity_rmse_bad_m_s: 3.0
+    action_rms_bad: 1.0
+    action_delta_rms_bad: 0.25
+    saturation_fraction_bad: 0.50
+    response_time_bad_s: 2.0
+    settling_error_deg: 2.0
+    settling_window_s: 0.50
+    phase_lag_max_s: 2.0
+
+  weights:
+    survival: 0.35
+    tracking: 0.35
+    action: 0.15
+    response: 0.15
+
+# 未同时满足三项时不覆盖 best_fixed_evaluation.pt；通过后优先比较包含
+# 生存、跟踪、动作与响应的总分，再以悬停生存时间打破同分。
+checkpoint_selection:
+  minimum_hover_survival_s: 2.5
+  maximum_hover_roll_pitch_rmse_deg: 10.0
+  maximum_hover_yaw_rate_rmse_rad_s: 0.5

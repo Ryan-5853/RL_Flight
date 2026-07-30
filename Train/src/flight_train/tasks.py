@@ -83,7 +83,12 @@ class AttitudeTrackingTask:
             )
         yaw_rate_error = angular_velocity[:, 2:3] - desired_yaw_rate
         tilt = tilt_angle(attitude)
-        rate_norm = angular_velocity.norm(dim=-1, keepdim=True)
+        termination_rate = (
+            angular_velocity[:, :2]
+            if self.config.terminate_angular_rate_axes == "roll_pitch"
+            else angular_velocity
+        )
+        rate_norm = termination_rate.norm(dim=-1, keepdim=True)
         terminated = (tilt > self.config.terminate_tilt_rad) | (rate_norm > self.config.terminate_angular_rate_rad_s)
         episode_age_fraction = (
             (episode_step[:, None].to(self.dtype) + 1.0) / float(max_episode_steps)
@@ -132,6 +137,8 @@ class AttitudeTrackingTask:
         info.update(
             {
                 "attitude_error_rad": attitude_error,
+                "roll_pitch_error_rad": roll_pitch_error,
+                "yaw_rate_error_rad_s": yaw_rate_error,
                 "tilt_rad": tilt,
                 "angular_rate_norm": rate_norm,
             }

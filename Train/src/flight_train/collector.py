@@ -90,6 +90,10 @@ class TensorDictRolloutCollector:
                         "angular_rate_norm_rad_s": info["angular_rate_norm"],
                         "height_error_m": info["pilot.height_error_m"],
                         "episode_length_steps": info["episode.length_steps"],
+                        "curriculum_quality_success": info.get(
+                            "episode.curriculum_quality_success",
+                            torch.ones_like(next_env["truncated"]),
+                        ),
                     }
                 )
                 for reward_key in (

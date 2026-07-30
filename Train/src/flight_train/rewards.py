@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Mapping, Protocol
 
@@ -37,8 +38,62 @@ class AttitudeRewardCalculator:
         self.roll_pitch_weight = float(
             params.get("roll_pitch_weight", params.get("attitude_weight", 2.0))
         )
+        roll_pitch_cost_cap_rad = params.get("roll_pitch_cost_cap_rad")
+        self.roll_pitch_cost_cap_rad = (
+            None if roll_pitch_cost_cap_rad is None else float(roll_pitch_cost_cap_rad)
+        )
+        if self.roll_pitch_cost_cap_rad is not None and (
+            not math.isfinite(self.roll_pitch_cost_cap_rad)
+            or self.roll_pitch_cost_cap_rad <= 0
+        ):
+            raise ValueError("roll_pitch_cost_cap_rad must be positive when configured")
+        roll_pitch_huber_delta_rad = params.get(
+            "roll_pitch_huber_delta_rad"
+        )
+        self.roll_pitch_huber_delta_rad = (
+            None
+            if roll_pitch_huber_delta_rad is None
+            else float(roll_pitch_huber_delta_rad)
+        )
+        if self.roll_pitch_huber_delta_rad is not None and (
+            not math.isfinite(self.roll_pitch_huber_delta_rad)
+            or self.roll_pitch_huber_delta_rad <= 0
+        ):
+            raise ValueError(
+                "roll_pitch_huber_delta_rad must be positive when configured"
+            )
+        if (
+            self.roll_pitch_cost_cap_rad is not None
+            and self.roll_pitch_huber_delta_rad is not None
+        ):
+            raise ValueError(
+                "roll_pitch_cost_cap_rad and roll_pitch_huber_delta_rad "
+                "are mutually exclusive"
+            )
         self.tilt_weight = float(params.get("tilt_weight", 1.0))
         self.yaw_rate_weight = float(params.get("yaw_rate_weight", 0.05))
+        yaw_rate_huber_delta_rad_s = params.get("yaw_rate_huber_delta_rad_s")
+        self.yaw_rate_huber_delta_rad_s = (
+            None
+            if yaw_rate_huber_delta_rad_s is None
+            else float(yaw_rate_huber_delta_rad_s)
+        )
+        if self.yaw_rate_huber_delta_rad_s is not None and (
+            not math.isfinite(self.yaw_rate_huber_delta_rad_s)
+            or self.yaw_rate_huber_delta_rad_s <= 0
+        ):
+            raise ValueError(
+                "yaw_rate_huber_delta_rad_s must be positive when configured"
+            )
+        yaw_rate_cost_cap = params.get("yaw_rate_cost_cap")
+        self.yaw_rate_cost_cap = (
+            None if yaw_rate_cost_cap is None else float(yaw_rate_cost_cap)
+        )
+        if self.yaw_rate_cost_cap is not None and (
+            not math.isfinite(self.yaw_rate_cost_cap)
+            or self.yaw_rate_cost_cap <= 0
+        ):
+            raise ValueError("yaw_rate_cost_cap must be positive when configured")
         self.angular_rate_weight = float(params.get("angular_rate_weight", 0.05))
         self.action_rate_weight = float(params.get("action_rate_weight", 0.01))
         self.saturation_weight = float(params.get("saturation_weight", 0.02))
@@ -95,11 +150,38 @@ class AttitudeRewardCalculator:
         rate_cost = angular_velocity[:, :2].square().sum(dim=-1, keepdim=True)
         action_rate_cost = (action - previous_action).square().sum(dim=-1, keepdim=True)
         saturation_cost = torch.relu(action.abs() - 0.95).square().sum(dim=-1, keepdim=True)
-        reward_attitude = -self.roll_pitch_weight * roll_pitch_error.square().sum(
-            dim=-1, keepdim=True
-        )
+        roll_pitch_cost = roll_pitch_error.square().sum(dim=-1, keepdim=True)
+        if self.roll_pitch_cost_cap_rad is not None:
+            roll_pitch_cost = roll_pitch_cost.clamp_max(
+                self.roll_pitch_cost_cap_rad**2
+            )
+        elif self.roll_pitch_huber_delta_rad is not None:
+            roll_pitch_norm = roll_pitch_cost.sqrt()
+            delta = self.roll_pitch_huber_delta_rad
+            roll_pitch_cost = torch.where(
+                roll_pitch_norm <= delta,
+                roll_pitch_cost,
+                2.0 * delta * roll_pitch_norm - delta**2,
+            )
+        reward_attitude = -self.roll_pitch_weight * roll_pitch_cost
         reward_tilt = -self.tilt_weight * tilt.square()
-        reward_yaw_rate = -self.yaw_rate_weight * yaw_rate_error.square()
+        yaw_rate_cost = yaw_rate_error.square()
+        if self.yaw_rate_huber_delta_rad_s is not None:
+            yaw_rate_abs = yaw_rate_error.abs()
+            delta = self.yaw_rate_huber_delta_rad_s
+            yaw_rate_cost = torch.where(
+                yaw_rate_abs <= delta,
+                yaw_rate_cost,
+                2.0 * delta * yaw_rate_abs - delta**2,
+            )
+        if self.yaw_rate_cost_cap is not None:
+            # 有理饱和保持 cost < cap，同时在高 yaw 区间保留非零梯度。
+            yaw_rate_cost = (
+                self.yaw_rate_cost_cap
+                * yaw_rate_cost
+                / (self.yaw_rate_cost_cap + yaw_rate_cost)
+            )
+        reward_yaw_rate = -self.yaw_rate_weight * yaw_rate_cost
         reward_rate = -self.angular_rate_weight * rate_cost
         reward_action_rate = -self.action_rate_weight * action_rate_cost
         reward_saturation = -self.saturation_weight * saturation_cost
@@ -114,18 +196,20 @@ class AttitudeRewardCalculator:
             -self.tilt_barrier_weight * tilt_risk
             - self.rate_barrier_weight * rate_risk
         )
+        reward_alive = torch.full_like(legacy_attitude_error, self.alive_bonus)
         reward_survival = self.survival_progress_weight * episode_age_fraction
         termination_cost = terminated.to(action.dtype) * (
             self.termination_penalty
             + self.early_termination_penalty * remaining_fraction
         )
         reward = (
-            self.alive_bonus + reward_attitude + reward_tilt + reward_yaw_rate
+            reward_alive + reward_attitude + reward_tilt + reward_yaw_rate
             + reward_rate + reward_action_rate
             + reward_saturation + reward_risk + reward_survival - termination_cost
         )
         terms = TensorDict(
             {
+                "reward.alive": reward_alive,
                 "reward.attitude": reward_attitude,
                 "reward.tilt": reward_tilt,
                 "reward.yaw_rate": reward_yaw_rate,

@@ -22,9 +22,11 @@ class SimEnvAdapter:
     适配器负责观测拼接、动作域映射、任务奖励和 episode 生命周期；SimEnv
     只负责动力学、执行器与传感器推进。控制周期内的张量始终留在目标设备。
 
-    观测固定为 21 维：目标相对当前姿态四元数 4、角速度 3、加速度 3、
+    单帧观测固定为 21 维：目标相对当前姿态四元数 4、角速度 3、加速度 3、
     电机转速 2、舵机实际角 3、目标偏航角速度 1、上桨油门 1、
-    上一策略动作 4。
+    上一策略动作 4。控制契约既支持等间隔整帧堆叠，也支持双时间尺度输入：
+    当前完整状态、连续动作历史，以及稀疏的执行机构/机体响应历史。后者让
+    无循环状态的 MLP 同时看到高频控制和较长的低通响应时间窗。
     """
 
     observation_fields = (
@@ -39,6 +41,17 @@ class SimEnvAdapter:
     )
     acceleration_scale_m_s2 = 9.80665
     motor_speed_scale_rad_s = 1800.0
+    base_observation_dim = 21
+    previous_action_start = 17
+    previous_action_dim = 4
+    physical_response_start = 4
+    physical_response_dim = 11
+    physical_response_fields = (
+        "angular_velocity_b",
+        "acceleration_b",
+        "motor_speed",
+        "servo_angle",
+    )
 
     def __init__(
         self,
@@ -60,15 +73,106 @@ class SimEnvAdapter:
         self.dtype = dtype
         self.batch_size = simulator.parallel_count
         physics_hz, control_hz = _load_timing(self.simulator_config)
+        self.observation_history_mode = (
+            control_contract_config.observation_history_mode
+        )
+        self.observation_history_frames = (
+            control_contract_config.observation_history_frames
+        )
+        self.observation_history_stride_steps = (
+            control_contract_config.observation_history_stride_steps
+        )
+        self.observation_history_dense_action_steps = (
+            control_contract_config.observation_history_dense_action_steps
+        )
+        self.observation_history_sparse_physical_frames = (
+            control_contract_config.observation_history_sparse_physical_frames
+        )
+        self.observation_history_sparse_physical_stride_steps = (
+            control_contract_config
+            .observation_history_sparse_physical_stride_steps
+        )
+        self.observation_history_capacity = (
+            control_contract_config.observation_history_span_steps + 1
+        )
+        self.observation_history = torch.zeros(
+            (
+                self.batch_size,
+                self.observation_history_capacity,
+                self.base_observation_dim,
+            ),
+            device=self.device,
+            dtype=self.dtype,
+        )
+        self.observation_history_index = (
+            self.observation_history_capacity - 1
+        )
+        self._observation_history_offsets = (
+            torch.arange(
+                self.observation_history_frames - 1,
+                -1,
+                -1,
+                device=self.device,
+                dtype=torch.long,
+            )
+            * self.observation_history_stride_steps
+        )
+        self._dense_action_history_offsets = torch.arange(
+            self.observation_history_dense_action_steps - 1,
+            -1,
+            -1,
+            device=self.device,
+            dtype=torch.long,
+        )
+        self._sparse_physical_history_offsets = (
+            torch.arange(
+                self.observation_history_sparse_physical_frames,
+                0,
+                -1,
+                device=self.device,
+                dtype=torch.long,
+            )
+            * self.observation_history_sparse_physical_stride_steps
+        )
+        self._physical_response_indices = torch.arange(
+            self.physical_response_start,
+            self.physical_response_start + self.physical_response_dim,
+            device=self.device,
+            dtype=torch.long,
+        )
+        if self.observation_history_mode == "uniform":
+            history_fields = tuple(
+                f"history_t_minus_{lag}.{field}"
+                for lag in self._observation_history_offsets.tolist()
+                for field in self.observation_fields
+            )
+        elif self.observation_history_mode == "multirate_actuator":
+            history_fields = (
+                *(f"current.{field}" for field in self.observation_fields),
+                *(
+                    f"action_t_minus_{lag + 1}.previous_policy_action"
+                    for lag in self._dense_action_history_offsets.tolist()
+                ),
+                *(
+                    f"history_t_minus_{lag}.{field}"
+                    for lag in self._sparse_physical_history_offsets.tolist()
+                    for field in self.physical_response_fields
+                ),
+            )
+        else:
+            raise RuntimeError(
+                "unsupported observation history mode "
+                f"{self.observation_history_mode!r}"
+            )
         self._spec = EnvSpec(
             parallel_count=self.batch_size,
-            observation_dim=21,
+            observation_dim=control_contract_config.observation_dim,
             action_dim=4,
             device=self.device,
             dtype=self.dtype,
             physics_hz=physics_hz,
             control_hz=control_hz,
-            observation_fields=self.observation_fields,
+            observation_fields=history_fields,
         )
         self.task_config = task_config
         self.task = AttitudeTrackingTask(
@@ -104,6 +208,18 @@ class SimEnvAdapter:
         self.previous_action = torch.zeros((self.batch_size, 4), device=self.device, dtype=self.dtype)
         self.episode_id = torch.zeros(self.batch_size, device=self.device, dtype=torch.int64)
         self.episode_step = torch.zeros(self.batch_size, device=self.device, dtype=torch.int64)
+        self.episode_roll_pitch_squared_sum = torch.zeros(
+            self.batch_size, device=self.device, dtype=self.dtype
+        )
+        self.episode_yaw_rate_squared_sum = torch.zeros_like(
+            self.episode_roll_pitch_squared_sum
+        )
+        self.episode_angular_rate_squared_sum = torch.zeros_like(
+            self.episode_roll_pitch_squared_sum
+        )
+        self.episode_quality_steps = torch.zeros(
+            self.batch_size, device=self.device, dtype=torch.int64
+        )
         self.max_episode_steps = self._duration_to_steps(
             task_config.curriculum_durations_s[0]
         )
@@ -122,14 +238,37 @@ class SimEnvAdapter:
         self,
         terminated: torch.Tensor,
         truncated: torch.Tensor,
+        quality_success: torch.Tensor | None = None,
         *,
         allow_promotion: bool = True,
     ) -> dict[str, torch.Tensor]:
-        """累计完整 episode 结果，并在允许时按连续达标次数晋级。"""
+        """累计完整 episode 的生存和质量结果，并按连续达标次数晋级。"""
 
-        self.curriculum_failures += int(terminated.sum().item())
-        self.curriculum_successes += int(
-            (truncated & ~terminated).sum().item()
+        survived = truncated & ~terminated
+        if quality_success is None:
+            quality_success = torch.ones_like(survived)
+        if quality_success.shape != survived.shape:
+            raise ValueError(
+                "curriculum quality_success must match terminated/truncated shape"
+            )
+        quality_success = quality_success.to(torch.bool)
+        successful = survived & quality_success
+        failed = terminated | (survived & ~quality_success)
+        rollout_survivals = int(survived.sum().item())
+        rollout_successes = int(successful.sum().item())
+        rollout_failures = int(failed.sum().item())
+        self.curriculum_failures += rollout_failures
+        self.curriculum_successes += rollout_successes
+        rollout_completed = rollout_survivals + int(terminated.sum().item())
+        rollout_survival_fraction = (
+            rollout_survivals / float(rollout_completed)
+            if rollout_completed
+            else 0.0
+        )
+        rollout_quality_fraction = (
+            rollout_successes / float(rollout_survivals)
+            if rollout_survivals
+            else 0.0
         )
         completed = self.curriculum_successes + self.curriculum_failures
         required = max(
@@ -185,6 +324,12 @@ class SimEnvAdapter:
             ),
             "curriculum_last_success_fraction": scalar(
                 self.curriculum_last_success_fraction
+            ),
+            "curriculum_rollout_survival_fraction": scalar(
+                rollout_survival_fraction
+            ),
+            "curriculum_rollout_quality_fraction": scalar(
+                rollout_quality_fraction
             ),
             "curriculum_consecutive_passes": scalar(
                 self.curriculum_consecutive_passes
@@ -271,8 +416,30 @@ class SimEnvAdapter:
         self.command_source.reset(mask)
         self.previous_action = torch.where(mask[:, None], torch.zeros_like(self.previous_action), self.previous_action)
         self.episode_step = torch.where(mask, torch.zeros_like(self.episode_step), self.episode_step)
+        self.episode_roll_pitch_squared_sum = torch.where(
+            mask,
+            torch.zeros_like(self.episode_roll_pitch_squared_sum),
+            self.episode_roll_pitch_squared_sum,
+        )
+        self.episode_yaw_rate_squared_sum = torch.where(
+            mask,
+            torch.zeros_like(self.episode_yaw_rate_squared_sum),
+            self.episode_yaw_rate_squared_sum,
+        )
+        self.episode_angular_rate_squared_sum = torch.where(
+            mask,
+            torch.zeros_like(self.episode_angular_rate_squared_sum),
+            self.episode_angular_rate_squared_sum,
+        )
+        self.episode_quality_steps = torch.where(
+            mask,
+            torch.zeros_like(self.episode_quality_steps),
+            self.episode_quality_steps,
+        )
         self.episode_id = self.episode_id + mask.to(torch.int64)
-        observation, _attitude, _rate, _height = self._observation()
+        base_observation, _attitude, _rate, _height = self._base_observation()
+        self._reset_observation_history(mask, base_observation)
+        observation = self._history_observation()
         return TensorDict(
             {
                 "observation": observation,
@@ -309,7 +476,12 @@ class SimEnvAdapter:
             self.control_contract_config.policy_action_residual_scale,
         )
         result = self.simulator.advance(command)
-        _observation_before_reset, attitude, angular_velocity, height = self._observation()
+        (
+            _observation_before_reset,
+            attitude,
+            angular_velocity,
+            height,
+        ) = self._base_observation()
         transition = self.task.transition(
             attitude,
             angular_velocity,
@@ -321,11 +493,48 @@ class SimEnvAdapter:
             env_context=self._reward_environment_context(),
             desired_yaw_rate=self.command_source.desired_yaw_rate,
         )
+        roll_pitch_error = transition.info["roll_pitch_error_rad"]
+        yaw_rate_error = transition.info["yaw_rate_error_rad_s"].squeeze(-1)
+        angular_rate_norm = transition.info["angular_rate_norm"].squeeze(-1)
+        self.episode_roll_pitch_squared_sum += roll_pitch_error.square().sum(
+            dim=-1
+        )
+        self.episode_yaw_rate_squared_sum += yaw_rate_error.square()
+        self.episode_angular_rate_squared_sum += angular_rate_norm.square()
+        self.episode_quality_steps += 1
+        quality_denominator = self.episode_quality_steps.clamp_min(1).to(
+            self.dtype
+        )
+        episode_roll_pitch_rmse = torch.sqrt(
+            self.episode_roll_pitch_squared_sum / quality_denominator
+        )
+        episode_yaw_rate_rmse = torch.sqrt(
+            self.episode_yaw_rate_squared_sum / quality_denominator
+        )
+        episode_angular_rate_rms = torch.sqrt(
+            self.episode_angular_rate_squared_sum / quality_denominator
+        )
+        episode_quality_success = torch.ones(
+            self.batch_size, device=self.device, dtype=torch.bool
+        )
+        if self.task_config.curriculum_max_roll_pitch_rmse_rad is not None:
+            episode_quality_success &= episode_roll_pitch_rmse <= (
+                self.task_config.curriculum_max_roll_pitch_rmse_rad
+            )
+        if self.task_config.curriculum_max_yaw_rate_rmse_rad_s is not None:
+            episode_quality_success &= episode_yaw_rate_rmse <= (
+                self.task_config.curriculum_max_yaw_rate_rmse_rad_s
+            )
+        if self.task_config.curriculum_max_angular_rate_rms_rad_s is not None:
+            episode_quality_success &= episode_angular_rate_rms <= (
+                self.task_config.curriculum_max_angular_rate_rms_rad_s
+            )
         self.episode_step = self.episode_step + 1
         # 保存本次转移所属 episode 的实际长度；下面 masked reset 会把内部
         # episode_step 清零，但训练诊断仍需知道刚结束 episode 活了多久。
         transition_episode_step = self.episode_step.clone()
         valid = result.valid[:, None] & transition.valid
+        episode_quality_success &= valid.squeeze(-1)
         truncated = self.episode_step[:, None] >= self.max_episode_steps
         terminated = transition.terminated
         reset_mask = (terminated | truncated | ~valid).squeeze(-1)
@@ -348,16 +557,44 @@ class SimEnvAdapter:
         self.command_source.reset(reset_mask)
         self.episode_id = self.episode_id + reset_mask.to(torch.int64)
         self.episode_step = torch.where(reset_mask, torch.zeros_like(self.episode_step), self.episode_step)
+        self.episode_roll_pitch_squared_sum = torch.where(
+            reset_mask,
+            torch.zeros_like(self.episode_roll_pitch_squared_sum),
+            self.episode_roll_pitch_squared_sum,
+        )
+        self.episode_yaw_rate_squared_sum = torch.where(
+            reset_mask,
+            torch.zeros_like(self.episode_yaw_rate_squared_sum),
+            self.episode_yaw_rate_squared_sum,
+        )
+        self.episode_angular_rate_squared_sum = torch.where(
+            reset_mask,
+            torch.zeros_like(self.episode_angular_rate_squared_sum),
+            self.episode_angular_rate_squared_sum,
+        )
+        self.episode_quality_steps = torch.where(
+            reset_mask,
+            torch.zeros_like(self.episode_quality_steps),
+            self.episode_quality_steps,
+        )
         self.previous_action = torch.where(reset_mask[:, None], torch.zeros_like(standard_action), standard_action)
         # 飞手先更新下一控制周期的油门和姿态目标，再构造交给下一次策略推理的观测。
         # 对 reset 实例这里读取重置后的 SimEnv 状态；其他实例保持刚推进后的状态。
-        observation, _attitude, _rate, _height = self._observation()
+        base_observation, _attitude, _rate, _height = self._base_observation()
+        self._append_observation_history(base_observation, reset_mask)
+        observation = self._history_observation()
 
         info = dict(transition.info)
         info["sim.error_code"] = result.error_code[:, None]
         info["action.command"] = command
         info["flight.height_m"] = height
         info["episode.length_steps"] = transition_episode_step[:, None]
+        info["episode.roll_pitch_rmse_rad"] = episode_roll_pitch_rmse[:, None]
+        info["episode.yaw_rate_rmse_rad_s"] = episode_yaw_rate_rmse[:, None]
+        info["episode.angular_rate_rms_rad_s"] = episode_angular_rate_rms[:, None]
+        info["episode.curriculum_quality_success"] = (
+            episode_quality_success[:, None]
+        )
         info.update(dict(pilot_info.items()))
         return TensorDict(
             {
@@ -377,7 +614,20 @@ class SimEnvAdapter:
         )
 
     def _observation(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """读取真值/传感器视图并按稳定字段顺序拼接策略观测。"""
+        """读取当前物理状态，并返回不改变历史游标的策略观测。"""
+
+        _base, attitude, angular_velocity, height = self._base_observation()
+        return (
+            self._history_observation(),
+            attitude,
+            angular_velocity,
+            height,
+        )
+
+    def _base_observation(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """读取真值/传感器视图并按稳定字段顺序拼接单帧观测。"""
 
         truth = self.simulator.observe(
             "truth",
@@ -438,9 +688,109 @@ class SimEnvAdapter:
             ),
             dim=-1,
         )
-        if observation.shape != (self.batch_size, 21):
-            raise RuntimeError(f"observation contract produced {tuple(observation.shape)}, expected {(self.batch_size, 21)}")
+        expected = (self.batch_size, self.base_observation_dim)
+        if observation.shape != expected:
+            raise RuntimeError(
+                f"observation contract produced {tuple(observation.shape)}, "
+                f"expected {expected}"
+            )
         return observation, attitude, angular_velocity, height
+
+    def _reset_observation_history(
+        self,
+        mask: torch.Tensor,
+        base_observation: torch.Tensor,
+    ) -> None:
+        """用 episode 首帧填满被重置实例的历史，禁止跨 episode 泄漏。"""
+
+        replacement = base_observation[:, None, :].expand(
+            -1, self.observation_history_capacity, -1
+        )
+        self.observation_history.copy_(
+            torch.where(
+                mask[:, None, None],
+                replacement,
+                self.observation_history,
+            )
+        )
+
+    def _append_observation_history(
+        self,
+        base_observation: torch.Tensor,
+        reset_mask: torch.Tensor,
+    ) -> None:
+        """推进一个原始控制步；reset 实例用新 episode 首帧重建完整窗口。"""
+
+        self.observation_history_index = (
+            self.observation_history_index + 1
+        ) % self.observation_history_capacity
+        self.observation_history[:, self.observation_history_index].copy_(
+            base_observation
+        )
+        self._reset_observation_history(reset_mask, base_observation)
+
+    def _history_observation(self) -> torch.Tensor:
+        """根据控制契约构造无跨 episode 泄漏的 MLP 历史输入。"""
+
+        if self.observation_history_mode == "uniform":
+            indices = (
+                self.observation_history_index
+                - self._observation_history_offsets
+            ) % self.observation_history_capacity
+            observation = self.observation_history.index_select(
+                1, indices
+            ).reshape(
+                self.batch_size,
+                self.base_observation_dim * self.observation_history_frames,
+            )
+        elif self.observation_history_mode == "multirate_actuator":
+            current = self.observation_history[
+                :, self.observation_history_index
+            ]
+            action_indices = (
+                self.observation_history_index
+                - self._dense_action_history_offsets
+            ) % self.observation_history_capacity
+            dense_actions = self.observation_history.index_select(
+                1, action_indices
+            )[
+                :,
+                :,
+                self.previous_action_start:
+                self.previous_action_start + self.previous_action_dim,
+            ].reshape(
+                self.batch_size,
+                self.observation_history_dense_action_steps
+                * self.previous_action_dim,
+            )
+            physical_indices = (
+                self.observation_history_index
+                - self._sparse_physical_history_offsets
+            ) % self.observation_history_capacity
+            sparse_physical = self.observation_history.index_select(
+                1, physical_indices
+            ).index_select(
+                2, self._physical_response_indices
+            ).reshape(
+                self.batch_size,
+                self.observation_history_sparse_physical_frames
+                * self.physical_response_dim,
+            )
+            observation = torch.cat(
+                (current, dense_actions, sparse_physical), dim=-1
+            )
+        else:
+            raise RuntimeError(
+                "unsupported observation history mode "
+                f"{self.observation_history_mode!r}"
+            )
+        expected = (self.batch_size, self._spec.observation_dim)
+        if observation.shape != expected:
+            raise RuntimeError(
+                f"history observation produced {tuple(observation.shape)}, "
+                f"expected {expected}"
+            )
+        return observation
 
     def _reward_environment_context(self) -> TensorDict:
         """只发布配置显式声明的环境张量，不改变 student observation。"""

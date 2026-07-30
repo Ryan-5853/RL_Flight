@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from collections.abc import Mapping
 from collections.abc import Callable
 from contextlib import nullcontext
@@ -224,6 +225,8 @@ class TorchRLSAC:
         )
         self.gradient_updates = 0
         self.actor_updates = 0
+        # 仅用于训练正则；不是 actor 的子模块，也不会改变推理图或模型接口。
+        self.policy_anchor_module = None
         # 多步回报必须跨 collector batch 延续，不能把每个 rollout 的尾部当作
         # episode 截断。这里按并行环境保存尚缺未来转移的 n-1 步原始上下文。
         self.n_step_pending: TensorDictBase | None = None
@@ -356,6 +359,7 @@ class TorchRLSAC:
         if self.replay_size < self.config.warmup_transitions:
             return {
                 "loss_actor": zero,
+                "loss_policy_anchor": zero,
                 "loss_qvalue": zero,
                 "loss_alpha": zero,
                 "alpha": self.loss._alpha.detach(),
@@ -423,6 +427,7 @@ class TorchRLSAC:
 
                 actor_grad_norm = zero.clone()
                 actor_loss = zero.clone()
+                policy_anchor_loss = zero.clone()
                 alpha_loss = zero.clone()
                 entropy = critic_loss_td["entropy"].detach()
                 # actor 只能读取已经完成当前 critic 更新后的 Q。critic-only
@@ -440,9 +445,12 @@ class TorchRLSAC:
                 if actor_enabled:
                     # critic 已先完成本轮更新；重新前向，避免 actor 沿旧 Q 梯度移动。
                     actor_loss_td = self.loss(batch)
+                    policy_anchor_loss = self._policy_anchor_loss(batch)
                     actor_objective = (
                         actor_loss_td["loss_actor"]
                         + actor_loss_td["loss_alpha"]
+                        + self.config.policy_anchor_weight
+                        * policy_anchor_loss
                     )
                     if not bool(torch.isfinite(actor_objective).all()):
                         raise FloatingPointError("SAC actor objective is non-finite")
@@ -468,6 +476,7 @@ class TorchRLSAC:
 
                 scalar_metrics = {
                     "loss_actor": actor_loss,
+                    "loss_policy_anchor": policy_anchor_loss.detach(),
                     "loss_qvalue": critic_objective.detach(),
                     "loss_alpha": alpha_loss,
                     "alpha": self.loss._alpha.detach(),
@@ -487,7 +496,12 @@ class TorchRLSAC:
                     progress_callback(update_index + 1, updates)
         metrics = {key: value / updates for key, value in aggregate.items()}
         if actor_updates_this_call:
-            for key in ("loss_actor", "loss_alpha", "actor_grad_norm"):
+            for key in (
+                "loss_actor",
+                "loss_policy_anchor",
+                "loss_alpha",
+                "actor_grad_norm",
+            ):
                 metrics[key] = aggregate[key] / actor_updates_this_call
         metrics.update(
             {
@@ -529,6 +543,45 @@ class TorchRLSAC:
             }
         )
         return metrics
+
+    def initialize_policy_anchor(
+        self, state: Mapping[str, object] | None = None
+    ) -> None:
+        """冻结当前 actor 均值网络，作为后续策略更新的安全参考。"""
+
+        if self.config.policy_anchor_weight <= 0:
+            self.policy_anchor_module = None
+            return
+        if self.model.is_recurrent:
+            raise ValueError("policy anchor currently supports MLP SAC only")
+        anchor = copy.deepcopy(self.model.policy_module).to(self.device)
+        if state is not None:
+            anchor.load_state_dict(state)
+        anchor.eval()
+        anchor.requires_grad_(False)
+        self.policy_anchor_module = anchor
+
+    def _policy_anchor_loss(self, batch: TensorDictBase) -> torch.Tensor:
+        if self.config.policy_anchor_weight <= 0:
+            return torch.zeros((), device=self.device)
+        if self.policy_anchor_module is None:
+            raise RuntimeError(
+                "policy anchor is enabled but has not been initialized"
+            )
+        current = batch.select("observation", strict=True).clone(False)
+        self.model.policy_module(current)
+        with torch.no_grad():
+            reference = batch.select(
+                "observation", strict=True
+            ).clone(False)
+            self.policy_anchor_module(reference)
+        deviation = (
+            current["loc"].tanh() - reference["loc"].tanh()
+        ).abs()
+        excess = torch.relu(
+            deviation - self.config.policy_anchor_max_action_deviation
+        )
+        return excess.square().mean()
 
     def _prepare_recurrent_batch(
         self, batch: TensorDictBase
@@ -613,6 +666,11 @@ class TorchRLSAC:
             "gradient_updates": self.gradient_updates,
             "actor_updates": self.actor_updates,
             "n_step_pending": self.n_step_pending,
+            "policy_anchor": (
+                None
+                if self.policy_anchor_module is None
+                else self.policy_anchor_module.state_dict()
+            ),
         }
 
     def load_state_dict(self, state: Mapping[str, object]) -> None:
@@ -631,6 +689,17 @@ class TorchRLSAC:
         storage.device = self.device
         self.gradient_updates = int(state["gradient_updates"])
         self.actor_updates = int(state.get("actor_updates", 0))
+        anchor_state = state.get("policy_anchor")
+        if anchor_state is not None and not isinstance(anchor_state, Mapping):
+            raise ValueError("checkpoint SAC policy_anchor must be a mapping")
+        if self.config.policy_anchor_weight > 0:
+            if anchor_state is None:
+                raise ValueError(
+                    "checkpoint SAC policy_anchor state is missing"
+                )
+            self.initialize_policy_anchor(anchor_state)
+        else:
+            self.policy_anchor_module = None
         pending = state.get("n_step_pending")
         if pending is not None and not isinstance(pending, TensorDictBase):
             raise ValueError("checkpoint SAC n_step_pending must be a TensorDict")

@@ -1,0 +1,59 @@
+schema_version: 3
+name: fixed_upright_survival_v3
+
+# v6 阶段只考察生存与 roll/pitch 直立能力。yaw-rate 仍写入 report，
+# 但不参与跟踪得分，也不作为 best checkpoint 的质量门槛。
+seed: 72001
+parallel_count: 8
+output_root: ../../evaluation_runs
+
+scenarios:
+  - name: hover
+    type: hover
+    duration_s: 10.0
+    fixed_euler_deg: [0.0, 0.0, 0.0]
+
+  - name: constant_translation
+    type: constant_translation
+    duration_s: 12.0
+    fixed_euler_deg: [0.0, 5.0, 0.0]
+    target_velocity_n_m_s: [1.0, 0.0, 0.0]
+
+  - name: circle
+    type: circle
+    duration_s: 16.0
+    fixed_euler_deg: [0.0, 0.0, 0.0]
+    circle_radius_m: 1.0
+    circle_period_s: 8.0
+    roll_amplitude_deg: 6.0
+    pitch_amplitude_deg: 6.0
+
+scoring:
+  limits:
+    # self-stabilize 模式下作为 roll/pitch 合成 RMSE 的坏值阈值。
+    attitude_rmse_bad_deg: 15.0
+    # 仍用于生成 yaw-rate 诊断分量，但其权重在本套件中为 0。
+    yaw_rate_rmse_bad_rad_s: 2.0
+    position_rmse_bad_m: 5.0
+    velocity_rmse_bad_m_s: 3.0
+    action_rms_bad: 1.0
+    action_delta_rms_bad: 0.25
+    saturation_fraction_bad: 0.50
+    response_time_bad_s: 2.0
+    settling_error_deg: 2.0
+    settling_window_s: 0.50
+    phase_lag_max_s: 2.0
+
+  self_stabilize_tracking:
+    yaw_rate_weight: 0.0
+
+  weights:
+    survival: 0.35
+    tracking: 0.35
+    action: 0.15
+    response: 0.15
+
+# yaw-rate 不参与 best 门槛；通过后仍按总分排序，再以悬停生存时间打破同分。
+checkpoint_selection:
+  minimum_hover_survival_s: 2.5
+  maximum_hover_roll_pitch_rmse_deg: 10.0

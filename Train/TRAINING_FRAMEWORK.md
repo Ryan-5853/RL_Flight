@@ -17,7 +17,7 @@ python -m flight_train run --config configs/experiments/gru_ppo.yaml
 - 控制目标：以循环神经网络替代传统飞控的姿态 controller + allocator。虚拟/真实飞手直接拥有上桨油门；策略输入飞手姿态命令和飞行器观测，输出下桨电机及三路舵机归一化命令。
 - 仿真接口：`SimulationEnvironment.create / observe / advance`；批量维始终为第一维，控制周期为一次 `advance`，单实例故障不得影响其他实例。
 - 默认时基：物理仿真 5 kHz，控制与网络推理 500 Hz，每次动作保持 10 个物理步。
-- 当前策略输入：目标相对当前姿态四元数 4、角速度 3、加速度 3、电机转速 2、舵机实际角 3、目标偏航角速度 1、当前上桨油门 1、上次策略动作 4，共 21 维。
+- 当前单帧策略输入：目标相对当前姿态四元数 4、角速度 3、加速度 3、电机转速 2、舵机实际角 3、目标偏航角速度 1、当前上桨油门 1、上次策略动作 4，共 21 维；MLP 可等间隔堆叠整帧，也可拼接当前完整帧、连续动作历史和稀疏物理响应历史。
 - 当前策略输出：下桨电机及三个舵机，共 4 维标准动作；SimEnv 仍接收由飞手油门和策略动作合成的 5 维执行器命令。
 
 四维标准动作统一解释为残差：
@@ -230,7 +230,7 @@ class BatchedControlEnv(Protocol):
 3. 调用 `SimulationEnvironment.advance(command)` 一次。
 4. 按任务配置分别读取 `truth`、`sensor`；不得通过 `info` 偷渡未声明真值给 student。
 5. 由 `Task` 计算结束标志，生成奖励上下文后调用注入的 `RewardCalculator`。
-6. VirtualPilot 生成下一周期命令，保存 `previous_policy_action` 并构造下一帧 21 维观测。
+6. VirtualPilot 生成下一周期命令，保存 `previous_policy_action`，构造下一帧 21 维基础观测，再按控制契约生成策略历史输入。
 
 当前仿真实现已提供 `reset(reset_mask, config_path)`，适配器应直接使用该 GPU bool mask 独立重置完成、截断或失效的实例。重置属于稀疏 episode 边界；控制步热路径中的观测、动作、reward、RNN state 和 rollout 不得为判断单实例状态而转到 CPU。
 
@@ -331,7 +331,7 @@ class Task(Protocol):
 ### 5.5 MLP 与循环策略
 
 在进入循环策略训练前，先使用无状态 `mlp_actor_critic` 建立 PPO 和 SAC 基线。两者严格使用
-自稳契约定义的 21 维观测和 4 维标准动作，actor 与 critic 均采用
+自稳契约生成的观测和 4 维标准动作，actor 与 critic 均采用
 `256×256×128` SiLU MLP。MLP 不创建或伪造 recurrent state。PPO 将每个有效控制步
 作为独立 minibatch 样本；SAC 将 transition 写入设备上的 TensorDict replay，并使用
 actor、双 Q、自动温度和软目标网络。SAC 方差必须通过
@@ -349,6 +349,12 @@ actor 使用尚未训练或当前更新前的 Q 梯度。这避免 500 Hz 飞控
 `done` 和 `valid` 必须共同指向多步终点，禁止观测已移动而终止标志仍停留在一步后。
 上下文属于 exact checkpoint 状态。
 两种算法共用环境、奖励、动作变换、记录、固定评测和 exact checkpoint。
+
+对于带明显执行器低通、速率限制、死区或回差的 MLP 实验，推荐
+`multirate_actuator` 历史模式：当前 21 维完整帧保留即时状态，最近每一个控制步的
+4 维策略动作连续保存以避免高频控制混叠，而角速度、加速度、电机实际转速和舵机
+实际角这 11 维物理响应可按较低频率保存以扩展时间覆盖。当前实验采用 32 步连续
+动作与 15 帧、间隔 4 步的物理响应，共 314 维，在 500 Hz 下覆盖最长 120 ms。
 
 示例配置为 `configs/experiments/mlp_ppo_smoke.json`，其中
 `model.type=mlp_actor_critic`、`algorithm.name=ppo` 且 `sequence_length=1`。
@@ -738,6 +744,8 @@ checkpoint:
   resume:
     from: null
     mode: exact
+  # 估算出的新 checkpoint 大小之外仍须保留的空间；不足时在安全边界退出。
+  minimum_free_space_bytes: 2147483648
   # 按全部并行实例累计控制步计数，在完整 update 边界保存；null 表示仅最终保存。
   interval_control_steps: 5000000
   keep_last: 5
@@ -927,7 +935,7 @@ load + resolve config
         -> flush logs, checksums, terminal status
 ```
 
-运行器必须用 `try/finally` 关闭环境并 flush 记录器。SIGINT/SIGTERM 到达时，在安全边界保存 `interrupt` checkpoint；若无法保存，仍在 `status.json` 和事件日志中记录原因。未捕获异常保存 traceback、最后成功 flush 的步数及运行状态 `failed`，不得把失败运行标成完成。
+运行器必须用 `try/finally` 关闭环境并 flush 记录器。SIGINT/SIGTERM 到达时，在安全边界保存 `interrupt` checkpoint；若无法保存，仍在 `status.json` 和事件日志中记录原因。checkpoint 写入前按去重后的 tensor storage 估算新文件大小，并在其之外保留 `minimum_free_space_bytes`；SimEnv 日志也维护独立余量。任一保护触发时不再尝试写新的 interrupt checkpoint，保留最后一份已校验 checkpoint，并把运行记录为 `interrupted`、原因为 `insufficient_disk_space`。未捕获异常保存 traceback、最后成功 flush 的步数及运行状态 `failed`，不得把失败运行标成完成。
 
 长 rollout 期间必须提供实时可见进度，不能只在 update 完成后静默写文件。交互终端按
 时间节流原位显示 collect 局部步数、全局样本比例、rollout 序号、已用时间和 ETA；进入

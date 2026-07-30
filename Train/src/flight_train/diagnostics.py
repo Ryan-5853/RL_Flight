@@ -51,8 +51,14 @@ class SACDiagnosticContext:
 class _EnvironmentSnapshot:
     simulator: Mapping[str, Any]
     previous_action: torch.Tensor
+    observation_history: torch.Tensor
+    observation_history_index: int
     episode_id: torch.Tensor
     episode_step: torch.Tensor
+    episode_roll_pitch_squared_sum: torch.Tensor
+    episode_yaw_rate_squared_sum: torch.Tensor
+    episode_angular_rate_squared_sum: torch.Tensor
+    episode_quality_steps: torch.Tensor
     current_static_parameters: TensorDictBase
     command_source: Mapping[str, Any]
     static_randomizer: Mapping[str, Any]
@@ -238,13 +244,18 @@ def replay_action_gradient_report(
     next_observation = storage["next.observation"][index]
     done = storage["next.done"][index, 0]
 
-    # 21d_v3: angular_velocity_b 位于 4:7，并除以终止角速度；yaw 指令位于 15。
+    # uniform 模式的当前帧在末尾，multirate 模式的当前完整帧在开头。
+    current_frame_offset = (
+        config.control_contract.current_observation_offset
+    )
+    yaw_rate_index = current_frame_offset + 6
+    yaw_command_index = current_frame_offset + 15
     angular_scale = config.task.terminate_angular_rate_rad_s
     _, control_hz = _load_timing(config.simulator_config)
-    yaw_rate = observation[:, 6] * angular_scale
+    yaw_rate = observation[:, yaw_rate_index] * angular_scale
     selected = (
         ~done
-        & (observation[:, 15].abs() < 0.05)
+        & (observation[:, yaw_command_index].abs() < 0.05)
         & (yaw_rate > minimum_yaw_rate_rad_s)
     )
     observation = observation[selected]
@@ -257,7 +268,7 @@ def replay_action_gradient_report(
 
     device = torch.device(config.run.device)
     model = build_sac_actor_critic(
-        21, 4, config.model, device, config.torch_dtype
+        observation.shape[-1], 4, config.model, device, config.torch_dtype
     )
     algorithm = TorchRLSAC(model, config.sac, device)
     model.actor.load_state_dict(state["actor"], strict=True)
@@ -268,7 +279,10 @@ def replay_action_gradient_report(
         deterministic_action, _ = model.forward_step(observation_device)
     exploration_residual = action_device - deterministic_action
     yaw_acceleration = (
-        (next_observation[:, 6].to(device) - observation_device[:, 6])
+        (
+            next_observation[:, yaw_rate_index].to(device)
+            - observation_device[:, yaw_rate_index]
+        )
         * angular_scale
         * control_hz
     )
@@ -354,7 +368,14 @@ def finite_horizon_action_sweep(
     ).values["angular_velocity_b"]
     selected = (
         (truth[:, 2] > minimum_yaw_rate_rad_s)
-        & (observation[:, 15].abs() < 0.05)
+        & (
+            observation[
+                :,
+                context.config.control_contract.current_observation_offset
+                + 15,
+            ].abs()
+            < 0.05
+        )
     )
     if not bool(selected.any().item()):
         raise RuntimeError("checkpoint state contains no selected positive-yaw instances")
@@ -543,8 +564,18 @@ def _snapshot_environment(
     return _EnvironmentSnapshot(
         simulator=_clone_state(env.simulator.state_dict()),
         previous_action=env.previous_action.clone(),
+        observation_history=env.observation_history.clone(),
+        observation_history_index=env.observation_history_index,
         episode_id=env.episode_id.clone(),
         episode_step=env.episode_step.clone(),
+        episode_roll_pitch_squared_sum=(
+            env.episode_roll_pitch_squared_sum.clone()
+        ),
+        episode_yaw_rate_squared_sum=env.episode_yaw_rate_squared_sum.clone(),
+        episode_angular_rate_squared_sum=(
+            env.episode_angular_rate_squared_sum.clone()
+        ),
+        episode_quality_steps=env.episode_quality_steps.clone(),
         current_static_parameters=env.current_static_parameters.clone(),
         command_source=_clone_state(env.command_source.state_dict()),
         static_randomizer=_clone_state(context.static_randomizer.state_dict()),
@@ -563,8 +594,20 @@ def _restore_snapshot(
     env = context.env
     env.simulator.load_state_dict(snapshot.simulator)
     env.previous_action.copy_(snapshot.previous_action)
+    env.observation_history.copy_(snapshot.observation_history)
+    env.observation_history_index = snapshot.observation_history_index
     env.episode_id.copy_(snapshot.episode_id)
     env.episode_step.copy_(snapshot.episode_step)
+    env.episode_roll_pitch_squared_sum.copy_(
+        snapshot.episode_roll_pitch_squared_sum
+    )
+    env.episode_yaw_rate_squared_sum.copy_(
+        snapshot.episode_yaw_rate_squared_sum
+    )
+    env.episode_angular_rate_squared_sum.copy_(
+        snapshot.episode_angular_rate_squared_sum
+    )
+    env.episode_quality_steps.copy_(snapshot.episode_quality_steps)
     env.current_static_parameters = snapshot.current_static_parameters.clone()
     env.command_source.load_state_dict(snapshot.command_source)
     context.static_randomizer.load_state_dict(snapshot.static_randomizer)
@@ -600,6 +643,23 @@ def _restore_environment_only(
     )
     env.episode_id.copy_(training["episode_id"].to(device))
     env.episode_step.copy_(training["episode_step"].to(device))
+    for target, name in (
+        (
+            env.episode_roll_pitch_squared_sum,
+            "episode_roll_pitch_squared_sum",
+        ),
+        (env.episode_yaw_rate_squared_sum, "episode_yaw_rate_squared_sum"),
+        (
+            env.episode_angular_rate_squared_sum,
+            "episode_angular_rate_squared_sum",
+        ),
+        (env.episode_quality_steps, "episode_quality_steps"),
+    ):
+        stored = training.get(name)
+        if stored is None:
+            target.zero_()
+        else:
+            target.copy_(stored.to(device))
     env.command_source.load_state_dict(training["command_source"])
     curriculum = training["episode_curriculum"]
     env.curriculum_stage = int(curriculum["stage"])
@@ -621,6 +681,30 @@ def _restore_environment_only(
     if not isinstance(current_static, TensorDictBase):
         raise ValueError("checkpoint static_parameters is missing")
     env.current_static_parameters = current_static.to(device)
+    stored_history = training.get("observation_history")
+    if stored_history is None:
+        if env.observation_history_capacity != 1:
+            raise ValueError(
+                "checkpoint observation history is missing for diagnostics"
+            )
+        base_observation, *_ = env._base_observation()
+        env.observation_history[:, 0].copy_(base_observation)
+        env.observation_history_index = 0
+    else:
+        if not isinstance(stored_history, torch.Tensor):
+            raise ValueError("checkpoint observation_history must be a tensor")
+        if (
+            stored_history.shape != env.observation_history.shape
+            or stored_history.dtype != env.observation_history.dtype
+        ):
+            raise ValueError("checkpoint observation_history is incompatible")
+        env.observation_history.copy_(stored_history.to(device))
+        history_index = int(training.get("observation_history_index", -1))
+        if not 0 <= history_index < env.observation_history_capacity:
+            raise ValueError(
+                "checkpoint observation_history_index is incompatible"
+            )
+        env.observation_history_index = history_index
 
 
 def _clone_state(value: Any) -> Any:

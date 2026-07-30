@@ -189,13 +189,15 @@ checkpoint。
 - `episode_reset_count`、已结束 episode 的平均长度和平均生存秒数；
 - 姿态误差 mean/P95、角速度 mean、高度绝对误差 mean；
 - 策略动作 RMS、绝对峰值和 `|action|>=0.95` 饱和率。
-- `curriculum_stage`、当前 episode 时长、命令比例、最近成功率和是否晋级；
+- `curriculum_stage`、当前 episode 时长、命令比例、最近成功率、当前 rollout
+  生存完成率、质量通过率和是否晋级；
 - `reward.attitude/tilt/yaw_rate/risk/survival/termination` 等分项。
 
-固定评测按悬停生存时间选择最佳策略，独立保存在
-`checkpoints/best_fixed_evaluation.pt`；对应控制步、评测总分、悬停生存时间和摘要
-写入 `checkpoints/best_fixed_evaluation.json`。该文件不参与周期 checkpoint 的
-`keep_last` 清理。
+固定评测先应用 suite 定义的悬停质量门槛，再按包含生存、跟踪、动作和响应的
+综合总分选择最佳策略；总分相同时才比较悬停生存时间。最佳策略独立保存在
+`checkpoints/best_fixed_evaluation.pt`；对应控制步、评测总分、悬停生存时间和
+质量指标写入 `checkpoints/best_fixed_evaluation.json`。该文件不参与周期
+checkpoint 的 `keep_last` 清理。
 
 `valid_fraction=1` 只表示数值/接口有效，不能代表没有坠毁；判断是否学会稳定控制必须结合
 终止率、生存时间、姿态误差和动作统计。
@@ -245,8 +247,24 @@ flight-train run --config configs/experiments/mlp_ppo_smoke.json \
 `9.80665 m/s²`，电机转速除以 `1800 rad/s`，舵角除以 `π/2`。该版本 profile 为
 `attitude_self_stabilize_21d_v3`；v2 checkpoint 的输入语义不同，不能续训或评测。
 
-部署/确定性评估使用 `ActorCritic.forward_step(observation)`：MLP 接收 `[B,21]` 并
-返回 `[B,4]`，不创建 hidden state；GRU 使用同一入口并额外接收/返回 recurrent state。
+`control_contract.observation_history` 支持两种 MLP 历史输入。`uniform` 模式
+按固定控制步间隔抽取 21 维整帧，并按 oldest→current 展平。更适合执行器低通
+建模的 `multirate_actuator` 模式会拼接：
+
+- 当前完整状态 21 维；
+- 连续 `dense_action_steps` 步的历史策略动作，每步 4 维，按 oldest→newest；
+- 每隔 `sparse_physical_stride_steps` 步抽取一次的历史物理响应，每帧 11 维，
+  包括角速度 3、加速度 3、电机实际转速 2 和舵机实际角 3。
+
+当前 MLP SAC 配置使用连续 32 步动作和 15 帧、间隔 4 步的物理响应。在 500 Hz
+下，高频动作窗口为 64 ms，物理响应窗口覆盖过去 120 ms，总输入为
+`21 + 32×4 + 15×11 = 314` 维。稀疏采样只用于已经经过执行器/机体低通的物理
+响应，不再跳过原始策略动作。episode reset 会按实例重建历史，checkpoint 也保存
+环形缓冲和游标，不会跨 episode 或续训边界混入旧状态。
+
+部署/确定性评估使用 `ActorCritic.forward_step(observation)`：单帧 MLP 接收
+`[B,21]`，历史 MLP 接收控制契约计算出的 `[B,observation_dim]`，均返回
+`[B,4]` 且不创建 hidden state；GRU 使用同一入口并额外接收/返回 recurrent state。
 训练 collector 使用随机动作，评估 collector 使用分布 mode，二者不会混淆。
 
 固定三科评测使用版本化配置
@@ -260,6 +278,12 @@ flight-train evaluate \
   --device cuda:0 \
   --output-root /path/to/evaluation-runs
 ```
+
+自稳任务应改用
+[`configs/evaluation/fixed_self_stabilize_v2.yaml`](configs/evaluation/fixed_self_stabilize_v2.yaml)。
+该版本不锁定 yaw 航向：完整四元数姿态误差只保留作诊断，跟踪得分使用
+roll/pitch 合成误差与 yaw 角速度误差，并为 best checkpoint 设置悬停生存、
+roll/pitch RMSE 和 yaw-rate RMSE 三项门槛。
 
 也可以直接运行 [`scripts/evaluate_fixed.py`](scripts/evaluate_fixed.py)，参数完全相同。
 评测使用 checkpoint 的确定性策略动作，并为每个科目创建全新的 SimEnv，防止动力学、

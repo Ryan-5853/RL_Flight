@@ -452,9 +452,17 @@ class SimulationEnvironment:
         actual["dynamic_parameter_names"] = tuple(
             actual.get("dynamic_parameter_names", ())
         )
-        if actual != expected:
+        actual_config_sha256 = actual.pop("config_sha256", None)
+        expected_without_config = dict(expected)
+        expected_without_config.pop("config_sha256")
+        if (
+            actual != expected_without_config
+            or actual_config_sha256 not in self._compatible_state_config_sha256s()
+        ):
             raise ConfigurationError(
-                f"simulation state is incompatible: expected {expected}, got {actual}"
+                "simulation state is incompatible: "
+                f"expected {expected}, got "
+                f"{dict(actual, config_sha256=actual_config_sha256)}"
             )
 
         parameters = self._validated_tensor_mapping(
@@ -512,8 +520,10 @@ class SimulationEnvironment:
     def close(self) -> None:
         if self._closed:
             return
-        self._logger.close()
-        self._closed = True
+        try:
+            self._logger.close()
+        finally:
+            self._closed = True
 
     def __enter__(self) -> "SimulationEnvironment":
         self._ensure_open()
@@ -623,8 +633,33 @@ class SimulationEnvironment:
         return self._physics_step.to(self.dtype) * self._config.timing.physics_dt
 
     def _state_config_sha256(self) -> str:
+        raw = dict(self._config.raw)
+        # 日志只决定产物位置和写盘策略，不改变仿真数值轨迹。
+        raw.pop("logging", None)
+        return self._config_sha256(raw)
+
+    def _compatible_state_config_sha256s(self) -> set[str]:
+        """返回当前数值配置及已发布状态格式可接受的配置摘要。"""
+
+        raw = dict(self._config.raw)
+        compatible = {
+            self._state_config_sha256(),
+            # schema v1 最初对完整配置取摘要，包括与状态无关的日志配置。
+            self._config_sha256(raw),
+        }
+        logging = raw.get("logging")
+        if isinstance(logging, Mapping) and "minimum_free_space_bytes" in logging:
+            legacy_raw = dict(raw)
+            legacy_logging = dict(logging)
+            legacy_logging.pop("minimum_free_space_bytes")
+            legacy_raw["logging"] = legacy_logging
+            compatible.add(self._config_sha256(legacy_raw))
+        return compatible
+
+    @staticmethod
+    def _config_sha256(raw: Mapping[str, Any]) -> str:
         resolved = json.dumps(
-            self._config.raw, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            raw, sort_keys=True, separators=(",", ":"), ensure_ascii=False
         )
         return hashlib.sha256(resolved.encode("utf-8")).hexdigest()
 

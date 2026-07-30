@@ -1,0 +1,223 @@
+# 128×128 MLP-SAC：直立定高稳定性修正版。
+#
+# 该配置以 mlp_sac_upright_height_only_small_tip_credit_fixed.yaml 为对照，
+# 保留相同 seed、环境、观测历史、网络、replay、n-step return 和更新频率，
+# 只针对 2026-07-24 训练暴露出的三个问题做修改：
+#   1. 策略在“短暂低误差”和“稍长生存但严重倾倒”之间反复切换；
+#   2. 自动熵使四路动作标准差逐渐逼近配置上限；
+#   3. 训练直接面对 30 s 回合，且没有动作平滑和提前终止信用。
+#
+# 修正：
+#   - 用 2/3/5/10/30 s 生存课程逐步延长回合；三轴目标始终为零；
+#   - 固定较小探索方差，并把 alpha 降低两个数量级且显式限幅；
+#   - 加入轻量动作变化、安全 barrier 和提前终止惩罚；
+#   - 仍使用固定评测的悬停生存时间选择 best checkpoint。
+#
+# 这是一次全新训练，不能 exact-resume 旧配置的 checkpoint。
+#
+# 启动：
+#   flight-train run \
+#     --config configs/experiments/mlp_sac_upright_height_only_small_tip_stability_v2.yaml
+
+schema_version: 2
+
+experiment:
+  name: mlp_sac_upright_height_only_small_tip_stability_v2
+  entrypoint:
+    type: "flight_train.runner:run_experiment"
+    version: "train-framework-v1"
+
+seed:
+  # 与上一轮保持一致，尽量把结果差异归因于本配置，而不是随机流。
+  base: 20260725
+  deterministic_algorithms: true
+  cudnn_benchmark: false
+
+run:
+  device: cuda:0
+  dtype: float32
+  parallel_count: 256
+  total_control_steps: 16777216
+  output_root: ../../runs
+  allow_unimplemented_simulator: false
+
+environment:
+  factory: "simenv:SimulationEnvironment"
+  config_path: ../environment/gru_sac_upright_height_only_small_tip.yaml
+  observation_source: truth
+
+command_source:
+  type: "flight_train.commands:VirtualPilotCommandSource"
+  version: "2"
+  seed: 52025
+  params:
+    throttle:
+      minimum: 0.20
+      maximum: 0.85
+      spool:
+        duration_s: 0.10
+        target_range: [0.54, 0.58]
+      height_controller:
+        observation_source: truth
+        target_m: 0.0
+        initial_throttle_range: [0.55, 0.58]
+        proportional_gain: 0.08
+        integral_gain: 0.04
+        error_limit_m: 5.0
+      slew_rate:
+        rise_per_s: 4.0
+        fall_per_s: 0.35
+    sticks:
+      roll:  {mode: angle, limit_rad: 0.0, time_constant_s: 0.20}
+      pitch: {mode: angle, limit_rad: 0.0, time_constant_s: 0.20}
+      yaw:   {mode: rate, limit_rad_s: 0.0, time_constant_s: 0.30}
+      target_sampling:
+        distribution: centered
+        center_exponent: 2.0
+        hold_duration_s:
+          range: [2.0, 4.0]
+      reset:
+        filtered_stick: zero
+        initial_target_scale: 0.0
+
+control_contract:
+  version: self_stabilize_v1
+  observation_profile: attitude_self_stabilize_21d_v3
+  # 当前状态 21 维 + 32×4 高频动作历史 + 15×11 稀疏物理响应，共 314 维。
+  observation_history:
+    mode: multirate_actuator
+    dense_action_steps: 32
+    sparse_physical_frames: 15
+    sparse_physical_stride_steps: 4
+  action_transform:
+    type: residual_around_trim
+    trim_command: [0.53523, 0.0, 0.0, 0.0]
+    residual_scale: [0.30, 1.0, 1.0, 1.0]
+  policy_action:
+    fields: [lower_motor, servo_1, servo_2, servo_3]
+  external_action:
+    fields: [upper_motor]
+  simulator_command:
+    fields: [upper_motor, lower_motor, servo_1, servo_2, servo_3]
+
+randomization:
+  static:
+    seed: 32025
+    scope: episode
+    parameters: {}
+  dynamic:
+    seed: 42025
+    scope: simulator
+    parameters: {}
+
+task:
+  episode_duration_s: 30.0
+  episode_curriculum:
+    # 先要求至少 80% 的实例连续两轮完成 2 s，再逐级延长。
+    # roll/pitch/yaw 的命令上限均为零，因此 target_scale 全程保持零；
+    # 本课程只改变生存时长，不改变任务定义。
+    durations_s:   [2.0, 3.0, 5.0, 10.0, 30.0]
+    target_scales: [0.0, 0.0, 0.0,  0.0,  0.0]
+    success_fraction: 0.80
+    evaluation_episodes_per_env: 1.0
+    consecutive_passes: 2
+  termination:
+    max_tilt_rad: 1.0
+    max_angular_rate_rad_s: 8.0
+
+reward:
+  calculator:
+    type: "flight_train.rewards.attitude:AttitudeRewardCalculator"
+    version: "3"
+    params:
+      # 保留上一轮已经能产生短暂低姿态误差的主体奖励尺度。
+      roll_pitch_weight: 0
+      tilt_weight: 0.08
+      yaw_rate_weight: 0.00015625
+      angular_rate_weight: 0.00015625
+
+      # 随机探索下四路动作差平方和约为 0.01~0.06；该权重产生的惩罚
+      # 远小于 0.02 alive bonus，只抑制抖动，不鼓励零动作。
+      action_rate_weight: 0.002
+      saturation_weight: 0.01
+
+      # 每个有效控制步继续提供固定生存信用。survival_progress 保持为零，
+      # 避免同一状态因课程时长不同而得到不同的稠密即时奖励。
+      alive_bonus: 0.02
+      survival_progress_weight: 0.0
+
+      # 从安全阈值的 30% 起提供轻量连续风险梯度，避免只在终止瞬间学习。
+      tilt_barrier_weight: 0.02
+      rate_barrier_weight: 0.002
+      barrier_start_fraction: 0.30
+      barrier_exponent: 2.0
+
+      # 基础终止代价保持不变；越早终止，额外代价越接近 10。
+      # 因此回合刚开始失稳约为 -20，接近课程终点失稳约为 -10。
+      termination_penalty: 10.0
+      early_termination_penalty: 10.0
+  context:
+    fields:
+      - {name: attitude_geodesic_rad, source: task}
+      - {name: angular_velocity_b, source: truth}
+      - {name: static_domain, source: train_randomizer, visibility: reward_only}
+
+model:
+  type: mlp_actor_critic
+  hidden_sizes: [128, 128]
+  policy_distribution:
+    # 上一轮可学习方差最终接近 [0.10, 0.08, 0.08, 0.08] 上限。
+    # 本轮固定较小方差，保留局部探索，同时消除“增大方差换熵收益”的路径。
+    learnable_action_std: false
+    initial_action_std: [0.04, 0.035, 0.035, 0.035]
+    minimum_action_std: [0.01, 0.01, 0.01, 0.01]
+    maximum_action_std: [0.06, 0.05, 0.05, 0.05]
+
+algorithm:
+  name: sac
+  gamma: 0.999
+  # 16 control steps = 32 ms，覆盖舵机主要响应区间。
+  n_step_return: 16
+  replay:
+    capacity_transitions: 1048576
+    warmup_transitions: 262144
+    batch_size: 4096
+  critic_pretraining_updates: 512
+  # 保留温和 actor 更新：每 4 次 critic 更新才更新一次 actor/alpha。
+  actor_update_interval: 4
+  updates_per_collection: 64
+  target_update:
+    tau: 0.005
+    interval_updates: 1
+  entropy:
+    automatic: true
+    # 上一轮 alpha 从 0.05 增至约 0.061，熵项相对 0.02 单步生存奖励过强。
+    # 本轮以 0.001 起步并限制在 [1e-4, 5e-3]，即使调温也不会重新主导 Q。
+    initial_alpha: 0.001
+    target_entropy: -4.0
+    min_alpha: 0.0001
+    max_alpha: 0.005
+  actor_max_grad_norm: 1.0
+  critic_max_grad_norm: 5.0
+  optimizer:
+    type: adam
+    actor_learning_rate: 0.00003
+    critic_learning_rate: 0.0003
+    alpha_learning_rate: 0.0001
+
+collector:
+  control_steps_per_rollout: 512
+
+evaluation:
+  enabled: true
+  interval_control_steps: 1048576
+  suite_path: ../evaluation/fixed_attitude_v1.yaml
+
+checkpoint:
+  resume:
+    from: null
+    mode: exact
+  interval_control_steps: 524288
+  keep_last: 4
+
+recording: {}

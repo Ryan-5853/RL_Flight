@@ -21,10 +21,12 @@ from flight_train.config import (
 )
 from flight_train.core import EnvSpec
 from flight_train.envs import SimEnvAdapter
+from flight_train.evaluation import load_fixed_evaluation_suite
 from flight_train.math import quaternion_geodesic_angle
 from flight_train.models import build_actor_critic, build_sac_actor_critic
 from flight_train.randomization import StaticParameterSpec, StaticRandomizer
 from flight_train.rewards import AttitudeRewardCalculator, RewardOutput
+from flight_train.runner import _restore_policy
 from flight_train.tasks import AttitudeTrackingTask
 from simenv.config import load_and_materialize
 
@@ -269,15 +271,29 @@ class TensorTrainingTests(unittest.TestCase):
         self.assertEqual(config.model.architecture, "mlp")
         self.assertEqual(config.model.encoder_sizes, (128, 128))
         self.assertEqual(
-            config.control_contract.observation_history_frames, 16
+            config.control_contract.observation_history_mode,
+            "multirate_actuator",
         )
         self.assertEqual(
-            config.control_contract.observation_history_stride_steps, 4
+            config.control_contract.observation_history_dense_action_steps,
+            32,
+        )
+        self.assertEqual(
+            config.control_contract.observation_history_sparse_physical_frames,
+            15,
+        )
+        self.assertEqual(
+            config.control_contract
+            .observation_history_sparse_physical_stride_steps,
+            4,
         )
         self.assertEqual(
             config.control_contract.observation_history_span_steps, 60
         )
-        self.assertEqual(config.control_contract.observation_dim, 336)
+        self.assertEqual(config.control_contract.observation_dim, 314)
+        self.assertEqual(
+            config.control_contract.current_observation_offset, 0
+        )
         self.assertEqual(config.sac.replay_burn_in_steps, 0)
         self.assertEqual(config.sac.replay_sequence_length, 1)
         self.assertEqual(config.sac.critic_pretraining_updates, 512)
@@ -290,12 +306,14 @@ class TensorTrainingTests(unittest.TestCase):
         env = object.__new__(SimEnvAdapter)
         env.batch_size = 2
         env.base_observation_dim = 21
+        env.observation_history_mode = "uniform"
         env.observation_history_frames = 3
         env.observation_history_stride_steps = 2
         env.observation_history_capacity = 5
         env.observation_history = torch.zeros(2, 5, 21)
         env.observation_history_index = 4
         env._observation_history_offsets = torch.tensor([4, 2, 0])
+        env._spec = SimpleNamespace(observation_dim=63)
 
         initial = torch.zeros(2, 21)
         env._reset_observation_history(
@@ -327,6 +345,58 @@ class TensorTrainingTests(unittest.TestCase):
         torch.testing.assert_close(
             reset_stacked[1, :, 0],
             torch.tensor([1.0, 3.0, 5.0]),
+        )
+
+    def test_multirate_history_keeps_dense_actions_and_sparse_physics(self):
+        env = object.__new__(SimEnvAdapter)
+        env.batch_size = 1
+        env.base_observation_dim = 21
+        env.previous_action_start = 17
+        env.previous_action_dim = 4
+        env.physical_response_dim = 11
+        env.observation_history_mode = "multirate_actuator"
+        env.observation_history_dense_action_steps = 4
+        env.observation_history_sparse_physical_frames = 2
+        env.observation_history_capacity = 7
+        env.observation_history = torch.zeros(1, 7, 21)
+        env.observation_history_index = 6
+        env._dense_action_history_offsets = torch.tensor([3, 2, 1, 0])
+        env._sparse_physical_history_offsets = torch.tensor([6, 3])
+        env._physical_response_indices = torch.arange(4, 15)
+        env._spec = SimpleNamespace(observation_dim=59)
+
+        def frame(step: int) -> torch.Tensor:
+            value = torch.zeros(1, 21)
+            value[:, 0] = float(step)
+            value[:, 4:15] = (
+                float(step) * 100.0 + torch.arange(11)
+            )
+            value[:, 17:21] = (
+                float(step) * 10.0 + torch.arange(4)
+            )
+            return value
+
+        env._reset_observation_history(
+            torch.ones(1, dtype=torch.bool), frame(0)
+        )
+        for step in range(1, 7):
+            env._append_observation_history(
+                frame(step), torch.zeros(1, dtype=torch.bool)
+            )
+
+        observation = env._history_observation()
+        torch.testing.assert_close(observation[:, :21], frame(6))
+        torch.testing.assert_close(
+            observation[:, 21:37].reshape(1, 4, 4),
+            torch.stack(
+                [frame(step)[0, 17:21] for step in range(3, 7)]
+            )[None],
+        )
+        torch.testing.assert_close(
+            observation[:, 37:].reshape(1, 2, 11),
+            torch.stack(
+                [frame(step)[0, 4:15] for step in (0, 3)]
+            )[None],
         )
 
     def test_gru_sac_long_collector_samples_sliding_windows_and_terminal(self):
@@ -756,6 +826,72 @@ class TensorTrainingTests(unittest.TestCase):
         self.assertEqual(float(restored_metrics["sac_actor_updates_total"]), 1.0)
         self.assertTrue(torch.isfinite(restored_metrics["loss_actor"]))
 
+    def test_sac_policy_anchor_is_training_only_and_penalizes_drift(self):
+        device = torch.device("cpu")
+        model_config = ModelConfig(
+            (16, 16),
+            16,
+            16,
+            architecture="mlp",
+            sac_initial_action_std=(0.05, 0.05, 0.05, 0.05),
+            sac_minimum_action_std=(0.01, 0.01, 0.01, 0.01),
+            sac_maximum_action_std=(0.10, 0.10, 0.10, 0.10),
+        )
+        model = build_sac_actor_critic(21, 4, model_config, device)
+        actor_keys = tuple(model.actor.state_dict())
+        sac = TorchRLSAC(
+            model,
+            SACConfig(
+                gamma=0.99,
+                n_step_return=1,
+                replay_capacity=32,
+                replay_batch_size=4,
+                warmup_transitions=4,
+                updates_per_collection=1,
+                actor_learning_rate=3e-4,
+                critic_learning_rate=3e-4,
+                alpha_learning_rate=1e-4,
+                actor_max_grad_norm=1.0,
+                critic_max_grad_norm=5.0,
+                target_tau=0.005,
+                target_update_interval=1,
+                initial_alpha=0.1,
+                target_entropy=-4.0,
+                min_alpha=1e-4,
+                max_alpha=1.0,
+                policy_anchor_weight=10.0,
+                policy_anchor_max_action_deviation=0.0,
+            ),
+            device,
+        )
+        sac.initialize_policy_anchor()
+        self.assertEqual(tuple(model.actor.state_dict()), actor_keys)
+        batch = TensorDict(
+            {"observation": torch.randn(8, 21)},
+            batch_size=[8],
+        )
+        torch.testing.assert_close(
+            sac._policy_anchor_loss(batch), torch.zeros(())
+        )
+        trainable = [
+            parameter
+            for parameter in model.policy_module.parameters()
+            if parameter.requires_grad
+        ]
+        with torch.no_grad():
+            trainable[-1].add_(0.5)
+        anchor_loss = sac._policy_anchor_loss(batch)
+        self.assertGreater(anchor_loss.item(), 0.0)
+        anchor_loss.backward()
+        self.assertTrue(any(parameter.grad is not None for parameter in trainable))
+        self.assertTrue(
+            all(
+                parameter.grad is None
+                for parameter in sac.policy_anchor_module.parameters()
+            )
+        )
+        self.assertIsNotNone(sac.state_dict()["policy_anchor"])
+
     def test_sac_n_step_return_crosses_rollout_boundary_and_shifts_terminal(self):
         device = torch.device("cpu")
         model_config = ModelConfig(
@@ -940,6 +1076,282 @@ class TensorTrainingTests(unittest.TestCase):
         )
         self.assertEqual(env.curriculum_stage, 1)
         self.assertEqual(float(metrics["curriculum_promoted"]), 1.0)
+
+    def test_curriculum_quality_gate_rejects_low_quality_survival(self):
+        config = load_experiment_config(
+            Path(__file__).parents[1]
+            / "configs/experiments/"
+            "mlp_sac_upright_height_only_small_tip_stability_v3.yaml"
+        )
+        self.assertEqual(
+            config.task.curriculum_durations_s,
+            (2.5, 3.5, 5.0, 10.0, 30.0),
+        )
+        self.assertAlmostEqual(
+            config.task.curriculum_max_roll_pitch_rmse_rad,
+            torch.deg2rad(torch.tensor(10.0)).item(),
+        )
+        self.assertEqual(config.sac.replay_capacity, 2097152)
+        self.assertEqual(config.sac.critic_pretraining_updates, 1024)
+        self.assertEqual(config.sac.actor_update_interval, 8)
+        self.assertEqual(config.sac.actor_learning_rate, 0.000015)
+        self.assertEqual(
+            config.reward.calculator.params["yaw_rate_weight"], 0.0015625
+        )
+        self.assertEqual(
+            config.task.curriculum_max_yaw_rate_rmse_rad_s, 0.5
+        )
+
+        env = object.__new__(SimEnvAdapter)
+        env.batch_size = 256
+        env.device = torch.device("cpu")
+        env.task_config = config.task
+        env.curriculum_stage = 0
+        env.curriculum_successes = 0
+        env.curriculum_failures = 0
+        env.curriculum_consecutive_passes = 0
+        env.curriculum_last_success_fraction = 0.0
+        env.max_episode_steps = 1250
+        env._spec = SimpleNamespace(control_hz=500)
+        env.command_source = SimpleNamespace(
+            set_curriculum_scale=lambda scale: None
+        )
+        terminated = torch.zeros(256, 1, dtype=torch.bool)
+        truncated = torch.ones(256, 1, dtype=torch.bool)
+
+        metrics = env.update_episode_curriculum(
+            terminated,
+            truncated,
+            torch.zeros_like(truncated),
+            allow_promotion=True,
+        )
+        self.assertEqual(env.curriculum_stage, 0)
+        self.assertEqual(float(metrics["curriculum_last_success_fraction"]), 0.0)
+        self.assertEqual(
+            float(metrics["curriculum_rollout_survival_fraction"]), 1.0
+        )
+        self.assertEqual(
+            float(metrics["curriculum_rollout_quality_fraction"]), 0.0
+        )
+
+        quality_success = torch.ones_like(truncated)
+        env.update_episode_curriculum(
+            terminated,
+            truncated,
+            quality_success,
+            allow_promotion=True,
+        )
+        metrics = env.update_episode_curriculum(
+            terminated,
+            truncated,
+            quality_success,
+            allow_promotion=True,
+        )
+        self.assertEqual(env.curriculum_stage, 1)
+        self.assertEqual(float(metrics["curriculum_promoted"]), 1.0)
+
+    def test_v6_focuses_curriculum_and_reward_on_upright_survival(self):
+        config = load_experiment_config(
+            Path(__file__).parents[1]
+            / "configs/experiments/"
+            "mlp_sac_upright_height_only_small_tip_stability_v6.yaml"
+        )
+        params = config.reward.calculator.params
+        self.assertEqual(params["yaw_rate_weight"], 0.0)
+        self.assertEqual(params["rate_barrier_weight"], 0.0)
+        self.assertAlmostEqual(
+            params["roll_pitch_cost_cap_rad"],
+            torch.deg2rad(torch.tensor(20.0)).item(),
+        )
+        self.assertAlmostEqual(
+            config.task.curriculum_max_roll_pitch_rmse_rad,
+            torch.deg2rad(torch.tensor(10.0)).item(),
+        )
+        self.assertIsNone(config.task.curriculum_max_yaw_rate_rmse_rad_s)
+        self.assertIsNone(config.task.curriculum_max_angular_rate_rms_rad_s)
+        suite = load_fixed_evaluation_suite(config.evaluation.suite_path)
+        self.assertEqual(suite.schema_version, 3)
+        self.assertEqual(suite.yaw_rate_tracking_weight, 0.0)
+        self.assertIsNone(
+            suite.checkpoint_selection.maximum_hover_yaw_rate_rmse_rad_s
+        )
+
+    def test_v7_policy_warm_start_and_yaw_control_config(self):
+        config = load_experiment_config(
+            Path(__file__).parents[1]
+            / "configs/experiments/"
+            "mlp_sac_upright_height_only_small_tip_stability_v7.yaml"
+        )
+        params = config.reward.calculator.params
+        self.assertEqual(config.checkpoint.resume_mode, "policy")
+        self.assertEqual(
+            config.checkpoint.resume_from.name, "step_16777216.pt"
+        )
+        self.assertEqual(
+            config.task.terminate_angular_rate_axes, "roll_pitch"
+        )
+        self.assertEqual(
+            config.task.curriculum_max_yaw_rate_rmse_rad_s, 1.0
+        )
+        self.assertEqual(params["yaw_rate_weight"], 0.0015625)
+        self.assertEqual(params["yaw_rate_huber_delta_rad_s"], 1.0)
+        self.assertEqual(params["yaw_rate_cost_cap"], 16.0)
+        self.assertNotIn("roll_pitch_cost_cap_rad", params)
+        self.assertAlmostEqual(
+            params["roll_pitch_huber_delta_rad"],
+            torch.deg2rad(torch.tensor(20.0)).item(),
+        )
+        self.assertEqual(params["rate_barrier_weight"], 0.002)
+        self.assertEqual(config.sac.policy_anchor_weight, 10.0)
+        self.assertEqual(
+            config.sac.policy_anchor_max_action_deviation, 0.08
+        )
+        self.assertEqual(config.sac.actor_update_interval, 8)
+        suite = load_fixed_evaluation_suite(config.evaluation.suite_path)
+        self.assertEqual(suite.schema_version, 2)
+        self.assertEqual(suite.yaw_rate_tracking_weight, 0.25)
+        self.assertEqual(
+            suite.checkpoint_selection.maximum_hover_yaw_rate_rmse_rad_s,
+            0.5,
+        )
+
+    def test_roll_pitch_reward_cost_can_be_capped(self):
+        cap_rad = torch.deg2rad(torch.tensor(20.0)).item()
+        calculator = AttitudeRewardCalculator(
+            {
+                "roll_pitch_weight": 0.55,
+                "roll_pitch_cost_cap_rad": cap_rad,
+                "tilt_weight": 0.0,
+                "yaw_rate_weight": 0.0,
+                "angular_rate_weight": 0.0,
+                "action_rate_weight": 0.0,
+                "saturation_weight": 0.0,
+                "alive_bonus": 0.0,
+                "tilt_barrier_weight": 0.0,
+                "rate_barrier_weight": 0.0,
+            }
+        )
+        angles = torch.deg2rad(torch.tensor([10.0, 20.0, 40.0]))
+        context = TensorDict(
+            {
+                "roll_pitch_error_rad": torch.stack(
+                    (angles, torch.zeros_like(angles)), dim=-1
+                ),
+                "tilt_rad": torch.zeros(3, 1),
+                "yaw_rate_error_rad_s": torch.zeros(3, 1),
+                "angular_velocity_b": torch.zeros(3, 3),
+                "action": torch.zeros(3, 4),
+                "previous_action": torch.zeros(3, 4),
+                "terminated": torch.zeros(3, 1, dtype=torch.bool),
+                "tilt_ratio": torch.zeros(3, 1),
+                "rate_ratio": torch.zeros(3, 1),
+                "episode_age_fraction": torch.zeros(3, 1),
+            },
+            batch_size=[3],
+        )
+        attitude_reward = calculator(context).terms["reward.attitude"].squeeze(-1)
+        self.assertAlmostEqual(
+            attitude_reward[0].item(),
+            -0.55 * torch.deg2rad(torch.tensor(10.0)).square().item(),
+        )
+        torch.testing.assert_close(attitude_reward[1], attitude_reward[2])
+
+    def test_yaw_rate_reward_can_transition_from_quadratic_to_linear(self):
+        calculator = AttitudeRewardCalculator(
+            {
+                "roll_pitch_weight": 0.0,
+                "tilt_weight": 0.0,
+                "yaw_rate_weight": 0.0015625,
+                "yaw_rate_huber_delta_rad_s": 1.0,
+                "angular_rate_weight": 0.0,
+                "action_rate_weight": 0.0,
+                "saturation_weight": 0.0,
+                "tilt_barrier_weight": 0.0,
+                "rate_barrier_weight": 0.0,
+            }
+        )
+        context = TensorDict(
+            {
+                "roll_pitch_error_rad": torch.zeros(3, 2),
+                "tilt_rad": torch.zeros(3, 1),
+                "yaw_rate_error_rad_s": torch.tensor([[0.5], [1.0], [4.0]]),
+                "angular_velocity_b": torch.zeros(3, 3),
+                "action": torch.zeros(3, 4),
+                "previous_action": torch.zeros(3, 4),
+                "terminated": torch.zeros(3, 1, dtype=torch.bool),
+                "tilt_ratio": torch.zeros(3, 1),
+                "rate_ratio": torch.zeros(3, 1),
+                "episode_age_fraction": torch.zeros(3, 1),
+            },
+            batch_size=[3],
+        )
+        yaw_reward = calculator(context).terms["reward.yaw_rate"].squeeze(-1)
+        torch.testing.assert_close(
+            yaw_reward,
+            -0.0015625 * torch.tensor([0.25, 1.0, 7.0]),
+        )
+
+    def test_roll_pitch_huber_and_yaw_cost_cap_keep_safety_dominant(self):
+        delta = torch.deg2rad(torch.tensor(20.0)).item()
+        calculator = AttitudeRewardCalculator(
+            {
+                "roll_pitch_weight": 0.55,
+                "roll_pitch_huber_delta_rad": delta,
+                "tilt_weight": 0.0,
+                "yaw_rate_weight": 0.0015625,
+                "yaw_rate_huber_delta_rad_s": 1.0,
+                "yaw_rate_cost_cap": 16.0,
+                "angular_rate_weight": 0.0,
+                "action_rate_weight": 0.0,
+                "saturation_weight": 0.0,
+                "tilt_barrier_weight": 0.0,
+                "rate_barrier_weight": 0.0,
+            }
+        )
+        angles = torch.deg2rad(torch.tensor([10.0, 20.0, 40.0]))
+        yaw_errors = torch.tensor(
+            [[0.5], [4.0], [20.0]], requires_grad=True
+        )
+        context = TensorDict(
+            {
+                "roll_pitch_error_rad": torch.stack(
+                    (angles, torch.zeros_like(angles)), dim=-1
+                ),
+                "tilt_rad": torch.zeros(3, 1),
+                "yaw_rate_error_rad_s": yaw_errors,
+                "angular_velocity_b": torch.zeros(3, 3),
+                "action": torch.zeros(3, 4),
+                "previous_action": torch.zeros(3, 4),
+                "terminated": torch.zeros(3, 1, dtype=torch.bool),
+                "tilt_ratio": torch.zeros(3, 1),
+                "rate_ratio": torch.zeros(3, 1),
+                "episode_age_fraction": torch.zeros(3, 1),
+            },
+            batch_size=[3],
+        )
+        terms = calculator(context).terms
+        expected_roll_pitch_cost = torch.tensor(
+            [
+                angles[0].square().item(),
+                angles[1].square().item(),
+                2.0 * delta * angles[2].item() - delta**2,
+            ]
+        )
+        torch.testing.assert_close(
+            terms["reward.attitude"].squeeze(-1),
+            -0.55 * expected_roll_pitch_cost,
+        )
+        torch.testing.assert_close(
+            terms["reward.yaw_rate"].squeeze(-1),
+            -0.0015625
+            * (
+                16.0
+                * torch.tensor([0.25, 7.0, 39.0])
+                / (16.0 + torch.tensor([0.25, 7.0, 39.0]))
+            ),
+        )
+        terms["reward.yaw_rate"].sum().backward()
+        self.assertNotEqual(yaw_errors.grad[-1].item(), 0.0)
 
     def test_commented_training_entry_template_parses(self):
         path = (
@@ -1131,6 +1543,64 @@ class TensorTrainingTests(unittest.TestCase):
         self.assertEqual(result.reward.shape, (8, 1))
         self.assertEqual(result.terminated.shape, (8, 1))
         self.assertEqual(result.reward.device, torch.device("cpu"))
+
+    def test_roll_pitch_rate_termination_does_not_terminate_on_yaw(self):
+        cfg = TaskConfig(
+            30.0,
+            1.3,
+            8.0,
+            "truth",
+            terminate_angular_rate_axes="roll_pitch",
+        )
+        calculator = AttitudeRewardCalculator(
+            {
+                "roll_pitch_weight": 0.0,
+                "tilt_weight": 0.0,
+                "yaw_rate_weight": 0.0,
+                "angular_rate_weight": 0.0,
+            }
+        )
+        task = AttitudeTrackingTask(
+            cfg, 2, torch.device("cpu"), torch.float32, calculator
+        )
+        identity = torch.tensor([[1.0, 0.0, 0.0, 0.0]]).expand(2, -1)
+        result = task.transition(
+            identity,
+            torch.tensor([[0.0, 0.0, 9.0], [9.0, 0.0, 0.0]]),
+            identity,
+            torch.zeros(2, 4),
+            torch.zeros(2, 4),
+        )
+        self.assertFalse(bool(result.terminated[0]))
+        self.assertTrue(bool(result.terminated[1]))
+
+    def test_policy_resume_restores_only_actor(self):
+        model_config = ModelConfig(
+            (32, 32),
+            32,
+            32,
+            architecture="mlp",
+            sac_initial_action_std=(0.04, 0.03, 0.03, 0.03),
+            sac_minimum_action_std=(0.01, 0.01, 0.01, 0.01),
+            sac_maximum_action_std=(0.06, 0.05, 0.05, 0.05),
+        )
+        source = build_sac_actor_critic(
+            21, 4, model_config, torch.device("cpu")
+        )
+        target = build_sac_actor_critic(
+            21, 4, model_config, torch.device("cpu")
+        )
+        with torch.no_grad():
+            for parameter in source.actor.parameters():
+                parameter.fill_(0.125)
+        qvalue_before = {
+            name: value.clone() for name, value in target.qvalue.state_dict().items()
+        }
+        _restore_policy({"actor": source.actor.state_dict()}, model=target)
+        for name, value in source.actor.state_dict().items():
+            torch.testing.assert_close(target.actor.state_dict()[name], value)
+        for name, value in qvalue_before.items():
+            torch.testing.assert_close(target.qvalue.state_dict()[name], value)
 
     def test_reward_terms_log_alive_and_sum_to_total_reward(self):
         calculator = AttitudeRewardCalculator(

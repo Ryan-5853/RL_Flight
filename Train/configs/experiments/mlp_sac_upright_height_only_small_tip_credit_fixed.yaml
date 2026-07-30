@@ -1,0 +1,205 @@
+# 128×128 MLP-SAC：直立定高，保留当前信用分配、探索与简化奖励思路。
+#
+# 相对 gru_sac_upright_height_only_small_tip_credit_fixed.yaml，只做模型迁移：
+#   1. actor 从双层 GRU 改为 [128, 128] MLP；
+#   2. replay 改回逐 transition 随机采样，删除 MLP 不需要的 burn-in/序列长度。
+# 环境、真值观测、上一动作输入、无随机化、高度控制器、奖励、16-step return、
+# critic-only 阶段、critic 更新次数和固定评测安排均保持不变；actor 使用更低
+# 学习率和更低更新频率，避免再次快速追逐尚不可靠的 Q 动作梯度。
+#
+# 启动：
+#   flight-train run \
+#     --config configs/experiments/mlp_sac_upright_height_only_small_tip_credit_fixed.yaml
+
+schema_version: 2
+
+experiment:
+  name: mlp_sac_upright_height_only_small_tip_credit_fixed
+  entrypoint:
+    type: "flight_train.runner:run_experiment"
+    version: "train-framework-v1"
+
+seed:
+  # 与 GRU 实验保持一致，便于直接比较模型结构的影响。
+  base: 20260725
+  deterministic_algorithms: true
+  cudnn_benchmark: false
+
+run:
+  device: cuda:0
+  dtype: float32
+  parallel_count: 256
+  total_control_steps: 16777216
+  output_root: ../../runs
+  allow_unimplemented_simulator: false
+
+environment:
+  factory: "simenv:SimulationEnvironment"
+  # 复用完全相同的机体、初始姿态和仿真参数，避免引入环境差异。
+  config_path: ../environment/gru_sac_upright_height_only_small_tip.yaml
+  observation_source: truth
+
+command_source:
+  type: "flight_train.commands:VirtualPilotCommandSource"
+  version: "2"
+  seed: 52025
+  params:
+    throttle:
+      minimum: 0.20
+      maximum: 0.85
+      spool:
+        duration_s: 0.10
+        target_range: [0.54, 0.58]
+      height_controller:
+        observation_source: truth
+        target_m: 0.0
+        initial_throttle_range: [0.55, 0.58]
+        proportional_gain: 0.08
+        integral_gain: 0.04
+        error_limit_m: 5.0
+      slew_rate:
+        rise_per_s: 4.0
+        fall_per_s: 0.35
+    sticks:
+      roll:  {mode: angle, limit_rad: 0.0, time_constant_s: 0.20}
+      pitch: {mode: angle, limit_rad: 0.0, time_constant_s: 0.20}
+      yaw:   {mode: rate, limit_rad_s: 0.0, time_constant_s: 0.30}
+      target_sampling:
+        distribution: centered
+        center_exponent: 2.0
+        hold_duration_s:
+          range: [2.0, 4.0]
+      reset:
+        filtered_stick: zero
+        initial_target_scale: 0.0
+
+control_contract:
+  version: self_stabilize_v1
+  observation_profile: attitude_self_stabilize_21d_v3
+  # 双时间尺度 MLP 输入（共 314 维）：
+  # - 当前完整状态 21 维；
+  # - 连续 32 个控制步的上一策略动作 32×4，保留 64 ms 高频打杆信息；
+  # - 每 4 步抽取一次过去的物理响应 15×11，覆盖 120 ms 的角速度、
+  #   加速度、电机实际转速与舵机实际角。
+  observation_history:
+    mode: multirate_actuator
+    dense_action_steps: 32
+    sparse_physical_frames: 15
+    sparse_physical_stride_steps: 4
+  action_transform:
+    type: residual_around_trim
+    trim_command: [0.53523, 0.0, 0.0, 0.0]
+    residual_scale: [0.30, 1.0, 1.0, 1.0]
+  policy_action:
+    fields: [lower_motor, servo_1, servo_2, servo_3]
+  external_action:
+    fields: [upper_motor]
+  simulator_command:
+    fields: [upper_motor, lower_motor, servo_1, servo_2, servo_3]
+
+randomization:
+  static:
+    seed: 32025
+    scope: episode
+    parameters: {}
+  dynamic:
+    seed: 42025
+    scope: simulator
+    parameters: {}
+
+task:
+  episode_duration_s: 30.0
+  termination:
+    max_tilt_rad: 1.0
+    max_angular_rate_rad_s: 8.0
+
+reward:
+  calculator:
+    type: "flight_train.rewards.attitude:AttitudeRewardCalculator"
+    version: "3"
+    params:
+      # tilt 终止阈值为 1 rad，因此这里等价于
+      # -0.08 * (tilt_rad / 1.0 rad)^2。
+      roll_pitch_weight: 0
+      tilt_weight: 0.08
+      # 角速度终止阈值为 8 rad/s；0.01 / 8^2 = 0.00015625。
+      # p/q 和 yaw 均按同一阈值归一化，防止 yaw 再次主导总奖励。
+      yaw_rate_weight: 0.00015625
+      angular_rate_weight: 0.00015625
+      action_rate_weight: 0
+      saturation_weight: 0
+      alive_bonus: 0.02
+      survival_progress_weight: 0.0
+      tilt_barrier_weight: 0
+      rate_barrier_weight: 0
+      barrier_start_fraction: 0.30
+      barrier_exponent: 2.0
+      termination_penalty: 10.0
+      early_termination_penalty: 0.0
+  context:
+    fields:
+      - {name: attitude_geodesic_rad, source: task}
+      - {name: angular_velocity_b, source: truth}
+      - {name: static_domain, source: train_randomizer, visibility: reward_only}
+
+model:
+  type: mlp_actor_critic
+  hidden_sizes: [128, 128]
+  policy_distribution:
+    learnable_action_std: true
+    initial_action_std: [0.06, 0.05, 0.05, 0.05]
+    minimum_action_std: [0.01, 0.015, 0.015, 0.015]
+    maximum_action_std: [0.10, 0.08, 0.08, 0.08]
+
+algorithm:
+  name: sac
+  gamma: 0.999
+  # 16 control steps = 32 ms，覆盖 20 ms 舵机时间常数的主要响应区间。
+  n_step_return: 16
+  replay:
+    capacity_transitions: 1048576
+    # 目标为约两轮 512-step collector 的数据规模；16-step pending 会使首次
+    # 达到阈值的更新自然落在第三轮 collector。
+    warmup_transitions: 262144
+    batch_size: 4096
+  # 512 次只更新 critic；按每轮 64 次更新，约 8 个学习轮次后启用 actor。
+  critic_pretraining_updates: 512
+  # critic-only 结束后，每 4 次 critic 更新才做 1 次 actor/alpha 更新。
+  actor_update_interval: 4
+  # 保持 GRU 配置的更新次数不变。MLP 没有 burn-in，每次更新的 4096 条
+  # transition 都参与损失，因此实际有效样本更新比约为 2:1。
+  updates_per_collection: 64
+  target_update:
+    tau: 0.005
+    interval_updates: 1
+  entropy:
+    automatic: true
+    initial_alpha: 0.05
+    target_entropy: auto
+  actor_max_grad_norm: 1.0
+  critic_max_grad_norm: 5.0
+  optimizer:
+    type: adam
+    # actor 比 critic 慢十倍，减小每次策略更新造成的动作分布漂移。
+    actor_learning_rate: 0.00003
+    critic_learning_rate: 0.0003
+    alpha_learning_rate: 0.0003
+
+collector:
+  # 每轮仍由 256 个环境各采集 512 个控制步。
+  control_steps_per_rollout: 512
+
+evaluation:
+  enabled: true
+  interval_control_steps: 1048576
+  suite_path: ../evaluation/fixed_attitude_v1.yaml
+
+checkpoint:
+  resume:
+    from: null
+    mode: exact
+  # 评测只能在 checkpoint 边界执行；每 4 个 collector 保存一次。
+  interval_control_steps: 524288
+  keep_last: 4
+
+recording: {}
