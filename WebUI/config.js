@@ -110,7 +110,7 @@
         test('run.device', '运行设备', 'cpu', '', 'select', { options: ['cpu'] }),
         test('run.dtype', '张量类型', 'float32', '', 'select', { options: ['float32', 'float64'] }),
         test('environment.observation_source', '观测来源', 'truth', '', 'select', { options: ['truth', 'sensor'] }),
-        test('runtime.checkpoint_path', '推理包路径（服务器）', 'controller/latest', '', 'text'),
+        test('runtime.checkpoint_path', '推理包路径（服务器）', '', '', 'select', { options: [''] }),
         test('runtime.compile_kernels', '编译实时仿真内核', true, '', 'boolean'),
         test('runtime.warmup_steps', '实时内核预热步数', 3, '', 'integer'),
         test('runtime.spin_us', '截止时间自旋窗口', 200, 'μs'),

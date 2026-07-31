@@ -455,7 +455,28 @@
         request('/api/runtime/checkpoints')
       ]);
       const checkpointInput = document.querySelector('[data-config="test"][data-path="runtime.checkpoint_path"]');
-      if (checkpointInput && checkpointData.checkpoints?.length) {
+      if (checkpointInput instanceof HTMLSelectElement) {
+        checkpointInput.replaceChildren();
+        const packages = checkpointData.checkpoints || [];
+        if (!packages.length) {
+          const option = document.createElement('option');
+          option.value = '';
+          option.textContent = '未发现推理包';
+          checkpointInput.appendChild(option);
+          checkpointInput.disabled = true;
+        } else {
+          packages.forEach(item => {
+            const option = document.createElement('option');
+            option.value = item.path;
+            option.textContent = item.path;
+            checkpointInput.appendChild(option);
+          });
+          checkpointInput.disabled = false;
+          checkpointInput.value = packages[0].path;
+          checkpointInput.dispatchEvent(new Event('input', { bubbles: true }));
+          checkpointInput.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      } else if (checkpointInput && checkpointData.checkpoints?.length) {
         const checkpoints = document.createElement('datalist');
         checkpoints.id = 'runtimeCheckpoints';
         checkpointData.checkpoints.forEach(item => {
@@ -465,6 +486,11 @@
         });
         document.body.appendChild(checkpoints);
         checkpointInput.setAttribute('list', checkpoints.id);
+        if (!checkpointInput.value.trim()) {
+          checkpointInput.value = checkpointData.checkpoints[0].path;
+          checkpointInput.dispatchEvent(new Event('input', { bubbles: true }));
+          checkpointInput.dispatchEvent(new Event('change', { bubbles: true }));
+        }
       }
       setConnection(capabilities.cpu_available ? 'CPU READY' : 'CPU UNAVAILABLE', capabilities.cpu_available ? 'ready' : 'fault');
     } catch (_error) {

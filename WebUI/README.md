@@ -16,12 +16,12 @@ python server.py --host 0.0.0.0 --port 8080
 然后访问 `http://localhost:8080`。
 
 默认加载器直接使用仓库 `Deploy` 提供的 `flight_deploy.PolicyRuntime`，只读取已经
-导出的完整性校验 bundle，不读取训练 checkpoint。开放一个或多个推理包目录即可：
+导出的完整性校验 bundle，不读取训练 checkpoint。推理包固定放在仓库相对目录
+`WebUI/artifacts/`；服务启动后自动递归发现包含 `manifest.json` 的 bundle，页面只需
+从“推理包路径”下拉框选择：
 
 ```bash
-python server.py --host 0.0.0.0 --port 8080 \
-  --checkpoint-root /srv/rl-flight/inference-packages \
-  --runtime-log-root /srv/rl-flight/webui-runtime-logs
+python server.py --host 0.0.0.0 --port 8080
 ```
 
 需要替换后端时可增加

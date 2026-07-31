@@ -25,7 +25,7 @@ DEFAULT_ROOTS = {
     "simenv": PROJECT_ROOT / "SimEnv" / "configs",
     "train": PROJECT_ROOT / "Train" / "configs" / "experiments",
 }
-DEFAULT_CHECKPOINT_ROOTS = (PROJECT_ROOT / "Train" / "runs",)
+DEFAULT_CHECKPOINT_ROOTS = (WEBUI_ROOT / "artifacts",)
 DEFAULT_RUNTIME_LOG_ROOT = WEBUI_ROOT / "runtime-runs"
 ALLOWED_SUFFIXES = {".yaml", ".yml", ".json"}
 MAX_CONFIG_BYTES = 2 * 1024 * 1024
@@ -274,13 +274,36 @@ class WebUIHandler(SimpleHTTPRequestHandler):
             ):
                 return candidate
         raise ValueError(
-            "inference package must exist inside an allowed package root"
+            "inference package must exist inside an allowed package root; "
+            f"received={raw_path!r}, "
+            f"allowed_roots={[str(root) for root in roots]}"
         )
 
     def _list_checkpoints(self) -> None:
         roots = self.server.checkpoint_roots  # type: ignore[attr-defined]
         entries = []
         for root_index, root in enumerate(roots):
+            # Deployment inference packages are directories whose integrity and
+            # backend files are described by manifest.json.  Keep the response
+            # key named "checkpoints" for compatibility with the existing UI.
+            for manifest in root.rglob("manifest.json"):
+                package = manifest.parent
+                resolved = package.resolve()
+                if not package.is_dir() or not _is_relative_to(resolved, root):
+                    continue
+                files = [path for path in package.iterdir() if path.is_file()]
+                entries.append({
+                    "root": root_index,
+                    "path": package.relative_to(root).as_posix(),
+                    "size": sum(path.stat().st_size for path in files),
+                    "modified_ns": max(
+                        (path.stat().st_mtime_ns for path in files),
+                        default=manifest.stat().st_mtime_ns,
+                    ),
+                    "kind": "inference_package",
+                })
+            # Retain legacy checkpoint discovery for custom loaders that still
+            # consume a .pt file with a SHA-256 sidecar.
             for path in root.rglob("*.pt"):
                 if (
                     not path.is_file()
@@ -294,6 +317,7 @@ class WebUIHandler(SimpleHTTPRequestHandler):
                     "path": path.relative_to(root).as_posix(),
                     "size": stat.st_size,
                     "modified_ns": stat.st_mtime_ns,
+                    "kind": "legacy_checkpoint",
                 })
         entries.sort(key=lambda item: item["modified_ns"], reverse=True)
         self._json({
@@ -684,13 +708,6 @@ def main() -> None:
         help="add or replace an allowed server-side config root",
     )
     parser.add_argument(
-        "--checkpoint-root",
-        action="append",
-        default=[],
-        metavar="/ABSOLUTE/PATH",
-        help="allow deployment inference packages from this server directory (repeatable)",
-    )
-    parser.add_argument(
         "--runtime-log-root",
         default=str(DEFAULT_RUNTIME_LOG_ROOT),
         metavar="/ABSOLUTE/PATH",
@@ -707,11 +724,12 @@ def main() -> None:
     )
     args = parser.parse_args()
     roots = parse_config_roots(args.config_root)
-    checkpoint_roots = tuple(
-        Path(value).expanduser().resolve() for value in args.checkpoint_root
-    ) or tuple(path.resolve() for path in DEFAULT_CHECKPOINT_ROOTS if path.is_dir())
+    checkpoint_roots = tuple(path.resolve() for path in DEFAULT_CHECKPOINT_ROOTS)
     if any(not path.is_dir() for path in checkpoint_roots):
-        raise ValueError("every inference package root must be an existing server directory")
+        raise ValueError(
+            "WebUI inference package directory does not exist: "
+            + ", ".join(str(path) for path in checkpoint_roots)
+        )
     runtime_log_root = Path(args.runtime_log_root).expanduser().resolve()
     runtime_log_root.mkdir(parents=True, exist_ok=True)
     from inference_package import load_flight_deploy_package
