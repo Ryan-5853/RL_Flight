@@ -303,6 +303,9 @@ evaluation: {}
 #     failure_policy: continue_training
 # 精确续训从一个带 .sha256 sidecar 的 checkpoint 启动。正常新实验保持 from: null；
 # 也可以不修改文件，使用 CLI --resume-from /absolute/path/step_N.pt。
+# SAC 扩缩并行批次可用 continuation_rebatch；必须保持
+# parallel_count * control_steps_per_rollout 不变。它保留学习状态和课程阶段，但会
+# 从完整新 episode 边界重建 simulator/collector 的批次相关瞬时状态。
 checkpoint:
   # 新 checkpoint 的估算大小之外必须继续保留的可用空间。
   minimum_free_space_bytes: 2147483648

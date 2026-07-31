@@ -6,6 +6,7 @@ from .errors import (
     SimulationError,
 )
 from .types import AdvanceResult, ErrorCode, Observation, ResetResult
+from .realtime import RealtimeLoopStats, RealtimeSimulationEnvironment
 
 __all__ = [
     "AdvanceResult",
@@ -15,6 +16,8 @@ __all__ = [
     "ErrorCode",
     "Observation",
     "ResetResult",
+    "RealtimeLoopStats",
+    "RealtimeSimulationEnvironment",
     "SimulationEnvironment",
     "SimulationError",
 ]

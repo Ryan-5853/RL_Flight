@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import re
 import socket
@@ -256,6 +257,26 @@ class WebUIHandler(SimpleHTTPRequestHandler):
                 return candidate
         raise ValueError("checkpoint must be an existing .pt file inside an allowed server checkpoint root")
 
+    def _resolve_inference_package(self, raw_path: str) -> Path:
+        if not raw_path:
+            raise ValueError("inference package path is required")
+        requested = Path(raw_path).expanduser()
+        roots = self.server.checkpoint_roots  # type: ignore[attr-defined]
+        candidates = (
+            [requested.resolve()]
+            if requested.is_absolute()
+            else [(root / requested).resolve() for root in roots]
+        )
+        for candidate in candidates:
+            if (
+                candidate.exists()
+                and any(_is_relative_to(candidate, root) for root in roots)
+            ):
+                return candidate
+        raise ValueError(
+            "inference package must exist inside an allowed package root"
+        )
+
     def _list_checkpoints(self) -> None:
         roots = self.server.checkpoint_roots  # type: ignore[attr-defined]
         entries = []
@@ -300,7 +321,7 @@ class WebUIHandler(SimpleHTTPRequestHandler):
                 raise ValueError("replace_existing must be a boolean")
             checkpoint: Path | None = None
             if controller_type == "neural":
-                checkpoint = self._resolve_checkpoint(
+                checkpoint = self._resolve_inference_package(
                     str(body.get("checkpoint_path", ""))
                 )
             session = self.server.runtime_registry.create(
@@ -334,7 +355,7 @@ class WebUIHandler(SimpleHTTPRequestHandler):
                 raise ValueError("controller must be a mapping")
             checkpoint: Path | None = None
             if str(controller.get("type", "neural")) == "neural":
-                checkpoint = self._resolve_checkpoint(
+                checkpoint = self._resolve_inference_package(
                     str(body.get("checkpoint_path", ""))
                 )
             fps = float(body.get("fps", 30))
@@ -380,11 +401,7 @@ class WebUIHandler(SimpleHTTPRequestHandler):
                 return
             after = int(query.get("after", ["-1"])[0])
             timeout = min(1.0, max(0.0, float(query.get("timeout", ["0"])[0])))
-            deadline = time.monotonic() + timeout
-            telemetry = session.telemetry(after)
-            while telemetry is None and time.monotonic() < deadline:
-                time.sleep(.02)
-                telemetry = session.telemetry(after)
+            telemetry = session.wait_telemetry(after, timeout)
             if telemetry is not None:
                 trace = telemetry.setdefault("latency_trace", {})
                 trace["telemetry_transport"] = "long_poll"
@@ -471,7 +488,7 @@ class WebUIHandler(SimpleHTTPRequestHandler):
         last_write = time.monotonic()
         try:
             while True:
-                telemetry = session.telemetry(after)
+                telemetry = session.wait_telemetry(after, 1.0)
                 now = time.monotonic()
                 if telemetry is not None:
                     after = int(telemetry["sequence"])
@@ -496,7 +513,6 @@ class WebUIHandler(SimpleHTTPRequestHandler):
                     last_write = now
                     if status["state"] in {"closed", "faulted"}:
                         break
-                time.sleep(.01)
         except (BrokenPipeError, ConnectionResetError):
             pass
         finally:
@@ -672,7 +688,7 @@ def main() -> None:
         action="append",
         default=[],
         metavar="/ABSOLUTE/PATH",
-        help="allow runtime checkpoints from this server directory (repeatable)",
+        help="allow deployment inference packages from this server directory (repeatable)",
     )
     parser.add_argument(
         "--runtime-log-root",
@@ -680,27 +696,60 @@ def main() -> None:
         metavar="/ABSOLUTE/PATH",
         help="server-owned directory for interactive SimEnv logs",
     )
+    parser.add_argument(
+        "--inference-loader",
+        default="",
+        metavar="MODULE:CALLABLE",
+        help=(
+            "deployment inference package loader; callable signature is "
+            "(path, device, dtype) -> RealtimeInferencePackage"
+        ),
+    )
     args = parser.parse_args()
     roots = parse_config_roots(args.config_root)
     checkpoint_roots = tuple(
         Path(value).expanduser().resolve() for value in args.checkpoint_root
     ) or tuple(path.resolve() for path in DEFAULT_CHECKPOINT_ROOTS if path.is_dir())
     if any(not path.is_dir() for path in checkpoint_roots):
-        raise ValueError("every checkpoint root must be an existing server directory")
+        raise ValueError("every inference package root must be an existing server directory")
     runtime_log_root = Path(args.runtime_log_root).expanduser().resolve()
     runtime_log_root.mkdir(parents=True, exist_ok=True)
+    from inference_package import load_flight_deploy_package
+
+    inference_loader = load_flight_deploy_package
+    if args.inference_loader:
+        if ":" not in args.inference_loader:
+            raise ValueError(
+                "--inference-loader must use MODULE:CALLABLE syntax"
+            )
+        module_name, attribute = args.inference_loader.split(":", 1)
+        inference_loader = getattr(
+            importlib.import_module(module_name), attribute
+        )
+        if not callable(inference_loader):
+            raise ValueError("--inference-loader target must be callable")
     from runtime import OfflineRolloutRegistry, RuntimeRegistry
     server = WebUIHTTPServer((args.host, args.port), WebUIHandler)
     server.config_roots = roots  # type: ignore[attr-defined]
     server.checkpoint_roots = checkpoint_roots  # type: ignore[attr-defined]
-    server.runtime_registry = RuntimeRegistry(runtime_log_root)  # type: ignore[attr-defined]
-    server.rollout_registry = OfflineRolloutRegistry(runtime_log_root)  # type: ignore[attr-defined]
+    server.runtime_registry = RuntimeRegistry(  # type: ignore[attr-defined]
+        runtime_log_root,
+        inference_package_loader=inference_loader,
+    )
+    server.rollout_registry = OfflineRolloutRegistry(  # type: ignore[attr-defined]
+        runtime_log_root,
+        inference_package_loader=inference_loader,
+    )
     print(f"RL Flight WebUI: http://{args.host}:{args.port}")
     for name, path in roots.items():
         print(f"  config root {name}: {path}")
     for path in checkpoint_roots:
-        print(f"  checkpoint root: {path}")
+        print(f"  inference package root: {path}")
     print(f"  runtime log root: {runtime_log_root}")
+    print(
+        "  inference loader: "
+        + (args.inference_loader or "flight_deploy default")
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:

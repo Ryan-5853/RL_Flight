@@ -124,6 +124,12 @@ flight-train run --config configs/experiments/my_experiment.yaml \
 允许修改 `run.total_control_steps`、`run.output_root` 和整个 `checkpoint` 调度段；模型、PPO、
 并行数、device/dtype、时基、随机化、VirtualPilot、reward 或控制契约不一致会在采样前拒绝。
 
+SAC 需要调整并行采样拓扑时，可在配置中使用 `continuation_rebatch`。该模式要求
+`parallel_count * control_steps_per_rollout` 与来源 checkpoint 保持不变，完整保留 actor、
+双 Q、target Q、replay、优化器、alpha、policy anchor、更新计数和课程阶段；旧批次的
+simulator/collector/episode 瞬时状态与 n-step pending 会被丢弃，并从完整新 episode
+边界按新批次重建。它不是逐张量精确恢复，适合诸如 `256×512 -> 512×256` 的吞吐扩容。
+
 `checkpoint.interval_control_steps` 按全部并行环境累计控制步计数，并在完整 rollout/PPO
 update 边界保存；`null` 表示只保存最终版本。`checkpoint.keep_last` 控制最近版本保留数，
 每份 `.pt` 均带 SHA-256 sidecar，并由 `checkpoints/index.json` 记录类型（`periodic`、

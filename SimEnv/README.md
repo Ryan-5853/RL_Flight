@@ -61,6 +61,54 @@ with SimulationEnvironment.create(
 
 当前 `env.dynamics_implemented` 和 `env.sensors_implemented` 均为 `True`。
 
+## 单环境 500 Hz 实时推理
+
+实时演示使用独立的 `RealtimeSimulationEnvironment`。它固定 `B=1`、显式关闭
+持久化日志、编译动力学和传感器内核，并复用扁平观测缓冲区。首次编译较慢，必须在
+控制回路开始前调用 `warmup()`；预热完成后会恢复预热前的完整数值状态。
+
+```python
+import torch
+
+from simenv import RealtimeSimulationEnvironment
+
+torch.set_num_threads(1)
+
+with RealtimeSimulationEnvironment.create(
+    "configs/example.yaml",
+    device="cpu",
+) as sim:
+    sim.warmup(steps=10)
+
+    # 实际部署时替换成推理模型；输入为复用的 [1,N] 传感器向量，
+    # 输出必须是同设备、同 dtype 的 [1,5] 或 [5] 控制量。
+    control = torch.zeros((1, 5), device=sim.device, dtype=sim.dtype)
+
+    def policy(observation: torch.Tensor) -> torch.Tensor:
+        return control
+
+    stats = sim.run_policy(
+        policy,
+        steps=5000,
+        observation_source="sensor",
+        realtime=True,
+    )
+    print(stats)
+```
+
+对单环境，仿真和策略应放在同一设备。小型策略通常优先使用 CPU；若策略必须使用
+CUDA，则仿真也应创建在同一 CUDA 设备，避免每个 2 ms 周期进行 CPU/GPU 往返。
+实时入口不写磁盘；需要录像或遥测时，应由回调把降采样状态发送给独立进程，不能在
+500 Hz 仿真线程内同步写文件。可用下列命令先测纯仿真/空策略的延迟上限：
+
+```bash
+PYTHONPATH=src python scripts/benchmark_realtime.py \
+  configs/example.yaml --device cpu --steps 5000
+```
+
+13980HX/RTX 4060 Laptop 的 CPU/GPU 选择、策略预热、线程隔离和验收方法见
+[实时推理部署说明](docs/realtime_inference.md)。
+
 物理标称参数只写在 SimEnv 配置的 `value` 中。训练层注入的
 `dynamic_randomization` 不得重复声明 `baseline` 或使用 `distribution: fixed`；它只描述
 围绕环境标称值的 `stddev` 或实际采样 `range`。不需要随机化的参数不应出现在规格中。

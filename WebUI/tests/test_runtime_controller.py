@@ -8,11 +8,42 @@ from unittest.mock import MagicMock, patch
 
 import yaml
 
-from runtime import CpuRuntimeSession, RuntimeRegistry
+from runtime import (
+    CpuRuntimeSession,
+    RuntimeConfigurationError,
+    RuntimeRegistry,
+    parse_runtime_options,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
 SIM_CONFIG = ROOT / "SimEnv" / "configs" / "example.yaml"
+
+
+class RuntimeOptionsTests(unittest.TestCase):
+    def test_realtime_backend_defaults_to_compiled_500_hz_execution(self) -> None:
+        options = parse_runtime_options({})
+
+        self.assertTrue(options.compile_kernels)
+        self.assertEqual(options.warmup_steps, 3)
+        self.assertEqual(options.spin_us, 200.0)
+        self.assertEqual(options.execution_hz, 500.0)
+
+    def test_compile_kernels_requires_a_boolean(self) -> None:
+        with self.assertRaisesRegex(
+            RuntimeConfigurationError,
+            "runtime.compile_kernels must be boolean",
+        ):
+            parse_runtime_options(
+                {"runtime": {"compile_kernels": "false"}}
+            )
+
+    def test_spin_window_is_bounded_to_one_millisecond(self) -> None:
+        with self.assertRaisesRegex(
+            RuntimeConfigurationError,
+            "runtime.spin_us must be between 0 and 1000",
+        ):
+            parse_runtime_options({"runtime": {"spin_us": 1001}})
 
 
 class RuntimeControllerIntegrationTests(unittest.TestCase):
@@ -24,6 +55,7 @@ class RuntimeControllerIntegrationTests(unittest.TestCase):
             "environment": {"observation_source": "truth"},
             "runtime": {
                 "cpu_threads": 1,
+                "compile_kernels": False,
                 "execution_hz": 80,
                 "telemetry_hz": 30,
                 "command_timeout_ms": 1000,
@@ -151,6 +183,7 @@ class RuntimeControllerIntegrationTests(unittest.TestCase):
             "environment": {"observation_source": "truth"},
             "runtime": {
                 "cpu_threads": 1,
+                "compile_kernels": False,
                 "telemetry_hz": 30,
                 "command_timeout_ms": 1000,
             },
@@ -200,6 +233,13 @@ class RuntimeControllerIntegrationTests(unittest.TestCase):
             try:
                 initial_status = session.status()
                 self.assertEqual(
+                    initial_status["simulation_backend"],
+                    "simenv-realtime-single-v1",
+                )
+                self.assertFalse(initial_status["simulation_compiled"])
+                self.assertFalse(initial_status["persistent_logging"])
+                self.assertIsNone(initial_status["log_directory"])
+                self.assertEqual(
                     initial_status["controller"]["type"],
                     "hybrid_pid_lqr",
                 )
@@ -220,8 +260,7 @@ class RuntimeControllerIntegrationTests(unittest.TestCase):
                 deadline = time.monotonic() + 3.0
                 telemetry = None
                 while telemetry is None and time.monotonic() < deadline:
-                    telemetry = session.telemetry()
-                    time.sleep(0.01)
+                    telemetry = session.wait_telemetry(timeout=0.1)
                 self.assertIsNotNone(telemetry)
                 assert telemetry is not None
                 self.assertEqual(

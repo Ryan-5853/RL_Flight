@@ -2,11 +2,12 @@
 
 轻量化飞行仿真可视化控制台。浏览器负责读取 Windows 电脑上的手柄，远程
 Python 服务负责在 CPU 上串联统一 Controller、单实例 SimEnv 和低频遥测。
-Controller 可以选择 PID、LQR、PID+LQR 混合控制器或已有 MLP/GRU checkpoint。
+Controller 可以选择 PID、LQR、PID+LQR 混合控制器，或由部署层加载的神经网络
+推理包。实时服务不从 Train 构造模型。
 
 ## 本地预览
 
-需要使用服务器本地配置、checkpoint 和 CPU 运行时时，请使用内置服务启动：
+需要使用服务器本地配置和 CPU 运行时时，请使用内置服务启动：
 
 ```bash
 python server.py --host 0.0.0.0 --port 8080
@@ -14,25 +15,30 @@ python server.py --host 0.0.0.0 --port 8080
 
 然后访问 `http://localhost:8080`。
 
-默认 checkpoint 根目录是 `/home/ryan/RL_Flight/Train/runs`。也可以显式开放
-一个或多个服务器目录：
+默认加载器直接使用仓库 `Deploy` 提供的 `flight_deploy.PolicyRuntime`，只读取已经
+导出的完整性校验 bundle，不读取训练 checkpoint。开放一个或多个推理包目录即可：
 
 ```bash
 python server.py --host 0.0.0.0 --port 8080 \
-  --checkpoint-root /srv/rl-flight/runs \
-  --checkpoint-root /srv/rl-flight/releases \
+  --checkpoint-root /srv/rl-flight/inference-packages \
   --runtime-log-root /srv/rl-flight/webui-runtime-logs
 ```
 
-选择 `controller.type: neural` 时，checkpoint 必须是根目录内的 `.pt` 文件，并且
-必须带有训练框架生成的同名 `.pt.sha256` 摘要文件。PID、LQR 和混合控制器不读取
-checkpoint，它们从本次 SimEnv 参数自动求配平、控制分配矩阵和 LQR 增益。普通静态
-文件服务器只能预览页面，无法使用配置浏览和 CPU 运行时接口。
+需要替换后端时可增加
+`--inference-loader my_deployment.loader:load_package`。加载函数签名为
+`(path: Path, device: torch.device, dtype: torch.dtype) -> RealtimeInferencePackage`。
+推理包必须声明固定的 21 维基础观测、`residual_4` 或 `physical_5` 输出契约，并实现
+`infer/reset/warmup/close/describe`。默认 `flight_deploy` 适配器还会读取 manifest
+中的 observation history、归一化和 action transform；例如 61 帧 uniform MLP 会在
+适配层组成 `21×61=1281` 维运行时输入。PID、LQR 和混合控制器不读取推理包，它们从
+本次 SimEnv 参数自动求配平、控制分配矩阵和 LQR 增益。普通静态文件服务器只能预览
+页面，无法使用配置浏览和 CPU 运行时接口。
 
-交互仿真的 SimEnv 日志始终写入后端管理的 `--runtime-log-root`，默认是本目录
-下的 `runtime-runs/`。上传配置中的 `logging.directory` 不会被直接采用，因为
-其相对路径已失去原文件目录语义，绝对路径也不应成为浏览器可控制的服务器写入
-目标。实际日志目录会在 session status 的 `log_directory` 字段中返回。
+交互仿真默认使用 SimEnv 的 `RealtimeSimulationEnvironment`：固定单环境 CPU
+执行、编译动力学和传感器内核，并关闭 500 Hz 热路径中的持久化日志。上传配置中的
+`logging.directory` 不会被交互会话采用，session status 中
+`persistent_logging=false`、`log_directory=null`。`--runtime-log-root` 仍作为服务端
+管理的兼容目录参数保留，但默认实时会话不会在其中创建时间线文件。
 
 ## 当前能力
 
@@ -62,7 +68,7 @@ Windows Gamepad API（未连接时使用零指令虚拟输入）
 同源 HTTP control API
         │  只更新“最新指令”，不驱动仿真时钟
         ▼
-服务器独立控制线程（SimEnv control_hz，默认 500 Hz）
+服务器独立控制线程（RealtimeSimulationEnvironment，目标 500 Hz）
         │
         ├─ CPU 摇杆滤波、目标姿态与油门斜率限制
         ├─ PID / LQR / PID+LQR：读取 SimEnv 参数并直接输出 5 维命令
@@ -70,26 +76,28 @@ Windows Gamepad API（未连接时使用零指令虚拟输入）
         └─ CPU SimEnv.advance([上桨, 下桨, 舵机1, 舵机2, 舵机3])
         │
         ▼
-低频 telemetry API（默认 30 Hz）→ Canvas 可视化
+持久 telemetry stream（默认 60 Hz）→ Canvas 可视化
 ```
 
-控制热路径中的状态、观测、循环网络 hidden、动作、仿真状态和遥测都保留在
-CPU，不再创建 CUDA stream、pinned memory 或设备间复制。SimEnv 仍会按照
-`logging` 配置异步归档时间线。checkpoint 在会话创建时从服务器磁盘读取一次，
-校验 SHA-256 后把 Actor 权重载入 CPU。
+控制热路径中的状态、观测、循环网络 hidden、动作和仿真状态都保留在 CPU，不再
+创建 CUDA stream、pinned memory 或设备间复制。会话创建时先编译并预热 SimEnv
+动力学、传感器、有限性检查和状态提交内核；预热结束后恢复完整初始数值状态，再
+启动控制线程。实时入口不创建磁盘日志线程，浏览器所需真值只在遥测边界降采样打包。
+神经控制器由部署加载器在会话创建时载入一次；WebUI 不导入 Train 的模型构造器。
 
 服务端只允许存在一个交互式仿真会话。浏览器暂停时保留该会话和仿真状态；
 配置未改变时再次启动会继续原会话，配置改变后会关闭旧会话并按新配置创建。
 手柄数据超过 `runtime.command_timeout_ms` 未更新时，服务端会自动暂停并报告
 `controller_input_timeout`，避免失联后继续使用旧指令。
 
-当前网络边界采用标准库 HTTP：手柄上传使用最新值覆盖，遥测使用最长 1 秒的
-长轮询。它不会让网络请求频率决定 500 Hz 的 CPU 控制循环，后续如需跨公网
-降低请求开销，可在保持同一会话对象的前提下替换为 WebSocket。
+当前网络边界采用标准库 HTTP：手柄的 `requestAnimationFrame` 输入事件会立即上传，
+最多保留两个 in-flight 最新值请求；遥测使用持久 chunked NDJSON stream，并由后端
+条件变量在新快照发布时立即唤醒，不再做 10 ms 轮询。长轮询仅作为浏览器或代理不支持
+streaming body 时的兼容回退。网络请求频率不会决定 500 Hz 的 CPU 控制循环。
 
 ## 离线 rollout 视频导出
 
-顶部“导出视频”会使用右侧当前选择的环境、控制器、checkpoint 和虚拟飞手
+顶部“导出视频”会使用右侧当前选择的环境、控制器、部署推理包和虚拟飞手
 参数，生成一段完整 episode 视频。该链路不是对远程实时画面录屏：
 
 ```text
@@ -133,7 +141,7 @@ CPU，不再创建 CUDA stream、pinned memory 或设备间复制。SimEnv 仍�
 - `hybrid_pid_lqr`：默认；启动/大误差由 PID 捕获，配平附近平滑切换到 LQR；
 - `pid`：高度和姿态全部使用传统 PID/PD；
 - `lqr`：高度使用 PID，姿态与执行器动态使用离散 LQR；
-- `neural`：保持现有 MLP/GRU checkpoint 推理链路。
+- `neural`：调用服务器部署层提供的 `RealtimeInferencePackage`。
 
 `collective_mode: hover` 会把 reset 时的位置作为高度目标；`manual` 将手柄油门映射为
 上桨 PWM，同时由控制器计算反扭矩平衡的下桨基准。没有手柄时页面会发送零姿态虚拟
@@ -141,31 +149,55 @@ CPU，不再创建 CUDA stream、pinned memory 或设备间复制。SimEnv 仍�
 `roll=8° / pitch=-6°` 并带有小角速度；点击“启动仿真”即可看到 PID 捕获和 LQR
 接管，不需要先修改参数。
 
-右侧“推理与观测”中包含四个运行时字段：
+右侧“推理与观测”中包含以下运行时字段：
 
-- `runtime.checkpoint_path`：仅神经网络控制器需要；服务器 checkpoint 根目录内的相对路径，也接受允许
-  根目录内的绝对路径；页面会从后端枚举带有效摘要文件的 checkpoint 作为候选；
+- `runtime.checkpoint_path`：仅神经网络控制器需要；服务器允许根内的部署推理包路径；
+- `runtime.compile_kernels`：默认启用 SimEnv 实时动力学与传感器内核编译；
+- `runtime.warmup_steps`：启动控制线程前执行并完整回滚的预热步数，默认 3；
+- `runtime.spin_us`：绝对 2 ms deadline 前的短自旋窗口，默认 200 μs；
+- `runtime.execution_hz`：墙钟控制循环目标，默认与 SimEnv 时基一致为 500 Hz；
 - `runtime.telemetry_hz`：CPU 真值序列化并推送前端的最高频率；
 - `runtime.command_timeout_ms`：最近一个有效手柄帧的最大允许年龄。
 - `runtime.cpu_threads`：PyTorch CPU 算子的 intra-op 线程数；单环境默认使用 1。
 
 `run.device` 必须是 `cpu`，服务端不会在交互运行时占用 CUDA。
-`model` 的类型和层宽必须与 checkpoint 完全一致，否则创建会话时会直接返回
-权重形状错误，避免用不匹配的控制器进入闭环。
+推理包 metadata 必须与固定 21 维基础实时观测和控制器输出模式一致；Deploy manifest
+声明的历史长度、字段归一化、配平和 residual scale 也会被逐项验证，否则会话创建直接
+失败，避免只匹配张量 shape、但语义错误的控制器进入闭环。
 
 左侧 `CTRL RATE` 显示后端按完成控制步实测的频率，延迟显示为对应的平均控制
-周期；它们不再使用前端模拟的 GPU 负载或固定延迟。当前 V100 与 CPU 的同配置
-短测结果分别约为 10.7 Hz 和 26 Hz。CPU 全链路约快 2.4 倍，但仍未达到配置的
-500 Hz，因此 `loop_overruns` 会如实增长。1/2/4/8 个 intra-op 线程的短测结果
-接近，单线程略优，所以默认 `runtime.cpu_threads: 1`。
+周期；它们不再使用前端模拟的 GPU 负载或固定延迟。默认墙钟执行目标现在与 SimEnv
+时基一致，为 500 Hz。实际能否达到目标取决于控制器、CPU 和操作系统调度；
+`loop_overruns` 和 `real_time_factor` 会如实反映完整 WebUI 闭环，而不是只反映纯
+SimEnv benchmark。单环境默认使用一个 PyTorch intra-op 线程。
+
+session status 还会返回：
+
+- `simulation_backend: simenv-realtime-single-v1`；
+- `simulation_compiled`：实时内核是否已安装编译包装；
+- `simulation_warmup_s`：创建会话时的首次编译和预热耗时；
+- `persistent_logging: false`：确认实时热路径没有磁盘日志。
+
+可在目标机器上先绕过浏览器，测量完整“控制器 + SimEnv + 60 Hz 遥测打包”链路：
+
+```bash
+PYTHONPATH=../SimEnv/src:../Controller/src:../Deploy/src:. \
+python benchmark_runtime.py \
+  ../SimEnv/configs/example.yaml \
+  /path/to/controller_test.yaml \
+  --seconds 60
+```
+
+神经控制器额外传入 `--inference-package /path/to/bundle`。该脚本与训练进程无关，
+不会创建训练环境或读取训练 checkpoint。
 
 ### Runtime API
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| `GET` | `/api/runtime/capabilities` | CPU、PyTorch、逻辑核心数及允许的 checkpoint 根 |
-| `GET` | `/api/runtime/checkpoints` | 枚举带 `.sha256` 的可加载 checkpoint |
-| `POST` | `/api/runtime/sessions` | 上传两份 YAML 和服务器 checkpoint 路径，创建唯一会话 |
+| `GET` | `/api/runtime/capabilities` | CPU、PyTorch、逻辑核心数、推理加载器状态及允许根 |
+| `GET` | `/api/runtime/checkpoints` | 旧版候选文件枚举接口；部署包也可直接填写允许根内路径 |
+| `POST` | `/api/runtime/sessions` | 上传两份 YAML 和服务器推理包路径，创建唯一会话 |
 | `POST` | `/api/runtime/sessions/{id}/control` | 更新带单调序号的四通道手柄指令 |
 | `POST` | `/api/runtime/sessions/{id}/start` | 在收到新鲜控制帧后启动/继续 CPU 循环 |
 | `POST` | `/api/runtime/sessions/{id}/pause` | 暂停并保留当前环境与 GRU 状态 |
@@ -189,7 +221,8 @@ CPU，不再创建 CUDA stream、pinned memory 或设备间复制。SimEnv 仍�
 }
 ```
 
-传统控制器创建会话时可以省略 `checkpoint_path`。遥测在原有 `truth/runtime` 外增加
+字段名 `checkpoint_path` 为兼容已有页面配置暂时保留，其语义已经变为部署推理包路径。
+传统控制器创建会话时可以省略该字段。遥测在原有 `truth/runtime` 外增加
 `controller.command`、控制器诊断量和实际参考指令，例如：
 
 ```json
@@ -225,10 +258,11 @@ CPU，不再创建 CUDA stream、pinned memory 或设备间复制。SimEnv 仍�
 
 连接手柄后需要按下任意按键让浏览器激活设备。校准向导默认只处理前四个轴，不要求校准额外轴、方向键或按钮。校准数据保存在当前浏览器的 `localStorage` 中，不会上传到服务器。
 
-俯仰通道采用航空器右手系约定：右杆向前/屏幕上方推动时输出负 Pitch，命令机头
-下俯；向后/屏幕下方拉动时输出正 Pitch，命令机头上仰。手柄配置从
-`rl-flight.gamepad.v2` 开始采用该约定，不会继续加载旧版向导中将“向前推杆”
-保存为正 Pitch 的方向；升级后如使用非标准轴布局，请重新运行一次校准向导。
+三个姿态通道采用航空器右手系约定：右杆向右输出正 Roll；右杆向前/屏幕上方
+推动时输出负 Pitch，命令机头下俯；左杆向右输出正 Yaw。手柄配置从
+`rl-flight.gamepad.v4` 开始统一采用该逻辑语义，硬件原始轴的正反方向只由默认
+映射或校准结果处理。校准向导会根据实际采集的左右、前后端点重新判断每根轴的
+极性，因此使用其他手柄或非标准轴布局时，重新运行一次校准即可。
 
 也可以通过以下接口读取最新标准化控制帧：
 
@@ -272,7 +306,13 @@ window.addEventListener('rlflightsimulationstart', (event) => {
 
 中央模型使用直径与高度约 `2:1` 的简化圆筒，包含上下两层共轴反桨和三组互成约 120° 的气动格栅。质心、直接推力中心、格栅气动中心及偏转轴由当前 SimEnv 配置更新。
 
-SimEnv 的 FRD/NED 坐标使用 `+Z` 向下，而 Canvas 内部使用图形学常见的 `+Z` 向上空间。所有机体几何和机体系向量在投影前统一执行 `z_visual = -z_FRD`：配置中较小的 z 位于上部、较大的 z 位于下部，因此共轴电机在上，`z≈0.25 m` 的三组格栅在下。该转换同样应用于质心、气动中心和力矩箭头。由于 Z 镜像同时改变绕 X/Y 轴的旋转手性，Canvas 姿态使用 `roll_visual=-roll_FRD`、`pitch_visual=-pitch_FRD`、`yaw_visual=yaw_NED`，确保模型的低头、横滚和真实推力方向一致。
+SimEnv 使用右手 FRD/NED 坐标，Canvas 使用右手 FLU/NWU 视觉坐标。所有机体几何、
+机体系向量和世界位置在投影前统一执行 `x_visual=x`、`y_visual=-y`、
+`z_visual=-z`：配置中较小的 z 位于上部、较大的 z 位于下部，因此共轴电机在上，
+`z≈0.25 m` 的三组格栅在下。该转换同样应用于质心、气动中心、力/力矩箭头、
+位置轨迹和目标位置。对应欧拉角使用 `roll_visual=roll_FRD`、
+`pitch_visual=-pitch_FRD`、`yaw_visual=-yaw_NED`，确保 Roll/Yaw 方向、低头姿态、
+真实推力方向及导出视频中的虚拟打杆语义一致。
 
 每组格栅的细横线表示 `deflection_axis_b`，三条栅片沿导流方向绘制。导流方向使用与 SimEnv 动力学相同的 Rodrigues 公式，将 `neutral_thrust_direction_b` 绕 `deflection_axis_b` 旋转当前 `servo_angle`；因此导流方向始终垂直于格栅旋转轴，并按右手定则随舵角偏转。
 

@@ -65,7 +65,9 @@
   const rotateX = ([x, y, z], a) => [x, y * Math.cos(a) - z * Math.sin(a), y * Math.sin(a) + z * Math.cos(a)];
   const rotateY = ([x, y, z], a) => [x * Math.cos(a) + z * Math.sin(a), y, -x * Math.sin(a) + z * Math.cos(a)];
   const rotateZ = ([x, y, z], a) => [x * Math.cos(a) - y * Math.sin(a), x * Math.sin(a) + y * Math.cos(a), z];
-  const nedToWorld = ([north, east, down]) => [north, east, -down];
+  // NED/FRD 是右手系。Canvas 世界使用 NWU/FLU 右手系，因此必须同时翻转
+  // East/Right 和 Down，不能只翻 Z 后落入左手坐标空间。
+  const nedToWorld = ([north, east, down]) => [north, -east, -down];
 
   function vectorDistance(a, b) {
     return Math.hypot(
@@ -153,14 +155,12 @@
   }
 
   function craftProject(point) {
-    // SimEnv 使用 FRD/NED（+Z 向下），Canvas 使用常见的 +Z 向上视觉空间。
-    // 所有机体几何与向量必须在姿态旋转前统一转换，避免电机/格栅上下颠倒。
-    let p = [point[0], point[1], -point[2]];
-    // 把 FRD/NED 的 Z 向下空间镜像为 Canvas 的 Z 向上空间后，
-    // 绕 X/Y 的旋转方向也会反转；Yaw 绕 Z 的方向保持不变。
-    p = rotateX(p, -state.roll);
+    // SimEnv 机体系为 FRD，Canvas 机体系为 FLU；同时翻转 Right 和 Down
+    // 可保持右手系。对应欧拉角为 Roll 保持、Pitch/Yaw 反号。
+    let p = [point[0], -point[1], -point[2]];
+    p = rotateX(p, state.roll);
     p = rotateY(p, -state.pitch);
-    p = rotateZ(p, state.yaw);
+    p = rotateZ(p, -state.yaw);
     const position = nedToWorld(state.positionNed);
     p = p.map((value, axis) => value + position[axis]);
     return worldProject(p);
@@ -219,7 +219,7 @@
         ctx.fillStyle = axis ? '#9fbe68' : '#607078';
         ctx.font = '500 7px IBM Plex Mono';
         ctx.textAlign = 'right';
-        ctx.fillText(`E ${formatGridValue(y)}`, label[0] - 5, label[1] + 3);
+        ctx.fillText(`E ${formatGridValue(-y)}`, label[0] - 5, label[1] + 3);
       }
     }
     ctx.textAlign = 'left';
@@ -230,7 +230,7 @@
     const length = state.gridStep * 2;
     const axes = [
       { p: [length, 0, 0], c: '#e66d6d', t: 'N / X' },
-      { p: [0, length, 0], c: '#b8dc74', t: 'E / Y' },
+      { p: [0, -length, 0], c: '#b8dc74', t: 'E / Y' },
       { p: [0, 0, -length], c: '#6997f0', t: 'D / Z↓' }
     ];
     axes.forEach(({ p, c, t }) => {

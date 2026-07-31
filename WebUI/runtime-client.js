@@ -9,7 +9,10 @@
   // sources can never make a live gamepad look older than a virtual frame.
   let transportSequence = 0;
   const controlInFlight = new Set();
-  const MAX_CONTROL_IN_FLIGHT = 4;
+  // Keep only two latest-value uploads in flight. More slots increase the age
+  // of commands already queued in the browser without improving simulator
+  // throughput.
+  const MAX_CONTROL_IN_FLIGHT = 2;
   let lastTelemetrySequence = -1;
   let running = false;
   let creating = false;
@@ -304,8 +307,9 @@
 
   function startControlPump() {
     clearInterval(controlTimer);
-    // Attempt 40 Hz with four bounded slots. This keeps high-RTT SSH links
-    // supplied without allowing an unbounded queue of obsolete commands.
+    // Gamepad rAF events send immediately. This low-rate timer is only a
+    // watchdog keepalive for virtual input and browsers which temporarily
+    // throttle animation callbacks.
     controlTimer = setInterval(() => {
       if (running) {
         if (usingVirtualInput) {
@@ -315,7 +319,7 @@
           if (running) failRuntime(error);
         });
       }
-    }, 25);
+    }, 100);
   }
 
   function stopTelemetryStream() {
@@ -474,6 +478,11 @@
       usingVirtualInput = false;
     } else {
       refreshVirtualInput();
+    }
+    if (running) {
+      sendControllerFrame().catch(error => {
+        if (running) failRuntime(error);
+      });
     }
   });
   window.addEventListener('rlflightsimulationstart', event => runSession(event.detail.configuration, event.detail.controller));

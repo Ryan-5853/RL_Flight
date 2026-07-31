@@ -50,32 +50,47 @@ class NeuralNetworkController(FlightController):
         active_mask: torch.Tensor | None = None,
     ) -> ControllerOutput:
         active = self._active_mask(active_mask)
-        observation = torch.cat(
-            (
-                state.attitude_q_wb,
-                state.angular_velocity_b / self.maximum_angular_rate,
-                state.linear_acceleration_n / 9.80665,
-                state.motor_speed / 1800.0,
-                reference.target_attitude_q_wb,
-                reference.collective_command * 2.0 - 1.0,
+        if hasattr(self.model, "forward_control"):
+            action, recurrent = self.model.forward_control(
+                state,
+                reference,
                 self.previous_action,
-            ),
-            dim=1,
-        )
-        if hasattr(self.model, "forward_step"):
-            action, recurrent = self.model.forward_step(
-                observation, self.recurrent_state, self.is_init
+                self.recurrent_state,
+                self.is_init,
             )
             self.recurrent_state = recurrent
         else:
-            result = self.model(observation)
-            if isinstance(result, tuple):
-                action, self.recurrent_state = result
+            observation = torch.cat(
+                (
+                    state.attitude_q_wb,
+                    state.angular_velocity_b / self.maximum_angular_rate,
+                    state.linear_acceleration_n / 9.80665,
+                    state.motor_speed / 1800.0,
+                    reference.target_attitude_q_wb,
+                    reference.collective_command * 2.0 - 1.0,
+                    self.previous_action,
+                ),
+                dim=1,
+            )
+            if hasattr(self.model, "forward_step"):
+                action, recurrent = self.model.forward_step(
+                    observation, self.recurrent_state, self.is_init
+                )
+                self.recurrent_state = recurrent
             else:
-                action = result
+                result = self.model(observation)
+                if isinstance(result, tuple):
+                    action, self.recurrent_state = result
+                else:
+                    action = result
         self.is_init.masked_fill_(active[:, None], False)
         action = action.clamp(-1.0, 1.0)
-        if self.output_mode == "physical_5":
+        if hasattr(self.model, "action_to_command"):
+            command = self.model.action_to_command(
+                action,
+                reference.collective_command,
+            )
+        elif self.output_mode == "physical_5":
             if action.shape != (self.context.batch_size, 5):
                 raise ValueError("physical_5 neural controller must output [B,5]")
             command = torch.cat(

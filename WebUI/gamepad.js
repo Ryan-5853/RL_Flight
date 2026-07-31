@@ -3,9 +3,9 @@
 
   const $ = (selector) => document.querySelector(selector);
   const $$ = (selector) => [...document.querySelectorAll(selector)];
-  // v2 明确采用飞行姿态约定：右杆向前/上为负 Pitch（低头）。
-  // 不复用 v1 的已校准方向，避免旧向导保存的正 Pitch=推杆继续反向。
-  const STORAGE_KEY = 'rl-flight.gamepad.v2';
+  // v4 明确采用统一打杆语义：右杆向前/上为负 Pitch（低头），
+  // Roll/Yaw 向右为正。硬件原始极性由校准向导负责识别。
+  const STORAGE_KEY = 'rl-flight.gamepad.v4';
   // Mode 2 遥控器布局：左杆 X/Y 为偏航/油门，右杆 X/Y 为横滚/俯仰。
   const DEFAULT_MAPPING = { roll: 2, pitch: 3, yaw: 0, throttle: 1 };
   const DEFAULT_INVERTED = { roll: false, pitch: false, yaw: false, throttle: true };

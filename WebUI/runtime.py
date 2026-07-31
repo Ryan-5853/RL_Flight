@@ -8,6 +8,7 @@ inference, recurrent state, and telemetry all remain on CPU.
 from __future__ import annotations
 
 import copy
+import gc
 import hashlib
 import math
 import sys
@@ -21,10 +22,17 @@ from typing import Any, Callable, Mapping
 
 import yaml
 
+from inference_package import (
+    InferenceModelAdapter,
+    InferencePackageLoader,
+    RealtimeInferencePackage,
+)
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 for source_root in (
     PROJECT_ROOT / "Controller" / "src",
+    PROJECT_ROOT / "Deploy" / "src",
     PROJECT_ROOT / "SimEnv" / "src",
     PROJECT_ROOT / "Train" / "src",
 ):
@@ -54,6 +62,9 @@ class RuntimeOptions:
     dtype: str
     observation_source: str
     cpu_threads: int
+    compile_kernels: bool
+    warmup_steps: int
+    spin_us: float
     execution_hz: float
     telemetry_hz: float
     command_timeout_s: float
@@ -97,13 +108,19 @@ def parse_runtime_options(config: Mapping[str, Any]) -> RuntimeOptions:
     pitch = _mapping(sticks.get("pitch", {}), "command_source.params.sticks.pitch")
     yaw = _mapping(sticks.get("yaw", {}), "command_source.params.sticks.yaw")
     runtime = _mapping(config.get("runtime", {}), "runtime")
+    compile_kernels = runtime.get("compile_kernels", True)
+    if not isinstance(compile_kernels, bool):
+        raise RuntimeConfigurationError("runtime.compile_kernels must be boolean")
     options = RuntimeOptions(
         device=str(run.get("device", "cpu")),
         dtype=str(run.get("dtype", "float32")),
         observation_source=str(environment.get("observation_source", "truth")),
         cpu_threads=int(runtime.get("cpu_threads", 1)),
-        execution_hz=_number(runtime, "execution_hz", 80.0),
-        telemetry_hz=_number(runtime, "telemetry_hz", 30.0),
+        compile_kernels=compile_kernels,
+        warmup_steps=int(runtime.get("warmup_steps", 3)),
+        spin_us=_number(runtime, "spin_us", 200.0),
+        execution_hz=_number(runtime, "execution_hz", 500.0),
+        telemetry_hz=_number(runtime, "telemetry_hz", 60.0),
         command_timeout_s=_number(runtime, "command_timeout_ms", 5000.0) / 1000.0,
         episode_duration_s=_number(task, "episode_duration_s", 30.0),
         max_tilt_rad=_number(termination, "max_tilt_rad", 1.3),
@@ -141,6 +158,14 @@ def parse_runtime_options(config: Mapping[str, Any]) -> RuntimeOptions:
         )
     if options.cpu_threads <= 0 or options.cpu_threads > 64:
         raise RuntimeConfigurationError("runtime.cpu_threads must be between 1 and 64")
+    if options.warmup_steps <= 0 or options.warmup_steps > 100:
+        raise RuntimeConfigurationError(
+            "runtime.warmup_steps must be between 1 and 100"
+        )
+    if options.spin_us < 0 or options.spin_us > 1000:
+        raise RuntimeConfigurationError(
+            "runtime.spin_us must be between 0 and 1000"
+        )
     if options.episode_duration_s <= 0:
         raise RuntimeConfigurationError("episode duration must be positive")
     if options.max_tilt_rad <= 0 or options.max_angular_rate_rad_s <= 0:
@@ -152,27 +177,6 @@ def parse_runtime_options(config: Mapping[str, Any]) -> RuntimeOptions:
     if not 0 <= options.throttle_minimum < options.throttle_maximum <= 1:
         raise RuntimeConfigurationError("throttle limits must satisfy 0 <= minimum < maximum <= 1")
     return options
-
-
-def _model_config(raw: Mapping[str, Any]):
-    from flight_train.config import ModelConfig
-
-    node = _mapping(raw.get("model", {}), "model")
-    model_type = str(node.get("type", "gru_actor_critic"))
-    if model_type == "gru_actor_critic":
-        encoder = tuple(int(value) for value in _mapping(node.get("encoder", {}), "model.encoder").get("hidden_sizes", [128, 128]))
-        hidden = int(_mapping(node.get("recurrent", {}), "model.recurrent").get("hidden_size", 128))
-        head_values = _mapping(node.get("actor_head", {}), "model.actor_head").get("hidden_sizes", [128])
-        head = int(head_values[0])
-        if not encoder or min((*encoder, hidden, head)) <= 0:
-            raise RuntimeConfigurationError("GRU model dimensions must be positive")
-        return ModelConfig(encoder, hidden, head, "gru")
-    if model_type == "mlp_actor_critic":
-        sizes = tuple(int(value) for value in node.get("hidden_sizes", [256, 256, 128]))
-        if not sizes or min(sizes) <= 0:
-            raise RuntimeConfigurationError("MLP hidden sizes must be positive")
-        return ModelConfig(sizes, sizes[-1], sizes[-1], "mlp")
-    raise RuntimeConfigurationError("unsupported runtime model type")
 
 
 def _dynamic_randomization(raw: Mapping[str, Any]) -> tuple[Mapping[str, Mapping[str, Any]], int | None]:
@@ -218,15 +222,18 @@ class CpuRuntimeSession:
         test_yaml: str,
         checkpoint_path: str | Path | None,
         log_root: str | Path,
+        *,
+        inference_package_loader: InferencePackageLoader | None = None,
     ) -> None:
         import torch
         from flight_controller import ControllerContext, create_controller
-        from simenv import SimulationEnvironment
+        from simenv import RealtimeSimulationEnvironment
 
         self.id = str(uuid.uuid4())
         self._torch = torch
         self.raw_simenv = yaml.safe_load(simenv_yaml)
         self.raw_test = yaml.safe_load(test_yaml)
+        self.inference_package: RealtimeInferencePackage | None = None
         if not isinstance(self.raw_simenv, Mapping):
             raise RuntimeConfigurationError("SimEnv YAML must contain a mapping")
         if not isinstance(self.raw_test, Mapping):
@@ -253,8 +260,9 @@ class CpuRuntimeSession:
             self._tempdir.cleanup()
             raise RuntimeConfigurationError("SimEnv logging must be a mapping")
         # Uploaded YAML no longer has a trustworthy source directory for
-        # relative paths. Keep all interactive logs inside the server-owned
-        # runtime log root instead of honoring a client-provided write target.
+        # relative paths. RealtimeSimulationEnvironment disables persistence,
+        # but reset still reparses this normalized config; retain a safe
+        # server-owned directory instead of a client-controlled write target.
         logging["directory"] = str(runtime_log_root)
         sensors = normalized_simenv.get("sensors", {})
         if not isinstance(sensors, dict):
@@ -283,20 +291,22 @@ class CpuRuntimeSession:
             encoding="utf-8",
         )
         self.test_path.write_text(test_yaml, encoding="utf-8")
+        self.simulation = None
         self.environment = None
         try:
             dynamic_parameters, dynamic_seed = _dynamic_randomization(self.raw_test)
-            self.environment = SimulationEnvironment.create(
+            self.simulation = RealtimeSimulationEnvironment.create(
                 self.simenv_path,
-                1,
-                self.device,
-                self.dtype,
+                device=self.device,
+                dtype=self.dtype,
+                compile_kernels=self.options.compile_kernels,
                 dynamic_randomization=dynamic_parameters,
                 dynamic_seed=dynamic_seed,
             )
+            self.environment = self.simulation.environment
             if not self.environment.dynamics_implemented or not self.environment.sensors_implemented:
                 raise RuntimeConfigurationError("SimEnv dynamics and sensors must both be implemented")
-            self.log_directory = str(self.environment.log_directory)
+            self.log_directory = None
             self.physics_hz, self.control_hz = _sim_timing(self.raw_simenv)
             self.control_period = 1.0 / self.control_hz
             self.execution_hz = min(
@@ -314,28 +324,21 @@ class CpuRuntimeSession:
             if controller_type == "neural":
                 if checkpoint_path is None:
                     raise RuntimeConfigurationError(
-                        "neural controller requires runtime.checkpoint_path"
+                        "neural controller requires a deployment package path"
                     )
-                from flight_train.models import build_actor_critic
-                from flight_train.recording import load_checkpoint
-
-                neural_model = build_actor_critic(
-                    21,
-                    4,
-                    _model_config(self.raw_test),
+                if inference_package_loader is None:
+                    raise RuntimeConfigurationError(
+                        "neural controller requires a deployment inference "
+                        "package loader; the realtime path does not construct "
+                        "models through Train"
+                    )
+                self.inference_package = inference_package_loader(
+                    Path(checkpoint_path).expanduser().resolve(),
                     self.device,
                     self.dtype,
                 )
-                checkpoint = load_checkpoint(
-                    Path(checkpoint_path).expanduser().resolve()
-                )
-                actor_state = checkpoint.get("actor")
-                if not isinstance(actor_state, Mapping):
-                    raise RuntimeConfigurationError(
-                        "checkpoint does not contain an actor state"
-                    )
-                neural_model.actor.load_state_dict(actor_state)
-                neural_model.actor.eval()
+                self.inference_package.metadata.validate()
+                neural_model = InferenceModelAdapter(self.inference_package)
                 params = controller_config.setdefault("params", {})
                 if not isinstance(params, dict):
                     raise RuntimeConfigurationError(
@@ -345,6 +348,17 @@ class CpuRuntimeSession:
                     "maximum_angular_rate_rad_s",
                     self.options.max_angular_rate_rad_s,
                 )
+                configured_output = str(
+                    params.get(
+                        "output_mode",
+                        self.inference_package.metadata.output_mode,
+                    )
+                )
+                if configured_output != self.inference_package.metadata.output_mode:
+                    raise RuntimeConfigurationError(
+                        "controller output_mode does not match inference package"
+                    )
+                params["output_mode"] = configured_output
             self.controller = create_controller(
                 controller_config,
                 ControllerContext(
@@ -359,6 +373,7 @@ class CpuRuntimeSession:
             parameters = self.environment.parameters
             self.effective_configuration = {
                 "id": self.configuration_id,
+                "simulation_backend": "simenv-realtime-single-v1",
                 "body": {
                     "mass": float(
                         parameters["body.mass"][0].detach().cpu().item()
@@ -371,13 +386,28 @@ class CpuRuntimeSession:
                     ][0].detach().cpu().tolist(),
                 },
                 "controller_parameter_source": (
-                    "checkpoint"
+                    "deployment_package"
                     if controller_type == "neural"
                     else "environment"
                 ),
             }
+            self.warmup_seconds = self.simulation.warmup(
+                steps=self.options.warmup_steps
+            )
+            if self.inference_package is not None:
+                self.inference_package.warmup(
+                    torch.zeros(
+                        (1, self.inference_package.metadata.observation_dim),
+                        device=self.device,
+                        dtype=self.dtype,
+                    )
+                )
         except Exception:
-            if self.environment is not None:
+            if self.inference_package is not None:
+                self.inference_package.close()
+            if self.simulation is not None:
+                self.simulation.close()
+            elif self.environment is not None:
                 self.environment.close()
             self._tempdir.cleanup()
             raise
@@ -394,19 +424,69 @@ class CpuRuntimeSession:
             self.target_velocity_n = torch.zeros(
                 (1, 3), device=self.device, dtype=self.dtype
             )
+            self.target_rate = torch.zeros(
+                (1, 3), device=self.device, dtype=self.dtype
+            )
             self.last_controller_output = None
             self.last_reference = None
             self.episode_step = 0
             self.episode_id = 0
+            self.controller_compiled = False
             self._filter_alpha = 1.0 - torch.exp(-torch.tensor(
                 self.control_period, device=self.device, dtype=self.dtype
             ) / torch.tensor(self.options.stick_time_constants, device=self.device, dtype=self.dtype))
+            if self.options.compile_kernels:
+                if self.controller.controller_type != "neural":
+                    self.controller.step = torch.compile(
+                        self.controller.step,
+                        fullgraph=True,
+                        mode="reduce-overhead",
+                    )
+                checkpoint = self.environment.state_dict()
+                controller_warmup_started = time.perf_counter()
+                try:
+                    with torch.no_grad():
+                        for _ in range(self.options.warmup_steps):
+                            self._step_cpu(
+                                inspect_safety=False,
+                                capture_timing=False,
+                            )
+                finally:
+                    self.environment.load_state_dict(checkpoint)
+                    reset_mask = torch.ones(
+                        1, device=self.device, dtype=torch.bool
+                    )
+                    self.controller.reset(reset_mask)
+                    if self.inference_package is not None:
+                        self.inference_package.reset()
+                    self.filtered_stick.zero_()
+                    self.target_yaw.zero_()
+                    self.upper_throttle.fill_(
+                        self.options.throttle_minimum
+                    )
+                    self.target_rate.zero_()
+                    self.last_controller_output = None
+                    self.last_reference = None
+                    self.episode_step = 0
+                    self.episode_id = 0
+                self.warmup_seconds += (
+                    time.perf_counter() - controller_warmup_started
+                )
+                self.controller_compiled = True
+            self.controller_description = self.controller.describe()
+            if self.inference_package is not None:
+                self.controller_description["inference_package"] = dict(
+                    self.inference_package.describe()
+                )
         except Exception:
-            self.environment.close()
+            if self.inference_package is not None:
+                self.inference_package.close()
+            self.simulation.close()
             self._tempdir.cleanup()
             raise
 
         self._lock = threading.RLock()
+        self._telemetry_ready = threading.Condition(self._lock)
         self._wake = threading.Event()
         self._closed = threading.Event()
         self._state = "ready"
@@ -441,7 +521,7 @@ class CpuRuntimeSession:
         try:
             self._thread.start()
         except Exception:
-            self.environment.close()
+            self.simulation.close()
             self._tempdir.cleanup()
             raise
 
@@ -596,9 +676,15 @@ class CpuRuntimeSession:
             self._state = "closed"
         self._closed.set()
         self._wake.set()
+        with self._telemetry_ready:
+            self._telemetry_ready.notify_all()
         self._thread.join(timeout=5)
-        self.environment.close()
-        self._tempdir.cleanup()
+        try:
+            if self.inference_package is not None:
+                self.inference_package.close()
+        finally:
+            self.simulation.close()
+            self._tempdir.cleanup()
 
     def status(self) -> dict[str, Any]:
         with self._lock:
@@ -609,6 +695,11 @@ class CpuRuntimeSession:
                 "device": str(self.device),
                 "cpu_threads": self.options.cpu_threads,
                 "dtype": str(self.dtype),
+                "simulation_backend": "simenv-realtime-single-v1",
+                "simulation_compiled": self.simulation.compiled,
+                "controller_compiled": self.controller_compiled,
+                "simulation_warmup_s": self.warmup_seconds,
+                "persistent_logging": False,
                 "control_hz": self.control_hz,
                 "physics_hz": self.physics_hz,
                 "target_execution_hz": self.execution_hz,
@@ -644,7 +735,9 @@ class CpuRuntimeSession:
                     self.effective_configuration
                 ),
                 "log_directory": self.log_directory,
-                "controller": self.controller.describe(),
+                "controller": copy.deepcopy(
+                    self.controller_description
+                ),
             }
 
     def telemetry(self, after: int = -1) -> dict[str, Any] | None:
@@ -653,8 +746,33 @@ class CpuRuntimeSession:
                 return None
             return copy.deepcopy(self._telemetry)
 
+    def wait_telemetry(
+        self,
+        after: int = -1,
+        timeout: float = 1.0,
+    ) -> dict[str, Any] | None:
+        """Block without polling until a newer latest-value packet exists."""
+
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self._telemetry_ready:
+            while (
+                self._telemetry is None
+                or self._telemetry_sequence <= after
+            ):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or self._state in {"closed", "faulted"}:
+                    return None
+                self._telemetry_ready.wait(remaining)
+            return copy.deepcopy(self._telemetry)
+
     def _run(self) -> None:
         torch = self._torch
+        next_deadline_ns = time.perf_counter_ns()
+        period_ns = max(1, round(self.execution_period * 1e9))
+        spin_ns = round(self.options.spin_us * 1000)
+        gc_was_enabled = gc.isenabled()
+        if gc_was_enabled:
+            gc.disable()
         try:
             while not self._closed.is_set():
                 with self._lock:
@@ -686,14 +804,18 @@ class CpuRuntimeSession:
                 if state != "running" and not single_step:
                     self._wake.wait(.1)
                     self._wake.clear()
+                    next_deadline_ns = time.perf_counter_ns()
                     continue
-                step_started = time.perf_counter()
+                step_started_ns_perf = time.perf_counter_ns()
                 step_started_ns = time.time_ns()
                 for index, value in enumerate(command):
                     self.input_tensor[0, index] = value
                 publish_due = single_step or time.monotonic() - self._last_telemetry_at >= self.telemetry_period
                 with torch.no_grad():
-                    step_timing = self._step_cpu(inspect_safety=publish_due)
+                    step_timing = self._step_cpu(
+                        inspect_safety=publish_due,
+                        capture_timing=publish_due or command_trace is not None,
+                    )
                 step_finished_ns = time.time_ns()
                 step_trace = command_trace or {
                     "transport_sequence": self._command_sequence,
@@ -718,42 +840,56 @@ class CpuRuntimeSession:
                     self._last_telemetry_at = time.monotonic()
                 if single_step:
                     continue
-                compute_s = time.perf_counter() - step_started
+                compute_s = (
+                    time.perf_counter_ns() - step_started_ns_perf
+                ) / 1e9
                 if self._step_compute_ema_s <= 0:
                     self._step_compute_ema_s = compute_s
                 else:
                     self._step_compute_ema_s = (
                         .9 * self._step_compute_ema_s + .1 * compute_s
                     )
-                # Reserve roughly 20% wall-clock headroom for HTTP control and
-                # telemetry threads. If inference/physics is slower than the
-                # configured execution rate, reduce wall execution rate rather
-                # than spinning and starving communication.
-                adaptive_period = max(
-                    self.execution_period,
-                    self._step_compute_ema_s / .8,
-                )
-                self._effective_execution_hz = 1.0 / adaptive_period
-                delay = adaptive_period - compute_s
-                if delay > 0:
-                    self._closed.wait(delay)
+                self._effective_execution_hz = self.execution_hz
+                next_deadline_ns += period_ns
+                remaining_ns = next_deadline_ns - time.perf_counter_ns()
+                if remaining_ns > 0:
+                    # Sleep most of the slack, then spin briefly to avoid the
+                    # millisecond-scale overshoot of a pure Event.wait.
+                    if remaining_ns > spin_ns:
+                        self._closed.wait(
+                            (remaining_ns - spin_ns) / 1e9
+                        )
+                    while (
+                        not self._closed.is_set()
+                        and time.perf_counter_ns() < next_deadline_ns
+                    ):
+                        pass
                 else:
                     self._overruns += 1
+                    # Do not execute an unbounded catch-up burst after an OS
+                    # scheduling stall; resume from the current wall clock.
+                    if remaining_ns < -period_ns:
+                        next_deadline_ns = time.perf_counter_ns()
         except Exception as error:
             with self._lock:
                 self._fault = f"{type(error).__name__}: {error}"
                 self._state = "faulted"
+                self._telemetry_ready.notify_all()
+        finally:
+            if gc_was_enabled:
+                gc.enable()
 
     def _step_cpu(
         self,
         *,
         inspect_safety: bool,
         reset_on_termination: bool = True,
+        capture_timing: bool = True,
     ) -> dict[str, Any]:
         torch = self._torch
         from flight_controller import ControllerReference, ControllerState
 
-        preparation_started_ns = time.time_ns()
+        preparation_started_ns = time.time_ns() if capture_timing else 0
         roll, pitch, yaw, throttle = self.input_tensor.unbind(dim=1)
         raw_stick = torch.stack((roll, pitch, yaw), dim=1)
         self.filtered_stick.add_(self._filter_alpha * (raw_stick - self.filtered_stick))
@@ -771,11 +907,19 @@ class CpuRuntimeSession:
         upper = self.upper_throttle + self.options.throttle_rise_per_s * self.control_period
         self.upper_throttle.copy_(torch.maximum(torch.minimum(desired_throttle, upper), lower))
 
-        truth = self.environment.observe("truth", (
+        truth_fields = (
             "position_n", "velocity_n", "attitude_q_wb", "angular_velocity_b",
             "linear_acceleration_n", "motor_speed", "servo_angle",
-        )).values
-        sensor = self.environment.observe("sensor").values
+        )
+        truth = dict(zip(
+            truth_fields,
+            self.simulation.state_views("truth", truth_fields),
+        ))
+        sensor_fields = self.simulation.observation_layout["sensor"]
+        sensor = dict(zip(
+            sensor_fields,
+            self.simulation.state_views("sensor", sensor_fields),
+        ))
         controller_values = dict(truth)
         if self.controller.controller_type == "neural":
             # Preserve the deployed 21-D policy contract: gyro,
@@ -804,55 +948,64 @@ class CpuRuntimeSession:
                 "motor_speed", truth["motor_speed"]
             )
         state = ControllerState.from_truth(controller_values)
-        target_rate = torch.zeros((1, 3), device=self.device, dtype=self.dtype)
-        target_rate[:, 2] = (
+        self.target_rate.zero_()
+        self.target_rate[:, 2] = (
             self.filtered_stick[:, 2] * self.options.max_yaw_rate_rad_s
         )
         reference = ControllerReference(
             target_position_n=self.target_position_n,
             target_velocity_n=self.target_velocity_n,
             target_attitude_q_wb=target_attitude,
-            target_angular_velocity_b=target_rate,
+            target_angular_velocity_b=self.target_rate,
             collective_command=self.upper_throttle,
         )
-        controller_started_perf_ns = time.perf_counter_ns()
-        controller_started_ns = time.time_ns()
+        controller_started_perf_ns = (
+            time.perf_counter_ns() if capture_timing else 0
+        )
+        controller_started_ns = time.time_ns() if capture_timing else 0
         controller_output = self.controller.step(state, reference)
-        controller_finished_ns = time.time_ns()
+        controller_finished_ns = time.time_ns() if capture_timing else 0
         controller_elapsed_ns = (
             time.perf_counter_ns() - controller_started_perf_ns
+            if capture_timing
+            else 0
         )
-        environment_started_perf_ns = time.perf_counter_ns()
-        environment_started_ns = time.time_ns()
-        result = self.environment.advance(controller_output.command)
-        environment_finished_ns = time.time_ns()
+        environment_started_perf_ns = (
+            time.perf_counter_ns() if capture_timing else 0
+        )
+        environment_started_ns = time.time_ns() if capture_timing else 0
+        result = self.simulation.advance(controller_output.command)
+        environment_finished_ns = time.time_ns() if capture_timing else 0
         environment_elapsed_ns = (
             time.perf_counter_ns() - environment_started_perf_ns
+            if capture_timing
+            else 0
         )
         self.last_controller_output = controller_output
         self.last_reference = reference
         self.episode_step += 1
 
-        attitude = state.attitude_q_wb
-        angular_velocity = state.angular_velocity_b
-        tilt = 2 * torch.acos(torch.sqrt((attitude[:, 0].square() + attitude[:, 3].square()).clamp(0, 1)))
-        # Safety inspection is limited to the telemetry boundary (or the
-        # deterministic episode timeout) to keep the hot path compact.
         inspect_safety = self.episode_step >= self.max_episode_steps or inspect_safety
-        angular_rate_norm = torch.linalg.vector_norm(
-            angular_velocity, dim=1
-        )
-        invalid_mask = ~result.valid
-        tilt_mask = tilt > self.options.max_tilt_rad
-        angular_rate_mask = (
-            angular_rate_norm > self.options.max_angular_rate_rad_s
-        )
-        reset_mask = invalid_mask | tilt_mask | angular_rate_mask
         episode_timeout = self.episode_step >= self.max_episode_steps
-        should_reset = episode_timeout
-        if inspect_safety and not should_reset:
-            should_reset = bool(reset_mask.any().item())
         termination: dict[str, Any] | None = None
+        if inspect_safety:
+            attitude = state.attitude_q_wb
+            angular_velocity = state.angular_velocity_b
+            tilt = 2 * torch.acos(torch.sqrt((
+                attitude[:, 0].square() + attitude[:, 3].square()
+            ).clamp(0, 1)))
+            angular_rate_norm = torch.linalg.vector_norm(
+                angular_velocity, dim=1
+            )
+            invalid_mask = ~result.valid
+            tilt_mask = tilt > self.options.max_tilt_rad
+            angular_rate_mask = (
+                angular_rate_norm > self.options.max_angular_rate_rad_s
+            )
+            reset_mask = invalid_mask | tilt_mask | angular_rate_mask
+            should_reset = episode_timeout or bool(reset_mask.any().item())
+        else:
+            should_reset = False
         if should_reset:
             if bool(invalid_mask.any().item()):
                 reason = "simenv_invalid"
@@ -881,6 +1034,8 @@ class CpuRuntimeSession:
                     reset_mask = torch.ones_like(result.valid)
                 self.environment.reset(reset_mask, self.simenv_path)
                 self.controller.reset(reset_mask)
+                if self.inference_package is not None:
+                    self.inference_package.reset()
                 self.filtered_stick.zero_()
                 self.target_yaw.zero_()
                 self.target_position_n.copy_(
@@ -901,7 +1056,9 @@ class CpuRuntimeSession:
             "environment_started_ns": environment_started_ns,
             "environment_finished_ns": environment_finished_ns,
             "environment_elapsed_ns": environment_elapsed_ns,
-            "post_step_finished_ns": time.time_ns(),
+            "post_step_finished_ns": (
+                time.time_ns() if capture_timing else 0
+            ),
             "termination": termination,
         }
 
@@ -1181,6 +1338,8 @@ class CpuRuntimeSession:
             mask = torch.ones(1, device=self.device, dtype=torch.bool)
             self.environment.reset(mask, self.simenv_path)
             self.controller.reset(mask)
+            if self.inference_package is not None:
+                self.inference_package.reset()
             self.filtered_stick.zero_()
             self.target_yaw.zero_()
             self.upper_throttle.fill_(self.options.throttle_minimum)
@@ -1229,18 +1388,22 @@ class CpuRuntimeSession:
             "position_n", "velocity_n", "attitude_q_wb", "angular_velocity_b", "linear_acceleration_n",
             "motor_speed", "servo_angle", "grid_moment_b", "moment_b", "grid_force_b", "force_b",
         )
-        truth = self.environment.observe("truth", fields).values
-        cpu = {name: value.detach().tolist() for name, value in truth.items()}
-        self._telemetry_sequence += 1
+        truth = self.simulation.state_views("truth", fields)
+        cpu = {
+            name: value.detach().tolist()
+            for name, value in zip(fields, truth)
+        }
+        next_telemetry_sequence = self._telemetry_sequence + 1
         packet = {
             "type": "telemetry",
             "session_id": self.id,
-            "sequence": self._telemetry_sequence,
+            "sequence": next_telemetry_sequence,
             "server_time_ns": time.time_ns(),
             "truth": cpu,
             "runtime": self.status(),
             "latency_trace": dict(latency_trace or {}),
         }
+        packet["runtime"]["telemetry_sequence"] = next_telemetry_sequence
         if self.last_controller_output is not None:
             packet["controller"] = {
                 "type": self.controller.controller_type,
@@ -1262,8 +1425,10 @@ class CpuRuntimeSession:
             "telemetry_pack_finished_ns": time.time_ns(),
         })
         packet["latency_trace"]["telemetry_published_ns"] = time.time_ns()
-        with self._lock:
+        with self._telemetry_ready:
+            self._telemetry_sequence = next_telemetry_sequence
             self._telemetry = packet
+            self._telemetry_ready.notify_all()
 
     @staticmethod
     def _euler_to_quaternion(roll, pitch, yaw):
@@ -1280,13 +1445,18 @@ class CpuRuntimeSession:
 
 
 class RuntimeRegistry:
-    def __init__(self, log_root: str | Path) -> None:
+    def __init__(
+        self,
+        log_root: str | Path,
+        *,
+        inference_package_loader: InferencePackageLoader | None = None,
+    ) -> None:
         self._lock = threading.RLock()
         self._sessions: dict[str, CpuRuntimeSession] = {}
         self._log_root = Path(log_root).expanduser().resolve()
+        self._inference_package_loader = inference_package_loader
 
-    @staticmethod
-    def capabilities() -> dict[str, Any]:
+    def capabilities(self) -> dict[str, Any]:
         try:
             import os
             import platform
@@ -1297,10 +1467,24 @@ class RuntimeRegistry:
                 "logical_cpu_count": os.cpu_count(),
                 "torch": torch.__version__,
                 "devices": [{"type": "cpu", "name": platform.processor() or platform.machine()}],
-                "runtime": "cpu-single-environment-v1",
+                "runtime": "cpu-realtime-single-environment-v2",
+                "simulation_backend": "simenv-realtime-single-v1",
+                "torch_compile_available": hasattr(torch, "compile"),
+                "inference_package_loader": (
+                    self._inference_package_loader is not None
+                ),
             }
         except Exception as error:
-            return {"cpu_available": False, "error": str(error), "devices": [], "runtime": "cpu-single-environment-v1"}
+            return {
+                "cpu_available": False,
+                "error": str(error),
+                "devices": [],
+                "runtime": "cpu-realtime-single-environment-v2",
+                "simulation_backend": "simenv-realtime-single-v1",
+                "inference_package_loader": (
+                    self._inference_package_loader is not None
+                ),
+            }
 
     def create(
         self,
@@ -1324,7 +1508,13 @@ class RuntimeRegistry:
                 self._sessions.clear()
                 for stale_session in stale_sessions:
                     stale_session.close()
-            session = CpuRuntimeSession(simenv_yaml, test_yaml, checkpoint_path, self._log_root)
+            session = CpuRuntimeSession(
+                simenv_yaml,
+                test_yaml,
+                checkpoint_path,
+                self._log_root,
+                inference_package_loader=self._inference_package_loader,
+            )
             self._sessions[session.id] = session
         return session
 
@@ -1361,6 +1551,7 @@ class OfflineRolloutJob:
         log_root: str | Path,
         *,
         fps: float,
+        inference_package_loader: InferencePackageLoader | None = None,
     ) -> None:
         self.id = str(uuid.uuid4())
         self._simenv_yaml = simenv_yaml
@@ -1368,6 +1559,7 @@ class OfflineRolloutJob:
         self._checkpoint_path = checkpoint_path
         self._log_root = log_root
         self._fps = fps
+        self._inference_package_loader = inference_package_loader
         self._lock = threading.RLock()
         self._cancelled = threading.Event()
         self._state = "queued"
@@ -1401,6 +1593,7 @@ class OfflineRolloutJob:
                 self._test_yaml,
                 self._checkpoint_path,
                 self._log_root,
+                inference_package_loader=self._inference_package_loader,
             )
             result = session.sample_virtual_pilot_rollout(
                 fps=self._fps,
@@ -1462,11 +1655,18 @@ class OfflineRolloutJob:
 class OfflineRolloutRegistry:
     """Keeps one active rollout and a small set of completed results."""
 
-    def __init__(self, log_root: str | Path, retain: int = 3) -> None:
+    def __init__(
+        self,
+        log_root: str | Path,
+        retain: int = 3,
+        *,
+        inference_package_loader: InferencePackageLoader | None = None,
+    ) -> None:
         self._lock = threading.RLock()
         self._jobs: dict[str, OfflineRolloutJob] = {}
         self._log_root = Path(log_root).expanduser().resolve()
         self._retain = max(1, retain)
+        self._inference_package_loader = inference_package_loader
 
     def create(
         self,
@@ -1504,6 +1704,7 @@ class OfflineRolloutRegistry:
                 checkpoint_path,
                 self._log_root,
                 fps=fps,
+                inference_package_loader=self._inference_package_loader,
             )
             self._jobs[job.id] = job
             return job

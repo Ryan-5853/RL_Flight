@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 import json
 import tempfile
 import unittest
@@ -23,6 +24,7 @@ from flight_train.config import (
     exact_resume_config_sha256,
     load_experiment_config,
     override_run_config,
+    rebatch_continuation_resume_config_sha256,
 )
 from flight_train.core import EnvSpec
 from flight_train.envs import SimEnvAdapter, _load_timing
@@ -38,6 +40,7 @@ from flight_train.rewards import AttitudeRewardCalculator, RewardOutput
 from flight_train.runner import (
     _apply_sac_continuation_overrides,
     _restore_policy,
+    _restore_rebatched_continuation,
 )
 from flight_train.tasks import AttitudeTrackingTask
 from simenv.config import load_and_materialize
@@ -1538,6 +1541,158 @@ class TensorTrainingTests(unittest.TestCase):
             continuation_resume_config_sha256(v3),
             continuation_resume_config_sha256(source_run_config),
         )
+
+    def test_command_tracking_v4_restarts_v3_best_actor_with_aligned_reward(self):
+        root = Path(__file__).parents[1] / "configs/experiments"
+        v4 = load_experiment_config(
+            root / "mlp_sac_attitude_command_tracking_v4.yaml"
+        )
+        params = v4.reward.calculator.params
+        self.assertEqual(v4.name, "mlp_sac_attitude_command_tracking_v4")
+        self.assertEqual(v4.checkpoint.resume_mode, "policy")
+        self.assertEqual(
+            v4.checkpoint.resume_from.name,
+            "best_total_evaluation.pt",
+        )
+        self.assertEqual(v4.run.parallel_count, 512)
+        self.assertEqual(v4.run.rollout_steps, 256)
+        self.assertEqual(v4.run.total_control_steps, 33_554_432)
+        self.assertEqual(
+            v4.run.parallel_count * v4.run.rollout_steps,
+            131_072,
+        )
+        self.assertEqual(v4.sac.updates_per_collection, 64)
+        self.assertEqual(v4.sac.critic_pretraining_updates, 2048)
+        self.assertEqual(v4.sac.actor_update_interval, 8)
+        self.assertEqual(v4.sac.actor_learning_rate, 0.000015)
+        self.assertEqual(v4.sac.max_alpha, 0.005)
+        self.assertEqual(
+            v4.model.sac_maximum_action_std,
+            (0.05, 0.07, 0.07, 0.07),
+        )
+        self.assertEqual(
+            v4.model.sac_initial_action_std,
+            (0.035, 0.045, 0.045, 0.045),
+        )
+        self.assertEqual(
+            v4.evaluation.interval_control_steps,
+            2_097_152,
+        )
+        self.assertEqual(
+            v4.checkpoint.interval_control_steps,
+            2_097_152,
+        )
+        self.assertEqual(
+            v4.task.curriculum_target_scales,
+            (0.05, 0.10, 0.25, 0.50, 0.75, 1.0),
+        )
+        self.assertEqual(params["alive_bonus"], 0.005)
+        self.assertEqual(params["joint_tracking_weight"], 0.005)
+        self.assertEqual(
+            params["joint_roll_pitch_scale_rad"],
+            v4.task.curriculum_max_roll_pitch_rmse_rad,
+        )
+        self.assertEqual(
+            params["joint_yaw_rate_scale_rad_s"],
+            v4.task.curriculum_max_yaw_rate_rmse_rad_s,
+        )
+
+    def test_rebatch_continuation_keeps_learning_state_and_resets_batch_state(self):
+        root = Path(__file__).parents[1] / "configs/experiments"
+        source = load_experiment_config(
+            root / "mlp_sac_attitude_command_tracking_v3.yaml"
+        )
+        destination_raw = copy.deepcopy(source.raw)
+        destination_raw["run"]["parallel_count"] = 512
+        destination_raw["collector"]["control_steps_per_rollout"] = 256
+        config = replace(
+            source,
+            run=replace(
+                source.run,
+                parallel_count=512,
+                rollout_steps=256,
+                total_control_steps=83_886_080,
+            ),
+            raw=destination_raw,
+        )
+        device = torch.device("cpu")
+        model = build_sac_actor_critic(
+            config.control_contract.observation_dim,
+            4,
+            config.model,
+            device,
+        )
+        algorithm = TorchRLSAC(model, config.sac, device)
+        algorithm.n_step_pending = TensorDict(
+            {"marker": torch.ones(256, 1)},
+            batch_size=[256],
+        )
+        command_source = SimpleNamespace(
+            set_curriculum_scale=unittest.mock.Mock()
+        )
+        env = SimpleNamespace(
+            curriculum_stage=0,
+            curriculum_successes=9,
+            curriculum_failures=7,
+            curriculum_consecutive_passes=0,
+            curriculum_last_success_fraction=0.0,
+            max_episode_steps=0,
+            command_source=command_source,
+            _duration_to_steps=lambda duration: round(duration * 500),
+        )
+        static_randomizer = SimpleNamespace(
+            load_state_dict=unittest.mock.Mock()
+        )
+        reward_calculator = SimpleNamespace(
+            load_state_dict=unittest.mock.Mock()
+        )
+        collector = SimpleNamespace(batch_size=512)
+        state = {
+            "checkpoint_schema_version": 5,
+            "algorithm_name": "sac",
+            "global_control_steps": 67_108_864,
+            "config": source.raw,
+            "actor": model.actor.state_dict(),
+            "sac": {},
+            "torch_rng_state": torch.get_rng_state(),
+            "training_environment": {
+                "static_randomizer": {"seed": 32032},
+                "reward_calculator": {"version": 3},
+                "episode_curriculum": {
+                    "stage": 3,
+                    "successes": 123,
+                    "failures": 45,
+                    "consecutive_passes": 1,
+                    "last_success_fraction": 0.69921875,
+                },
+            },
+        }
+        with unittest.mock.patch.object(
+            algorithm,
+            "load_state_dict",
+        ) as load_learning_state:
+            restored_steps = _restore_rebatched_continuation(
+                config,
+                state,
+                env=env,
+                model=model,
+                algorithm=algorithm,
+                collector=collector,
+                static_randomizer=static_randomizer,
+                reward_calculator=reward_calculator,
+                device=device,
+            )
+
+        self.assertEqual(restored_steps, 67_108_864)
+        load_learning_state.assert_called_once_with({})
+        self.assertIsNone(algorithm.n_step_pending)
+        self.assertEqual(env.curriculum_stage, 3)
+        self.assertEqual(env.curriculum_successes, 0)
+        self.assertEqual(env.curriculum_failures, 0)
+        self.assertEqual(env.curriculum_consecutive_passes, 1)
+        self.assertEqual(env.curriculum_last_success_fraction, 0.69921875)
+        self.assertEqual(env.max_episode_steps, 15_000)
+        command_source.set_curriculum_scale.assert_called_once_with(0.5)
 
     def test_sac_continuation_applies_runtime_bounds_and_learning_rates(self):
         config = load_experiment_config(

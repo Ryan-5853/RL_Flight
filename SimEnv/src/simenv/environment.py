@@ -14,7 +14,7 @@ from .config import MaterializedConfig, load_and_materialize
 from .dynamics import TensorDynamicsKernel
 from .errors import ConfigurationError, EnvironmentClosedError
 from .kernels import TensorSensorKernel
-from .logging import TensorChunkLogger
+from .logging import NullTensorLogger, TensorChunkLogger
 from .types import AdvanceResult, ErrorCode, Observation, ResetResult
 
 
@@ -30,6 +30,7 @@ class SimulationEnvironment:
         *,
         dynamic_parameter_names: tuple[str, ...] = (),
         dynamic_seed: int | None = None,
+        logging_enabled: bool = True,
     ) -> None:
         self.parallel_count = parallel_count
         self.batch_shape = torch.Size([parallel_count])
@@ -82,15 +83,20 @@ class SimulationEnvironment:
             parallel_count, dtype=torch.int32, device=device
         )
         self._closed = False
-        self._logger = TensorChunkLogger(
-            materialized.logging,
-            self.batch_id,
-            self.instance_ids,
-            materialized.source_path,
-            materialized.raw,
-            self._parameters,
-            simulation_hz=materialized.timing.physics_hz,
-        )
+        if logging_enabled:
+            self._logger = TensorChunkLogger(
+                materialized.logging,
+                self.batch_id,
+                self.instance_ids,
+                materialized.source_path,
+                materialized.raw,
+                self._parameters,
+                simulation_hz=materialized.timing.physics_hz,
+            )
+        else:
+            self._logger = NullTensorLogger(
+                materialized.logging.directory / self.batch_id
+            )
         self._append_log(
             active_mask=torch.zeros_like(self._valid),
             event_code=torch.ones(parallel_count, dtype=torch.int32, device=device),
@@ -107,6 +113,7 @@ class SimulationEnvironment:
         *,
         dynamic_randomization: Mapping[str, Mapping[str, Any]] | None = None,
         dynamic_seed: int | None = None,
+        logging_enabled: bool = True,
     ) -> "SimulationEnvironment":
         if isinstance(parallel_count, bool) or not isinstance(parallel_count, int) or parallel_count <= 0:
             raise ConfigurationError("parallel_count must be a positive integer")
@@ -139,6 +146,7 @@ class SimulationEnvironment:
             dtype,
             dynamic_parameter_names=tuple((dynamic_randomization or {}).keys()),
             dynamic_seed=dynamic_seed,
+            logging_enabled=logging_enabled,
         )
 
     @property

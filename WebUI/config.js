@@ -110,9 +110,12 @@
         test('run.device', '运行设备', 'cpu', '', 'select', { options: ['cpu'] }),
         test('run.dtype', '张量类型', 'float32', '', 'select', { options: ['float32', 'float64'] }),
         test('environment.observation_source', '观测来源', 'truth', '', 'select', { options: ['truth', 'sensor'] }),
-        test('runtime.checkpoint_path', '模型检查点（服务器）', 'controller/latest.pt', '', 'text'),
-        test('runtime.execution_hz', '墙钟执行频率', 80, 'Hz'),
-        test('runtime.telemetry_hz', '前端遥测频率', 30, 'Hz'),
+        test('runtime.checkpoint_path', '推理包路径（服务器）', 'controller/latest', '', 'text'),
+        test('runtime.compile_kernels', '编译实时仿真内核', true, '', 'boolean'),
+        test('runtime.warmup_steps', '实时内核预热步数', 3, '', 'integer'),
+        test('runtime.spin_us', '截止时间自旋窗口', 200, 'μs'),
+        test('runtime.execution_hz', '墙钟执行频率', 500, 'Hz'),
+        test('runtime.telemetry_hz', '前端遥测频率', 60, 'Hz'),
         test('runtime.command_timeout_ms', '手柄失联安全切换', 5000, 'ms'),
         test('runtime.cpu_threads', 'CPU 推理线程数', 1, '', 'integer'),
         test('model.type', '控制器模型', 'gru_actor_critic', '', 'select', { options: ['gru_actor_critic', 'mlp_actor_critic'] }),
@@ -493,7 +496,7 @@
     if (Math.abs(sum - 1) > 1e-6) throw new Error('direct 与三个 grid 的推力占比之和必须等于 1。');
     if (testConfig.task.episode_duration_s <= 0) throw new Error('测试时长必须大于 0。');
     if (testConfig.controller.type === 'neural' && !String(testConfig.runtime.checkpoint_path || '').trim()) {
-      throw new Error('神经网络控制器必须选择服务器 checkpoint。');
+      throw new Error('神经网络控制器必须选择服务器部署推理包。');
     }
     document.querySelectorAll('[data-config]').forEach(input => {
       const value = parseValue(input);

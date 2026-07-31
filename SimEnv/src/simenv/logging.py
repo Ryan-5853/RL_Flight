@@ -15,6 +15,42 @@ from .config import LoggingConfig
 from .errors import InsufficientDiskSpaceError, LoggingError
 
 
+class NullTensorLogger:
+    """No-op logger for latency-sensitive execution paths.
+
+    The regular environment remains losslessly logged by default.  This logger
+    must be selected explicitly by a caller which owns the observability and
+    persistence policy, such as the single-environment real-time runner.
+    """
+
+    def __init__(self, directory: Path) -> None:
+        self.directory = directory
+
+    @property
+    def uses_sparse_reset_events(self) -> bool:
+        return False
+
+    def record_reset(self, **_: Any) -> None:
+        return None
+
+    def append(self, record: Mapping[str, torch.Tensor], *, force: bool = False) -> None:
+        del record, force
+
+    def append_lazy(
+        self,
+        record_factory: Callable[[], Mapping[str, torch.Tensor]],
+        *,
+        force: bool = False,
+    ) -> None:
+        del record_factory, force
+
+    def flush(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+
 class TensorChunkLogger:
     """Lossless [time, B, ...] tensor logger with a background disk writer."""
 

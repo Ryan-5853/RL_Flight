@@ -17,6 +17,7 @@ from .config import (
     ExperimentConfig,
     continuation_resume_config_sha256,
     exact_resume_config_sha256,
+    rebatch_continuation_resume_config_sha256,
 )
 from .core import tensordict_to_device
 from .envs import SimEnvAdapter
@@ -418,6 +419,18 @@ def run_experiment(config: ExperimentConfig) -> dict[str, Any]:
                     continuation=(
                         config.checkpoint.resume_mode == "continuation"
                     ),
+                )
+            elif config.checkpoint.resume_mode == "continuation_rebatch":
+                global_steps = _restore_rebatched_continuation(
+                    config,
+                    resume_state,
+                    env=env,
+                    model=model,
+                    algorithm=algorithm,
+                    collector=collector,
+                    static_randomizer=static_randomizer,
+                    reward_calculator=reward_calculator,
+                    device=device,
                 )
             else:
                 _restore_policy(resume_state, model=model)
@@ -994,6 +1007,131 @@ def _restore_exact(
         if not isinstance(cuda_rng, list) or len(cuda_rng) != torch.cuda.device_count():
             raise ValueError("checkpoint CUDA RNG state is incompatible with visible devices")
         torch.cuda.set_rng_state_all(cuda_rng)
+    return global_steps
+
+
+def _restore_rebatched_continuation(
+    config: ExperimentConfig,
+    state: Mapping[str, Any],
+    *,
+    env: SimEnvAdapter,
+    model,
+    algorithm: TorchRLPPO | TorchRLSAC,
+    collector: TensorDictRolloutCollector,
+    static_randomizer: StaticRandomizer,
+    reward_calculator,
+    device: torch.device,
+) -> int:
+    """恢复 SAC 学习状态和课程阶段，并以新并行批次重建环境瞬时状态。
+
+    并行数变化后 simulator、command source、collector current、episode 张量和
+    n-step pending 的 batch 维均不兼容。该模式明确丢弃这些瞬时状态，但完整
+    保留 actor、双 Q、target Q、replay、优化器、alpha、policy anchor 和更新计数。
+    """
+
+    if not isinstance(algorithm, TorchRLSAC) or config.algorithm_name != "sac":
+        raise ValueError("continuation_rebatch currently supports SAC only")
+    if int(state.get("checkpoint_schema_version", -1)) != 5:
+        raise ValueError(
+            "checkpoint does not contain exact-resume schema v5 SAC state"
+        )
+    if str(state.get("algorithm_name", "")) != "sac":
+        raise ValueError("checkpoint algorithm is incompatible")
+    source_config = state.get("config")
+    if not isinstance(source_config, Mapping):
+        raise ValueError("checkpoint source configuration is missing")
+    expected = rebatch_continuation_resume_config_sha256(config)
+    actual = rebatch_continuation_resume_config_sha256(source_config)
+    if actual != expected:
+        raise ValueError(
+            "checkpoint configuration is incompatible with rebatch continuation"
+        )
+
+    source_run = source_config.get("run")
+    source_collector = source_config.get("collector")
+    if not isinstance(source_run, Mapping) or not isinstance(
+        source_collector, Mapping
+    ):
+        raise ValueError("checkpoint source batching configuration is missing")
+    try:
+        source_parallel = int(source_run["parallel_count"])
+        source_rollout = int(source_collector["control_steps_per_rollout"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "checkpoint source batching configuration is invalid"
+        ) from exc
+    source_transitions = source_parallel * source_rollout
+    destination_transitions = (
+        config.run.parallel_count * config.run.rollout_steps
+    )
+    if (
+        source_parallel <= 0
+        or source_rollout <= 0
+        or source_transitions != destination_transitions
+    ):
+        raise ValueError(
+            "continuation_rebatch must preserve transitions per collection: "
+            f"source={source_parallel}x{source_rollout}={source_transitions}, "
+            f"destination={config.run.parallel_count}x"
+            f"{config.run.rollout_steps}={destination_transitions}"
+        )
+
+    global_steps = int(state.get("global_control_steps", -1))
+    if global_steps < 0 or global_steps > config.run.total_control_steps:
+        raise ValueError(
+            "checkpoint global_control_steps is outside the requested run budget"
+        )
+    training = state.get("training_environment")
+    if not isinstance(training, Mapping):
+        raise ValueError("checkpoint training_environment state is missing")
+    curriculum = training.get("episode_curriculum")
+    if not isinstance(curriculum, Mapping):
+        raise ValueError("checkpoint episode_curriculum state is missing")
+
+    model.actor.load_state_dict(state["actor"])
+    sac_state = state.get("sac")
+    if not isinstance(sac_state, Mapping):
+        raise ValueError("checkpoint SAC state is missing")
+    algorithm.load_state_dict(sac_state)
+    # 旧 pending 尾部按旧环境 batch 排列，不能与新 collector 的第一批拼接。
+    algorithm.n_step_pending = None
+    _apply_sac_continuation_overrides(config, model, algorithm)
+
+    env.curriculum_stage = int(curriculum["stage"])
+    if not 0 <= env.curriculum_stage < len(config.task.curriculum_durations_s):
+        raise ValueError("checkpoint episode curriculum stage is incompatible")
+    # 新环境从完整 episode 边界开始；旧批次未完成的成功/失败累计不能迁移。
+    env.curriculum_successes = 0
+    env.curriculum_failures = 0
+    env.curriculum_consecutive_passes = int(curriculum["consecutive_passes"])
+    env.curriculum_last_success_fraction = float(
+        curriculum["last_success_fraction"]
+    )
+    env.max_episode_steps = env._duration_to_steps(
+        config.task.curriculum_durations_s[env.curriculum_stage]
+    )
+    env.command_source.set_curriculum_scale(
+        config.task.curriculum_target_scales[env.curriculum_stage]
+    )
+    static_randomizer.load_state_dict(training["static_randomizer"])
+    reward_calculator.load_state_dict(training["reward_calculator"])
+
+    # collector.current 和所有新环境状态来自构造阶段的完整 reset。恢复来源
+    # RNG 后，后续策略采样仍从 checkpoint 的随机流位置继续；batch 已变化，
+    # 因此不声称与旧运行逐张量一致。
+    torch_rng = state.get("torch_rng_state")
+    if not isinstance(torch_rng, torch.Tensor):
+        raise ValueError("checkpoint torch_rng_state is missing")
+    torch.set_rng_state(torch_rng.cpu())
+    if device.type == "cuda":
+        cuda_rng = state.get("cuda_rng_state_all")
+        if not isinstance(cuda_rng, list) or len(cuda_rng) != torch.cuda.device_count():
+            raise ValueError(
+                "checkpoint CUDA RNG state is incompatible with visible devices"
+            )
+        torch.cuda.set_rng_state_all(cuda_rng)
+    if collector.batch_size != config.run.parallel_count:
+        raise ValueError("rebuilt collector parallel count is incompatible")
     return global_steps
 
 

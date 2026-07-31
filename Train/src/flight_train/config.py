@@ -1007,6 +1007,28 @@ def continuation_resume_config_sha256(
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def rebatch_continuation_resume_config_sha256(
+    config: ExperimentConfig | Mapping[str, Any],
+) -> str:
+    """计算扩缩并行批次续训摘要。
+
+    ``continuation_rebatch`` 继承普通 SAC continuation 的调参白名单，另外允许
+    同时修改并行环境数和 rollout 时间长度。runner 会要求二者乘积保持不变，
+    从而维持每轮新增 transition 数和 updates-per-collection 比例。批次相关
+    simulator/collector/episode 瞬时状态不会恢复，而学习状态和课程阶段会恢复。
+    """
+
+    raw = config.raw if isinstance(config, ExperimentConfig) else config
+    normalized = copy.deepcopy(dict(raw))
+    run = normalized.get("run")
+    if isinstance(run, dict):
+        run.pop("parallel_count", None)
+    collector = normalized.get("collector")
+    if isinstance(collector, dict):
+        collector.pop("control_steps_per_rollout", None)
+    return continuation_resume_config_sha256(normalized)
+
+
 def _normalize_resume_config(normalized: dict[str, Any]) -> None:
     """原地移除只影响运行身份、长度、产物与评测调度的配置。"""
 
@@ -1072,9 +1094,15 @@ def _checkpoint_config(node: Mapping[str, Any], source: Path) -> CheckpointConfi
         raise ConfigError("checkpoint.resume must be a mapping")
     _keys(resume, {"from", "mode"}, "checkpoint.resume")
     mode = str(resume.get("mode", "exact"))
-    if mode not in {"exact", "continuation", "policy"}:
+    if mode not in {
+        "exact",
+        "continuation",
+        "continuation_rebatch",
+        "policy",
+    }:
         raise ConfigError(
-            "checkpoint.resume.mode must be exact, continuation, or policy"
+            "checkpoint.resume.mode must be exact, continuation, "
+            "continuation_rebatch, or policy"
         )
     value = resume.get("from")
     if value is None or value == "":
