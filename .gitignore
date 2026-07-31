@@ -49,6 +49,7 @@ compile_commands.json
 
 # Training, simulation, and experiment outputs
 /Train/runs/
+/WebUI/runtime-runs/
 logs/
 wandb/
 mlruns/

@@ -1,0 +1,86 @@
+schema_version: 4
+name: fixed_small_command_tracking_v1
+
+# 小范围操纵阶段的确定性门槛。保留三项历史科目用于纵向比较，并增加语义明确
+# 的角度/偏航角速度阶跃；command_step 的时间表为 20% 静止、25% 正向、
+# 25% 反向、30% 回中。
+seed: 72002
+parallel_count: 8
+output_root: ../../evaluation_runs
+
+scenarios:
+  - name: hover
+    type: hover
+    duration_s: 10.0
+    fixed_euler_deg: [0.0, 0.0, 0.0]
+
+  - name: constant_translation
+    type: constant_translation
+    duration_s: 12.0
+    fixed_euler_deg: [0.0, 5.0, 0.0]
+    target_velocity_n_m_s: [1.0, 0.0, 0.0]
+
+  - name: circle
+    type: circle
+    duration_s: 16.0
+    fixed_euler_deg: [0.0, 0.0, 0.0]
+    circle_radius_m: 1.0
+    circle_period_s: 8.0
+    roll_amplitude_deg: 6.0
+    pitch_amplitude_deg: 6.0
+
+  - name: roll_step
+    type: command_step
+    duration_s: 12.0
+    roll_amplitude_deg: 5.7
+
+  - name: pitch_step
+    type: command_step
+    duration_s: 12.0
+    pitch_amplitude_deg: 5.7
+
+  - name: yaw_rate_step
+    type: command_step
+    duration_s: 12.0
+    yaw_rate_amplitude_rad_s: 0.15
+
+  - name: yaw_rate_full_step
+    type: command_step
+    duration_s: 12.0
+    yaw_rate_amplitude_rad_s: 0.35
+
+  - name: combined_step
+    type: command_step
+    duration_s: 16.0
+    roll_amplitude_deg: 4.0
+    pitch_amplitude_deg: 4.0
+    yaw_rate_amplitude_rad_s: 0.20
+
+scoring:
+  limits:
+    attitude_rmse_bad_deg: 10.0
+    yaw_rate_rmse_bad_rad_s: 0.35
+    position_rmse_bad_m: 5.0
+    velocity_rmse_bad_m_s: 3.0
+    action_rms_bad: 1.0
+    action_delta_rms_bad: 0.25
+    saturation_fraction_bad: 0.50
+    response_time_bad_s: 2.0
+    settling_error_deg: 2.0
+    settling_window_s: 0.50
+    phase_lag_max_s: 2.0
+
+  self_stabilize_tracking:
+    yaw_rate_weight: 0.35
+
+  weights:
+    survival: 0.35
+    tracking: 0.40
+    action: 0.10
+    response: 0.15
+
+# 只有悬停基线仍然安全，才允许 command-step 总分参与 best 排名。
+checkpoint_selection:
+  minimum_hover_survival_s: 10.0
+  maximum_hover_roll_pitch_rmse_deg: 3.0
+  maximum_hover_yaw_rate_rmse_rad_s: 0.12

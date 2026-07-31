@@ -9,7 +9,7 @@ parallel:
   independent_rng: true
 
 timing:
-  physics_hz: {value: 5000}
+  physics_hz: {value: 500}
   control_hz: {value: 500}
 
 initial_state:
@@ -89,21 +89,23 @@ aerodynamics:
 # 训练读取 truth；保留传感器接口但把全部噪声置零，确保环境确定性。
 sensors:
   gyro:
-    sample_hz: {value: 5000}
+    sample_hz: {value: 500}
     noise:
       distribution: normal
       stddev: {value: [0.0, 0.0, 0.0]}
     bias: {value: [0.0, 0.0, 0.0]}
     delay: {value: 0.001}
+    interpolation: linear
   accelerometer:
-    sample_hz: {value: 5000}
+    sample_hz: {value: 500}
     noise:
       distribution: normal
       stddev: {value: [0.0, 0.0, 0.0]}
     bias: {value: [0.0, 0.0, 0.0]}
     delay: {value: 0.001}
+    interpolation: linear
   motor_speed:
-    sample_hz: {value: 5000}
+    sample_hz: {value: 500}
     noise:
       distribution: normal
       stddev: {value: [0.0, 0.0]}
@@ -113,7 +115,7 @@ sensors:
 logging:
   directory: ../logs
   mode: compact
-  physics_step_stride: 200
+  physics_step_stride: 20
   fields:
     - physics_step
     - control_step

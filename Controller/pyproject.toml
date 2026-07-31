@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rl-flight-controller"
+version = "0.1.0"
+description = "Unified batched controller interface for RL Flight"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "torch>=2.2,<3.0",
+    "scipy>=1.11,<2.0",
+    "PyYAML>=6.0,<7.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

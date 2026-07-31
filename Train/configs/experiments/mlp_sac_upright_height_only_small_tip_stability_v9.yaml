@@ -1,0 +1,233 @@
+# 256×256 MLP-SAC：从 v8 最终均衡策略完整续训的 v9。
+#
+# 相对 stability_v8：
+#   1. 保留 61×21=1281 维稠密 120 ms 全历史和 worst-axis joint reward，
+#      不改变表示与训练目标；
+#   2. 从 v8 最终 step_16777216.pt 以 continuation 模式完整恢复 actor、双 Q、
+#      target Q、replay、优化器状态、环境、课程和 RNG。该模型固定评测全部
+#      完整生存，hover RP=6.96deg、yaw-rate=0.636rad/s，是更均衡的续训起点；
+#   3. 累计训练预算扩展到 33554432，实际新增 16777216 control steps；
+#   4. actor_update_interval 从 2 调到 4，每轮 actor 更新由 32 次降至 16 次，
+#      给 critic 更多跟随时间，同时保留足够学习速度继续压低 yaw-rate；
+#   5. actor 学习率保持 3e-5，避免在剩余预算内学习不足；
+#   6. 可学习方差边界从 0.025~0.20 收紧到 0.01~0.12；恢复的 raw scale 会
+#      映射到新边界，减少失稳探索但不清空已经学到的策略；
+#   7. entropy alpha 当前值从 checkpoint 保留并限制在 3e-4~1e-2；0.003
+#      仅作为无历史状态时的初值；
+#   8. 不启用 policy anchor，最多并行 2 个评测，并用 latest 抑制积压。
+#
+# 启动：
+#   flight-train run \
+#     --config configs/experiments/mlp_sac_upright_height_only_small_tip_stability_v9.yaml
+
+schema_version: 2
+
+experiment:
+  name: mlp_sac_upright_height_only_small_tip_stability_v9
+  entrypoint:
+    type: "flight_train.runner:run_experiment"
+    version: "train-framework-v1"
+
+seed:
+  # 与 v8 保持同一随机流，使两次训练的主要差异集中在 actor/entropy 配置。
+  base: 20260730
+  deterministic_algorithms: true
+  cudnn_benchmark: false
+
+run:
+  device: cuda:0
+  dtype: float32
+  parallel_count: 256
+  # continuation 沿用 checkpoint 的全局步数，因此这里是累计目标步数。
+  total_control_steps: 33554432
+  output_root: ../../runs
+  allow_unimplemented_simulator: false
+
+environment:
+  factory: "simenv:SimulationEnvironment"
+  config_path: ../environment/gru_sac_upright_height_only_small_tip.yaml
+  observation_source: truth
+
+command_source:
+  type: "flight_train.commands:VirtualPilotCommandSource"
+  version: "2"
+  seed: 52030
+  params:
+    throttle:
+      minimum: 0.20
+      maximum: 0.85
+      spool:
+        duration_s: 0.10
+        target_range: [0.54, 0.58]
+      height_controller:
+        observation_source: truth
+        target_m: 0.0
+        initial_throttle_range: [0.55, 0.58]
+        proportional_gain: 0.08
+        integral_gain: 0.04
+        error_limit_m: 5.0
+      slew_rate:
+        rise_per_s: 4.0
+        fall_per_s: 0.35
+    sticks:
+      roll:  {mode: angle, limit_rad: 0.0, time_constant_s: 0.20}
+      pitch: {mode: angle, limit_rad: 0.0, time_constant_s: 0.20}
+      yaw:   {mode: rate, limit_rad_s: 0.0, time_constant_s: 0.30}
+      target_sampling:
+        distribution: centered
+        center_exponent: 2.0
+        hold_duration_s:
+          range: [2.0, 4.0]
+      reset:
+        filtered_stick: zero
+        initial_target_scale: 0.0
+
+control_contract:
+  version: self_stabilize_v1
+  observation_profile: attitude_self_stabilize_21d_v3
+  # 稠密 120 ms 全历史：61×21=1281 维，oldest -> current，stride=1。
+  observation_history:
+    mode: uniform
+    frames: 61
+    stride_steps: 1
+  action_transform:
+    type: residual_around_trim
+    trim_command: [0.53523, 0.0, 0.0, 0.0]
+    residual_scale: [0.30, 1.0, 1.0, 1.0]
+  policy_action:
+    fields: [lower_motor, servo_1, servo_2, servo_3]
+  external_action:
+    fields: [upper_motor]
+  simulator_command:
+    fields: [upper_motor, lower_motor, servo_1, servo_2, servo_3]
+
+randomization:
+  static:
+    seed: 32030
+    scope: episode
+    parameters: {}
+  dynamic:
+    seed: 42030
+    scope: simulator
+    parameters: {}
+
+task:
+  episode_duration_s: 30.0
+  episode_curriculum:
+    durations_s:   [2.5, 3.5, 5.0, 10.0, 30.0]
+    target_scales: [0.0, 0.0, 0.0,  0.0,  0.0]
+    success_fraction: 0.80
+    evaluation_episodes_per_env: 1.0
+    consecutive_passes: 2
+    quality_gate:
+      max_roll_pitch_rmse_rad: 0.17453292519943295
+      max_yaw_rate_rmse_rad_s: 1.0
+  termination:
+    max_tilt_rad: 1.0
+    max_angular_rate_rad_s: 8.0
+    # yaw 不触发硬终止，否则高 yaw 样本会被截断，联合奖励看不到改善过程。
+    angular_rate_axes: roll_pitch
+
+reward:
+  calculator:
+    type: "flight_train.rewards.attitude:AttitudeRewardCalculator"
+    version: "3"
+    params:
+      # 旧的三项独立姿态跟踪必须保持为 0；构造器会拒绝与 joint 同时启用。
+      roll_pitch_weight: 0.0
+      tilt_weight: 0.0
+      yaw_rate_weight: 0.0
+
+      # c_rp = huber(||[roll,pitch]|| / 10deg)
+      # c_yaw = huber(|yaw-rate error| / 1rad/s)
+      # reward_joint = -0.01 * max(c_rp, c_yaw)
+      joint_tracking_weight: 0.01
+      joint_roll_pitch_scale_rad: 0.17453292519943295
+      joint_yaw_rate_scale_rad_s: 1.0
+      joint_tracking_huber_delta: 1.0
+
+      angular_rate_weight: 0.00015625
+      action_rate_weight: 0.001
+      saturation_weight: 0.01
+      alive_bonus: 0.02
+      survival_progress_weight: 0.0
+
+      tilt_barrier_weight: 0.01
+      rate_barrier_weight: 0.001
+      barrier_start_fraction: 0.50
+      barrier_exponent: 2.0
+
+      termination_penalty: 10.0
+      early_termination_penalty: 10.0
+  context:
+    fields:
+      - {name: attitude_geodesic_rad, source: task}
+      - {name: angular_velocity_b, source: truth}
+      - {name: static_domain, source: train_randomizer, visibility: reward_only}
+
+model:
+  type: mlp_actor_critic
+  hidden_sizes: [256, 256]
+  policy_distribution:
+    # continuation 会保留已学习的 raw scale，再映射到这里的新边界。
+    learnable_action_std: true
+    initial_action_std: [0.06, 0.06, 0.06, 0.06]
+    minimum_action_std: [0.01, 0.01, 0.01, 0.01]
+    maximum_action_std: [0.12, 0.12, 0.12, 0.12]
+
+algorithm:
+  name: sac
+  gamma: 0.999
+  n_step_return: 16
+  replay:
+    capacity_transitions: 524288
+    warmup_transitions: 131072
+    batch_size: 4096
+  # continuation 恢复的 critic update 已超过预训练阈值，不会重新预训练。
+  critic_pretraining_updates: 2048
+  actor_update_interval: 4
+  policy_anchor:
+    weight: 0.0
+    max_action_deviation: 0.0
+  updates_per_collection: 64
+  target_update:
+    tau: 0.0025
+    interval_updates: 1
+  entropy:
+    automatic: true
+    initial_alpha: 0.003
+    target_entropy: -4.0
+    min_alpha: 0.0003
+    max_alpha: 0.01
+  actor_max_grad_norm: 1.0
+  critic_max_grad_norm: 2.5
+  optimizer:
+    type: adam
+    actor_learning_rate: 0.00003
+    critic_learning_rate: 0.0002
+    alpha_learning_rate: 0.0001
+
+collector:
+  control_steps_per_rollout: 512
+
+evaluation:
+  enabled: true
+  interval_control_steps: 1048576
+  suite_path: ../evaluation/fixed_self_stabilize_v2.yaml
+  execution:
+    mode: subprocess
+    max_in_flight: 2
+    pending_policy: latest
+    pin_checkpoint: hardlink
+    wait_for_final: true
+    failure_policy: continue_training
+
+checkpoint:
+  minimum_free_space_bytes: 8589934592
+  resume:
+    from: ../../runs/mlp_sac_upright_height_only_small_tip_stability_v8/20260730T082124Z_8d0af2ceaa4d_459d9666/checkpoints/step_16777216.pt
+    mode: continuation
+  interval_control_steps: 524288
+  keep_last: 4
+
+recording: {}

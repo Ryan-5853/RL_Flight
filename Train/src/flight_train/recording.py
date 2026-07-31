@@ -140,6 +140,23 @@ class RunRecorder:
             "checkpoint_minimum_free_space_bytes": (
                 config.checkpoint.minimum_free_space_bytes
             ),
+            "evaluation_enabled": config.evaluation.enabled,
+            "evaluation_interval_control_steps": (
+                config.evaluation.interval_control_steps
+            ),
+            "evaluation_execution_mode": config.evaluation.execution.mode,
+            "evaluation_max_in_flight": (
+                config.evaluation.execution.max_in_flight
+            ),
+            "evaluation_pending_policy": (
+                config.evaluation.execution.pending_policy
+            ),
+            "evaluation_wait_for_final": (
+                config.evaluation.execution.wait_for_final
+            ),
+            "evaluation_failure_policy": (
+                config.evaluation.execution.failure_policy
+            ),
         }
         self._manifest_path.write_text(
             json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
@@ -198,6 +215,31 @@ class RunRecorder:
                 for name, values in report["scenarios"].items()
             },
         }
+        path = self.directory / "evaluations.jsonl"
+        line = json.dumps(record, ensure_ascii=False) + "\n"
+        self.ensure_checkpoint_capacity(
+            self._checkpoint_size_estimate + len(line.encode("utf-8"))
+        )
+        with path.open("a", encoding="utf-8") as output:
+            output.write(line)
+
+    def evaluation_failure(
+        self,
+        control_steps: int,
+        *,
+        error: str,
+        detail: str | None = None,
+    ) -> None:
+        """Record an asynchronous evaluation failure without stopping training."""
+
+        record: dict[str, Any] = {
+            "global_control_steps": control_steps,
+            "utc": datetime.now(timezone.utc).isoformat(),
+            "status": "failed",
+            "error": error,
+        }
+        if detail:
+            record["detail"] = detail
         path = self.directory / "evaluations.jsonl"
         line = json.dumps(record, ensure_ascii=False) + "\n"
         self.ensure_checkpoint_capacity(

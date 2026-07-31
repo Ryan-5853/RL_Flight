@@ -278,8 +278,14 @@ class FrameworkAcceptanceTests(unittest.TestCase):
             )
             first_metrics = json.loads((first["run_directory"] / "metrics.jsonl").read_text().splitlines()[0])
             second_metrics = json.loads((second["run_directory"] / "metrics.jsonl").read_text().splitlines()[0])
-            first_metrics.pop("utc")
-            second_metrics.pop("utc")
+            for runtime_key in (
+                "utc",
+                "timing_collect_s",
+                "timing_update_s",
+                "sampling_steps_per_second",
+            ):
+                first_metrics.pop(runtime_key)
+                second_metrics.pop(runtime_key)
             self.assertEqual(first_metrics, second_metrics)
 
     def test_07_exact_restore_tensor_identity(self):
@@ -342,8 +348,14 @@ class FrameworkAcceptanceTests(unittest.TestCase):
             resumed_metrics = json.loads(
                 (resumed["run_directory"] / "metrics.jsonl").read_text().splitlines()[-1]
             )
-            continuous_metrics.pop("utc")
-            resumed_metrics.pop("utc")
+            for runtime_key in (
+                "utc",
+                "timing_collect_s",
+                "timing_update_s",
+                "sampling_steps_per_second",
+            ):
+                continuous_metrics.pop(runtime_key)
+                resumed_metrics.pop(runtime_key)
             self.assertEqual(continuous_metrics, resumed_metrics)
             manifest = json.loads((resumed["run_directory"] / "manifest.json").read_text())
             self.assertTrue(manifest["exact_resume_supported"])
@@ -430,6 +442,9 @@ class FrameworkAcceptanceTests(unittest.TestCase):
             self.assertTrue(metric_lines)
             metrics = json.loads(metric_lines[-1])
             for key in (
+                "timing_collect_s",
+                "timing_update_s",
+                "sampling_steps_per_second",
                 "terminated_fraction",
                 "truncated_fraction",
                 "done_fraction",
@@ -444,6 +459,11 @@ class FrameworkAcceptanceTests(unittest.TestCase):
                 "action_saturation_fraction",
                 "completed_episode_length_mean_steps",
                 "completed_episode_survival_mean_s",
+                "reward.joint_tracking_mean",
+                "joint_roll_pitch_cost_mean",
+                "joint_yaw_rate_cost_mean",
+                "joint_roll_pitch_dominant_fraction",
+                "joint_yaw_rate_dominant_fraction",
             ):
                 self.assertIn(key, metrics)
             checkpoint = next((run_dir / "checkpoints").glob("*.pt"))

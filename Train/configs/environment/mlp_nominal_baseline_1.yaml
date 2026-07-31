@@ -27,8 +27,8 @@ parallel:
   independent_rng: true            # 必须为 true；并行数量/device/dtype 由 create(...) 指定
 
 timing:
-  physics_hz: {value: 5000}        # 物理频率，正整数，不允许随机化
-  control_hz: {value: 500}         # 控制频率，正整数；必须整除 physics_hz
+  physics_hz: {value: 500}         # 固定 500 Hz 仿真时基，不允许随机化
+  control_hz: {value: 500}         # 固定 500 Hz；每次 advance 推进一个 2 ms 步
 
 initial_state:
   position_n: {value: [0.0, 0.0, 0.0]}         # 质心 NED 位置 [北,东,地]，m
@@ -121,25 +121,27 @@ aerodynamics:
       - [0.10, 0.10, 0.0]
 
 # 当前只允许 gyro、accelerometer、motor_speed；可删去不需要的传感器，但至少保留一个。
-# sample_hz 必须 > 0 且能整除 physics_hz。若 delay*physics_hz 不是整数，必须增加：
+# sample_hz 必须 > 0 且能整除 500 Hz。若 delay*500 不是整数，必须增加：
 # interpolation: linear
 sensors:
   gyro:
-    sample_hz: {value: 5000}      # Hz
+    sample_hz: {value: 500}       # Hz
     noise:
       distribution: normal
       stddev: {value: [0.002, 0.002, 0.002]} # [x,y,z]，rad/s
     bias: {value: [0.0, 0.0, 0.0]}           # [x,y,z]，rad/s
-    delay: {value: 0.001}         # s；固定延迟，此处为 5 个物理步
+    delay: {value: 0.001}         # s；固定延迟，此处为 0.5 个仿真步
+    interpolation: linear
   accelerometer:
-    sample_hz: {value: 5000}      # Hz；理想值为机体系比力，不包含重力直接读数
+    sample_hz: {value: 500}       # Hz；理想值为机体系比力，不包含重力直接读数
     noise:
       distribution: normal
       stddev: {value: [0.02, 0.02, 0.02]} # [x,y,z]，m/s²
     bias: {value: [0.0, 0.0, 0.0]}       # [x,y,z]，m/s²
     delay: {value: 0.001}
+    interpolation: linear
   motor_speed:
-    sample_hz: {value: 5000}      # Hz
+    sample_hz: {value: 500}       # Hz
     noise:
       distribution: normal
       stddev: {value: [2.0, 2.0]} # [上桨,下桨]，rad/s
@@ -148,12 +150,12 @@ sensors:
 
 logging:
   directory: ../logs              # 相对路径以配置文件目录为基准；每次 create 会新建 batch_id 子目录
-  # 16384 路长训练使用 compact：物理层 5000 Hz 每 200 步取 1 步，即保存
+  # 16384 路长训练使用 compact：500 Hz 仿真时间线每 20 步取 1 步，即保存
   # 25 Hz 诊断时间线。总累计样本仍为 268,435,456，因此保持该采样间隔即可
   # 控制训练日志体积；固定评测仍另存控制级轨迹。25 Hz 足以排查姿态
   # 发散和电机/舵机慢趋势，初始化、reset、精确恢复事件仍强制保存。
   mode: compact
-  physics_step_stride: 200
+  physics_step_stride: 20
   fields:                         # 只保留训练诊断和实例追溯所需字段
     - physics_step
     - control_step

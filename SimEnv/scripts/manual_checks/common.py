@@ -38,10 +38,13 @@ def _remove_randomization(node: Any) -> None:
 def deterministic_config(
     log_directory: Path,
     *,
-    physics_hz: int = 100,
+    physics_hz: int = 500,
     control_hz: int | None = None,
 ) -> dict[str, Any]:
     """Load the example topology and remove every source of randomness."""
+
+    if physics_hz != 500 or (control_hz is not None and control_hz != 500):
+        raise ValueError("SimEnv manual checks require the fixed 500 Hz timebase")
 
     with (REPO_ROOT / "configs" / "example.yaml").open("r", encoding="utf-8") as stream:
         config = yaml.safe_load(stream)
@@ -49,7 +52,7 @@ def deterministic_config(
     _remove_randomization(config)
     config["seed"] = 1
     value(config["timing"]["physics_hz"], physics_hz)
-    value(config["timing"]["control_hz"], control_hz or physics_hz)
+    value(config["timing"]["control_hz"], 500)
     config["logging"]["directory"] = str(log_directory)
     config["logging"]["mode"] = "compact"
     config["logging"]["physics_step_stride"] = 1000
@@ -176,16 +179,25 @@ def rotate_world_to_body(q_wb: torch.Tensor, vector_n: torch.Tensor) -> torch.Te
 def integrate_quaternion(
     q_wb: torch.Tensor, angular_velocity_b: torch.Tensor, dt: float
 ) -> torch.Tensor:
+    angular_speed = torch.linalg.vector_norm(angular_velocity_b)
+    half_angle = 0.5 * dt * angular_speed
+    if angular_speed.item() == 0.0:
+        delta_vector = 0.5 * dt * angular_velocity_b
+    else:
+        delta_vector = (
+            torch.sin(half_angle) / angular_speed * angular_velocity_b
+        )
+    delta_scalar = torch.cos(half_angle).reshape(1)
     scalar = q_wb[:1]
     vector = q_wb[1:]
-    q_dot = torch.cat(
+    candidate = torch.cat(
         (
-            -(vector * angular_velocity_b).sum().reshape(1),
-            scalar * angular_velocity_b
-            + torch.linalg.cross(vector, angular_velocity_b),
+            scalar * delta_scalar - (vector * delta_vector).sum().reshape(1),
+            scalar * delta_vector
+            + delta_scalar * vector
+            + torch.linalg.cross(vector, delta_vector),
         )
     )
-    candidate = q_wb + 0.5 * dt * q_dot
     return candidate / torch.linalg.vector_norm(candidate)
 
 
@@ -200,4 +212,3 @@ def assert_close(
         torch.testing.assert_close(actual, expected, rtol=2.0e-5, atol=atol)
     except AssertionError as error:
         raise AssertionError(f"{label} failed:\n{error}") from error
-

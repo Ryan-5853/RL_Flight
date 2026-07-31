@@ -1,0 +1,233 @@
+# 256×256 MLP-SAC：稠密全历史、非补偿式双轴奖励的最后一轮直接 RL。
+#
+# 相对 stability_v7：
+#   1. 保留原来最长 120 ms 的历史覆盖，但把所有 61 个 500 Hz 完整观测帧
+#      连续交给 MLP；不再对物理响应每 4 步跳采样，输入由 314 维变为 1281 维；
+#   2. 主跟踪奖励不再线性相加 roll/pitch 与 yaw，而取两项归一化 Huber 代价
+#      的最大值。较好的一轴不能抵消较差的一轴，当前较差轴决定主奖励变化；
+#   3. 关闭旧的 roll_pitch、tilt、yaw-rate 独立跟踪项，避免绕过联合目标；
+#   4. 从头直接训练。v7 的 314 维 actor 与新的 1281 维输入不兼容，也不再
+#      使用会把策略锁在单轴局部盆地中的 policy anchor；
+#   5. SAC actor 改为可学习方差，提高初始/最低动作标准差与 entropy alpha，
+#      让四个动作维持续探索，同时由较宽但有界的最大方差防止失控；
+#   6. 为控制 1281 维双观测 replay 的显存和 checkpoint 体积，将容量缩至
+#      524288 transition；这与 v7 的 2097152×314 维主体存储量基本相当。
+#
+# 120 ms = 60 control steps，覆盖最长 50 ms 执行器时间常数的 2.4 倍；
+# 61 帧包含 t-60 ... t 的每一个控制时刻。
+#
+# 启动：
+#   flight-train run \
+#     --config configs/experiments/mlp_sac_upright_height_only_small_tip_stability_v8.yaml
+
+schema_version: 2
+
+experiment:
+  name: mlp_sac_upright_height_only_small_tip_stability_v8
+  entrypoint:
+    type: "flight_train.runner:run_experiment"
+    version: "train-framework-v1"
+
+seed:
+  base: 20260730
+  deterministic_algorithms: true
+  cudnn_benchmark: false
+
+run:
+  device: cuda:0
+  dtype: float32
+  parallel_count: 256
+  total_control_steps: 16777216
+  output_root: ../../runs
+  allow_unimplemented_simulator: false
+
+environment:
+  factory: "simenv:SimulationEnvironment"
+  config_path: ../environment/gru_sac_upright_height_only_small_tip.yaml
+  observation_source: truth
+
+command_source:
+  type: "flight_train.commands:VirtualPilotCommandSource"
+  version: "2"
+  seed: 52030
+  params:
+    throttle:
+      minimum: 0.20
+      maximum: 0.85
+      spool:
+        duration_s: 0.10
+        target_range: [0.54, 0.58]
+      height_controller:
+        observation_source: truth
+        target_m: 0.0
+        initial_throttle_range: [0.55, 0.58]
+        proportional_gain: 0.08
+        integral_gain: 0.04
+        error_limit_m: 5.0
+      slew_rate:
+        rise_per_s: 4.0
+        fall_per_s: 0.35
+    sticks:
+      roll:  {mode: angle, limit_rad: 0.0, time_constant_s: 0.20}
+      pitch: {mode: angle, limit_rad: 0.0, time_constant_s: 0.20}
+      yaw:   {mode: rate, limit_rad_s: 0.0, time_constant_s: 0.30}
+      target_sampling:
+        distribution: centered
+        center_exponent: 2.0
+        hold_duration_s:
+          range: [2.0, 4.0]
+      reset:
+        filtered_stick: zero
+        initial_target_scale: 0.0
+
+control_contract:
+  version: self_stabilize_v1
+  observation_profile: attitude_self_stabilize_21d_v3
+  # 稠密 120 ms 全历史：61×21=1281 维，oldest -> current，stride=1。
+  observation_history:
+    mode: uniform
+    frames: 61
+    stride_steps: 1
+  action_transform:
+    type: residual_around_trim
+    trim_command: [0.53523, 0.0, 0.0, 0.0]
+    residual_scale: [0.30, 1.0, 1.0, 1.0]
+  policy_action:
+    fields: [lower_motor, servo_1, servo_2, servo_3]
+  external_action:
+    fields: [upper_motor]
+  simulator_command:
+    fields: [upper_motor, lower_motor, servo_1, servo_2, servo_3]
+
+randomization:
+  static:
+    seed: 32030
+    scope: episode
+    parameters: {}
+  dynamic:
+    seed: 42030
+    scope: simulator
+    parameters: {}
+
+task:
+  episode_duration_s: 30.0
+  episode_curriculum:
+    durations_s:   [2.5, 3.5, 5.0, 10.0, 30.0]
+    target_scales: [0.0, 0.0, 0.0,  0.0,  0.0]
+    success_fraction: 0.80
+    evaluation_episodes_per_env: 1.0
+    consecutive_passes: 2
+    quality_gate:
+      max_roll_pitch_rmse_rad: 0.17453292519943295
+      max_yaw_rate_rmse_rad_s: 1.0
+  termination:
+    max_tilt_rad: 1.0
+    max_angular_rate_rad_s: 8.0
+    # yaw 不触发硬终止，否则高 yaw 样本会被截断，联合奖励看不到改善过程。
+    angular_rate_axes: roll_pitch
+
+reward:
+  calculator:
+    type: "flight_train.rewards.attitude:AttitudeRewardCalculator"
+    version: "3"
+    params:
+      # 旧的三项独立姿态跟踪必须保持为 0；构造器也会拒绝与 joint 同时启用。
+      roll_pitch_weight: 0.0
+      tilt_weight: 0.0
+      yaw_rate_weight: 0.0
+
+      # c_rp = huber(||[roll,pitch]|| / 10deg)
+      # c_yaw = huber(|yaw-rate error| / 1rad/s)
+      # reward_joint = -0.01 * max(c_rp, c_yaw)
+      #
+      # max 是非补偿式 worst-axis 聚合：只有两轴都进入好区间，主跟踪奖励
+      # 才会接近最优；一轴已经较好时，继续优化它不会掩盖另一轴的坏结果。
+      joint_tracking_weight: 0.01
+      joint_roll_pitch_scale_rad: 0.17453292519943295
+      joint_yaw_rate_scale_rad_s: 1.0
+      joint_tracking_huber_delta: 1.0
+
+      # 小幅 p/q 阻尼和动作正则只负责动态/执行器质量，不重复定义姿态目标。
+      angular_rate_weight: 0.00015625
+      action_rate_weight: 0.001
+      saturation_weight: 0.01
+      alive_bonus: 0.02
+      survival_progress_weight: 0.0
+
+      # 安全 barrier 只在接近硬终止边界时介入。
+      tilt_barrier_weight: 0.01
+      rate_barrier_weight: 0.001
+      barrier_start_fraction: 0.50
+      barrier_exponent: 2.0
+
+      termination_penalty: 10.0
+      early_termination_penalty: 10.0
+  context:
+    fields:
+      - {name: attitude_geodesic_rad, source: task}
+      - {name: angular_velocity_b, source: truth}
+      - {name: static_domain, source: train_randomizer, visibility: reward_only}
+
+model:
+  type: mlp_actor_critic
+  hidden_sizes: [256, 256]
+  policy_distribution:
+    # v7 是固定 0.035~0.04；v8 允许 actor 在边界内学习并持续保持探索。
+    learnable_action_std: true
+    initial_action_std: [0.10, 0.10, 0.10, 0.10]
+    minimum_action_std: [0.025, 0.025, 0.025, 0.025]
+    maximum_action_std: [0.20, 0.20, 0.20, 0.20]
+
+algorithm:
+  name: sac
+  gamma: 0.999
+  n_step_return: 16
+  replay:
+    capacity_transitions: 524288
+    warmup_transitions: 131072
+    batch_size: 4096
+  # 新输入、新 reward、无旧 actor：先让双 Q 拟合随机探索数据，再放开 actor。
+  critic_pretraining_updates: 2048
+  actor_update_interval: 2
+  policy_anchor:
+    weight: 0.0
+    max_action_deviation: 0.0
+  updates_per_collection: 64
+  target_update:
+    tau: 0.0025
+    interval_updates: 1
+  entropy:
+    automatic: true
+    initial_alpha: 0.01
+    target_entropy: -4.0
+    min_alpha: 0.001
+    max_alpha: 0.05
+  actor_max_grad_norm: 1.0
+  critic_max_grad_norm: 2.5
+  optimizer:
+    type: adam
+    actor_learning_rate: 0.00003
+    critic_learning_rate: 0.0002
+    alpha_learning_rate: 0.0001
+
+collector:
+  control_steps_per_rollout: 512
+
+evaluation:
+  enabled: true
+  interval_control_steps: 1048576
+  suite_path: ../evaluation/fixed_self_stabilize_v2.yaml
+  execution:
+    mode: subprocess
+    max_in_flight: 4
+    pending_policy: latest
+    pin_checkpoint: hardlink
+    wait_for_final: true
+    failure_policy: continue_training
+
+checkpoint:
+  minimum_free_space_bytes: 8589934592
+  interval_control_steps: 524288
+  keep_last: 4
+
+recording: {}

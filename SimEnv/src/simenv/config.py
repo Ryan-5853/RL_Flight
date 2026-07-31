@@ -19,6 +19,9 @@ class TimingConfig:
     substeps: int
 
 
+SIMULATION_HZ = 500
+
+
 @dataclass(frozen=True)
 class LoggingConfig:
     directory: Path
@@ -61,12 +64,17 @@ def load_and_materialize(
     timing_node = _mapping(raw, "timing")
     physics_hz = _structural_int(timing_node.get("physics_hz"), "timing.physics_hz")
     control_hz = _structural_int(timing_node.get("control_hz"), "timing.control_hz")
-    _require(physics_hz > 0 and control_hz > 0, "timing frequencies must be positive")
     _require(
-        physics_hz % control_hz == 0,
-        "timing.physics_hz / timing.control_hz must be a positive integer",
+        physics_hz == SIMULATION_HZ and control_hz == SIMULATION_HZ,
+        "timing.physics_hz and timing.control_hz must both equal 500 for "
+        "single-step simulation",
     )
-    timing = TimingConfig(physics_hz, control_hz, 1.0 / physics_hz, physics_hz // control_hz)
+    timing = TimingConfig(
+        physics_hz,
+        control_hz,
+        1.0 / SIMULATION_HZ,
+        1,
+    )
     logging = _logging_config(raw.get("logging", {}), path.parent)
     randomizer = ParameterRandomizer(seed, parallel_count, device, dtype)
 

@@ -27,8 +27,8 @@ parallel:
   independent_rng: true            # 必须为 true；并行数量/device/dtype 由 create(...) 指定
 
 timing:
-  physics_hz: {value: 5000}        # 物理频率，正整数，不允许随机化
-  control_hz: {value: 500}         # 控制频率，正整数；必须整除 physics_hz
+  physics_hz: {value: 500}         # 固定 500 Hz 仿真时基，不允许随机化
+  control_hz: {value: 500}         # 固定 500 Hz；advance 每次只推进一个 2 ms 步
 
 initial_state:
   position_n: {value: [0.0, 0.0, 0.0]}         # 质心 NED 位置 [北,东,地]，m
@@ -125,21 +125,23 @@ aerodynamics:
 # interpolation: linear
 sensors:
   gyro:
-    sample_hz: {value: 5000}      # Hz
+    sample_hz: {value: 500}       # Hz
     noise:
       distribution: normal
       stddev: {value: [0.002, 0.002, 0.002]} # [x,y,z]，rad/s
     bias: {value: [0.0, 0.0, 0.0]}           # [x,y,z]，rad/s
-    delay: {value: 0.001}         # s；固定延迟，此处为 5 个物理步
+    delay: {value: 0.001}         # s；固定延迟，此处为 0.5 个仿真步
+    interpolation: linear         # 分数步延迟必须显式线性插值
   accelerometer:
-    sample_hz: {value: 5000}      # Hz；理想值为机体系比力，不包含重力直接读数
+    sample_hz: {value: 500}       # Hz；理想值为机体系比力，不包含重力直接读数
     noise:
       distribution: normal
       stddev: {value: [0.02, 0.02, 0.02]} # [x,y,z]，m/s²
     bias: {value: [0.0, 0.0, 0.0]}       # [x,y,z]，m/s²
     delay: {value: 0.001}
+    interpolation: linear
   motor_speed:
-    sample_hz: {value: 5000}      # Hz
+    sample_hz: {value: 500}       # Hz
     noise:
       distribution: normal
       stddev: {value: [2.0, 2.0]} # [上桨,下桨]，rad/s
@@ -148,8 +150,8 @@ sensors:
 
 logging:
   directory: ../logs              # 相对路径以配置文件目录为基准；每次 create 会新建 batch_id 子目录
-  mode: full                      # full：每个物理步全字段；compact：允许降采样/字段裁剪
-  physics_step_stride: 1          # 普通物理日志每隔多少步保存；初始化/reset/resume 始终保存
+  mode: full                      # full：每个 500 Hz 仿真步全字段；compact：允许降采样/字段裁剪
+  physics_step_stride: 1          # 普通仿真日志每隔多少步保存；初始化/reset/resume 始终保存
   # fields: [physics_step, control_step, control, event_code, truth.position_n]
   chunk_steps: 1024               # 单个 timeline_*.pt 的最大“已记录”时间步数
   queue_chunks: 2                 # 后台写线程队列容量，必须 > 0

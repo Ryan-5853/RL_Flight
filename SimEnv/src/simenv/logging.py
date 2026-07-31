@@ -26,6 +26,7 @@ class TensorChunkLogger:
         config_path: Path,
         raw_config: Mapping[str, Any],
         parameters: Mapping[str, torch.Tensor],
+        simulation_hz: int = 500,
     ) -> None:
         self.directory = config.directory / batch_id
         self.directory.mkdir(parents=True, exist_ok=False)
@@ -56,6 +57,12 @@ class TensorChunkLogger:
                 "instance_ids": instance_ids,
                 "schema_version": raw_config.get("schema_version"),
                 "logging_mode": config.mode,
+                "simulation_hz": simulation_hz,
+                "simulation_step_s": 1.0 / simulation_hz,
+                "timeline_step_semantics": (
+                    "physics_step and control_step are the same "
+                    f"{simulation_hz} Hz single-step clock"
+                ),
                 "physics_step_stride": config.physics_step_stride,
                 "timeline_fields": (
                     list(config.fields) if config.fields is not None else "all"

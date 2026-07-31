@@ -1,0 +1,218 @@
+# 256×256 MLP-SAC：修复 policy warm start 方差污染后，保守进入小范围指令跟踪。
+#
+# v1 失败原因与 v2 对策：
+#   1. policy resume 曾把 v9 checkpoint 的 std buffer 一并恢复，导致实际探索
+#      std 保持在约 0.12；v2 依赖修复后的 warm-start 语义，均值继承、方差重置。
+#   2. 新 critic 解冻 actor 时没有锚点；v2 使用 weight=10、允许偏差 0.05，
+#      防止 actor 利用早期 Q 误差突然离开已验证的稳定策略。
+#   3. actor 更新频率减半、学习率减半，相比 v1 将均值策略漂移速度约降至 1/4。
+#   4. critic 预训练阶段不再只看零指令：stage 0 使用 5% 包线，随后逐步放开。
+#   5. 前期固定评测间隔缩短到 524288 步，确保 actor 解冻后能尽快发现退化。
+#
+# 启动：
+#   flight-train run \
+#     --config configs/experiments/mlp_sac_attitude_command_tracking_v2.yaml
+
+schema_version: 2
+
+experiment:
+  name: mlp_sac_attitude_command_tracking_v2
+  entrypoint:
+    type: "flight_train.runner:run_experiment"
+    version: "train-framework-v1"
+
+seed:
+  base: 20260801
+  deterministic_algorithms: true
+  cudnn_benchmark: false
+
+run:
+  device: cuda:0
+  dtype: float32
+  parallel_count: 256
+  total_control_steps: 16777216
+  output_root: ../../runs
+  allow_unimplemented_simulator: false
+
+environment:
+  factory: "simenv:SimulationEnvironment"
+  config_path: ../environment/gru_sac_upright_height_only_small_tip.yaml
+  observation_source: truth
+
+command_source:
+  type: "flight_train.commands:VirtualPilotCommandSource"
+  version: "2"
+  seed: 52032
+  params:
+    throttle:
+      minimum: 0.20
+      maximum: 0.85
+      spool:
+        duration_s: 0.10
+        target_range: [0.54, 0.58]
+      height_controller:
+        observation_source: truth
+        target_m: 0.0
+        initial_throttle_range: [0.55, 0.58]
+        proportional_gain: 0.08
+        integral_gain: 0.04
+        error_limit_m: 5.0
+      slew_rate:
+        rise_per_s: 4.0
+        fall_per_s: 0.35
+    sticks:
+      roll:  {mode: angle, limit_rad: 0.10, time_constant_s: 0.20}
+      pitch: {mode: angle, limit_rad: 0.10, time_constant_s: 0.20}
+      yaw:   {mode: rate, limit_rad_s: 0.35, time_constant_s: 0.30}
+      target_sampling:
+        distribution: centered
+        center_exponent: 2.0
+        hold_duration_s:
+          range: [2.0, 4.0]
+      reset:
+        filtered_stick: zero
+        initial_target_scale: 0.0
+
+control_contract:
+  version: self_stabilize_v1
+  observation_profile: attitude_self_stabilize_21d_v3
+  observation_history:
+    mode: uniform
+    frames: 61
+    stride_steps: 1
+  action_transform:
+    # 只扩展目标指令，不改变 v9 已验证的执行器动作映射。
+    type: residual_around_trim
+    trim_command: [0.53523, 0.0, 0.0, 0.0]
+    residual_scale: [0.30, 1.0, 1.0, 1.0]
+  policy_action:
+    fields: [lower_motor, servo_1, servo_2, servo_3]
+  external_action:
+    fields: [upper_motor]
+  simulator_command:
+    fields: [upper_motor, lower_motor, servo_1, servo_2, servo_3]
+
+randomization:
+  static:
+    seed: 32032
+    scope: episode
+    parameters: {}
+  dynamic:
+    seed: 42032
+    scope: simulator
+    parameters: {}
+
+task:
+  episode_duration_s: 30.0
+  episode_curriculum:
+    # actor 冻结期间先让 critic 看 5% 小指令，避免只拟合零指令状态分布。
+    durations_s:   [5.0,  10.0, 20.0, 30.0, 30.0, 30.0]
+    target_scales: [0.05, 0.10, 0.25, 0.50, 0.75, 1.00]
+    success_fraction: 0.80
+    evaluation_episodes_per_env: 1.0
+    consecutive_passes: 2
+    quality_gate:
+      max_roll_pitch_rmse_rad: 0.04363323129985824  # 2.5deg
+      max_yaw_rate_rmse_rad_s: 0.12
+  termination:
+    max_tilt_rad: 1.0
+    max_angular_rate_rad_s: 8.0
+    angular_rate_axes: roll_pitch
+
+reward:
+  calculator:
+    type: "flight_train.rewards.attitude:AttitudeRewardCalculator"
+    version: "3"
+    params:
+      roll_pitch_weight: 0.0
+      tilt_weight: 0.0
+      yaw_rate_weight: 0.0
+
+      joint_tracking_weight: 0.01
+      joint_roll_pitch_scale_rad: 0.08726646259971647
+      joint_yaw_rate_scale_rad_s: 0.35
+      joint_tracking_huber_delta: 1.0
+
+      angular_rate_weight: 0.00015625
+      action_rate_weight: 0.001
+      saturation_weight: 0.01
+      alive_bonus: 0.02
+      survival_progress_weight: 0.0
+
+      tilt_barrier_weight: 0.01
+      rate_barrier_weight: 0.001
+      barrier_start_fraction: 0.50
+      barrier_exponent: 2.0
+
+      termination_penalty: 10.0
+      early_termination_penalty: 10.0
+  context:
+    fields:
+      - {name: attitude_geodesic_rad, source: task}
+      - {name: angular_velocity_b, source: truth}
+      - {name: static_domain, source: train_randomizer, visibility: reward_only}
+
+model:
+  type: mlp_actor_critic
+  hidden_sizes: [256, 256]
+  policy_distribution:
+    learnable_action_std: true
+    initial_action_std: [0.04, 0.05, 0.05, 0.05]
+    minimum_action_std: [0.01, 0.015, 0.015, 0.015]
+    maximum_action_std: [0.06, 0.08, 0.08, 0.08]
+
+algorithm:
+  name: sac
+  gamma: 0.999
+  n_step_return: 16
+  replay:
+    capacity_transitions: 524288
+    warmup_transitions: 131072
+    batch_size: 4096
+  critic_pretraining_updates: 2048
+  actor_update_interval: 8
+  policy_anchor:
+    weight: 10.0
+    max_action_deviation: 0.05
+  updates_per_collection: 64
+  target_update:
+    tau: 0.0025
+    interval_updates: 1
+  entropy:
+    automatic: true
+    initial_alpha: 0.001
+    target_entropy: -4.0
+    min_alpha: 0.0001
+    max_alpha: 0.005
+  actor_max_grad_norm: 1.0
+  critic_max_grad_norm: 2.5
+  optimizer:
+    type: adam
+    actor_learning_rate: 0.000015
+    critic_learning_rate: 0.0002
+    alpha_learning_rate: 0.0001
+
+collector:
+  control_steps_per_rollout: 512
+
+evaluation:
+  enabled: true
+  interval_control_steps: 524288
+  suite_path: ../evaluation/fixed_small_command_tracking_v1.yaml
+  execution:
+    mode: subprocess
+    max_in_flight: 2
+    pending_policy: latest
+    pin_checkpoint: hardlink
+    wait_for_final: true
+    failure_policy: continue_training
+
+checkpoint:
+  minimum_free_space_bytes: 8589934592
+  resume:
+    from: ../../runs/mlp_sac_upright_height_only_small_tip_stability_v9/20260730T093659Z_8d05d4a70b4d_28414d80/checkpoints/best_fixed_evaluation.pt
+    mode: policy
+  interval_control_steps: 524288
+  keep_last: 4
+
+recording: {}

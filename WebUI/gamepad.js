@@ -3,7 +3,9 @@
 
   const $ = (selector) => document.querySelector(selector);
   const $$ = (selector) => [...document.querySelectorAll(selector)];
-  const STORAGE_KEY = 'rl-flight.gamepad.v1';
+  // v2 明确采用飞行姿态约定：右杆向前/上为负 Pitch（低头）。
+  // 不复用 v1 的已校准方向，避免旧向导保存的正 Pitch=推杆继续反向。
+  const STORAGE_KEY = 'rl-flight.gamepad.v2';
   // Mode 2 遥控器布局：左杆 X/Y 为偏航/油门，右杆 X/Y 为横滚/俯仰。
   const DEFAULT_MAPPING = { roll: 2, pitch: 3, yaw: 0, throttle: 1 };
   const DEFAULT_INVERTED = { roll: false, pitch: false, yaw: false, throttle: true };
@@ -12,8 +14,8 @@
     { channel: 'throttle', endpoint: 'negative', heading: '将左侧油门拉到最小', description: '保持油门杆在最低位置，然后采集。' },
     { channel: 'yaw', endpoint: 'negative', heading: '将左侧偏航推到左极限', description: '保持左杆在最左位置，然后采集。' },
     { channel: 'yaw', endpoint: 'positive', heading: '将左侧偏航推到右极限', description: '保持左杆在最右位置，然后采集。' },
-    { channel: 'pitch', endpoint: 'positive', heading: '将右侧俯仰推到上极限', description: '保持右杆在最上位置，然后采集。' },
-    { channel: 'pitch', endpoint: 'negative', heading: '将右侧俯仰拉到下极限', description: '保持右杆在最下位置，然后采集。' },
+    { channel: 'pitch', endpoint: 'negative', heading: '将右侧俯仰向前推到上极限', description: '保持右杆在最上位置；该方向对应负 Pitch、机头下俯。' },
+    { channel: 'pitch', endpoint: 'positive', heading: '将右侧俯仰向后拉到下极限', description: '保持右杆在最下位置；该方向对应正 Pitch、机头上仰。' },
     { channel: 'roll', endpoint: 'negative', heading: '将右侧横滚推到左极限', description: '保持右杆在最左位置，然后采集。' },
     { channel: 'roll', endpoint: 'positive', heading: '将右侧横滚推到右极限', description: '保持右杆在最右位置，然后采集。' }
   ];
@@ -28,7 +30,8 @@
     frame: emptyFrame(),
     wizardStep: 0,
     captures: {},
-    calibrationBackup: null
+    calibrationBackup: null,
+    lastPollEpochMs: null
   };
 
   function emptyFrame() {
@@ -166,6 +169,12 @@
   }
 
   function updateFrame(gamepad) {
+    const capturedPerfMs = performance.now();
+    const capturedEpochMs = performance.timeOrigin + capturedPerfMs;
+    const pollIntervalMs = Number.isFinite(controller.lastPollEpochMs)
+      ? Math.max(0, capturedEpochMs - controller.lastPollEpochMs)
+      : null;
+    controller.lastPollEpochMs = capturedEpochMs;
     const axes = gamepad.axes.map((value, index) => normalizeAxis(value, controller.calibration?.[index], controller.deadzone));
     const channels = {};
     Object.keys(DEFAULT_MAPPING).forEach(channel => {
@@ -176,7 +185,13 @@
       connected: true,
       id: gamepad.id,
       index: gamepad.index,
-      timestamp: performance.now(),
+      timestamp: capturedPerfMs,
+      captured_epoch_ms: capturedEpochMs,
+      gamepad_poll_interval_ms: pollIntervalMs,
+      hardware_updated_epoch_ms: Number.isFinite(gamepad.timestamp) && gamepad.timestamp > 0
+        ? performance.timeOrigin + gamepad.timestamp
+        : null,
+      input_source: 'gamepad',
       sequence: controller.frame.sequence + 1,
       axes,
       buttons: gamepad.buttons.map(button => ({ value: button.value, pressed: button.pressed, touched: button.touched })),
@@ -190,7 +205,8 @@
 
   function updateMonitor({ roll, pitch, yaw, throttle }) {
     $('#leftStickDot').style.transform = `translate(${yaw * 18}px, ${-throttle * 18}px)`;
-    $('#rightStickDot').style.transform = `translate(${roll * 18}px, ${-pitch * 18}px)`;
+    // 负 Pitch 表示推杆低头，因此逻辑负值仍应把屏幕摇杆点画到上方。
+    $('#rightStickDot').style.transform = `translate(${roll * 18}px, ${pitch * 18}px)`;
     const signed = value => `${value >= 0 ? '+' : ''}${value.toFixed(2)}`;
     $('#controllerAxesReadout').innerHTML = `R ${signed(roll)}&nbsp; P ${signed(pitch)}<br>Y ${signed(yaw)}&nbsp; T ${signed(throttle)}`;
   }

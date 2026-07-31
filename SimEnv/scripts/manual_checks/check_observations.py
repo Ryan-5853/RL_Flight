@@ -187,15 +187,15 @@ def run() -> None:
             "zero delay",
             inputs,
             inputs,
-            sample_hz=100,
+            sample_hz=500,
             delay=0.0,
         )
         gyro_sequence(
             root,
-            "50 Hz sample/hold",
+            "250 Hz sample/hold",
             inputs,
             [0.0, 20.0, 20.0, 40.0],
-            sample_hz=50,
+            sample_hz=250,
             delay=0.0,
         )
         gyro_sequence(
@@ -203,16 +203,16 @@ def run() -> None:
             "two-step delay",
             inputs,
             [0.0, 0.0, 10.0, 20.0],
-            sample_hz=100,
-            delay=0.02,
+            sample_hz=500,
+            delay=0.004,
         )
         gyro_sequence(
             root,
             "1.5-step delay",
             inputs,
             [0.0, 5.0, 15.0, 25.0],
-            sample_hz=100,
-            delay=0.015,
+            sample_hz=500,
+            delay=0.003,
             interpolation="linear",
         )
     print(

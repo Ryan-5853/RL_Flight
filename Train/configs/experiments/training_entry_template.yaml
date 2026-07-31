@@ -285,8 +285,22 @@ collector:
   # MLP 可自由选择；GRU 时必须能被 sequence_length 整除。
   control_steps_per_rollout: 256
 
-# evaluation/recording 仍是预留调度接口；checkpoint 已由 runner 实际消费。
+# 空映射关闭固定评测。启用时 interval_control_steps 必须是 checkpoint
+# interval_control_steps 的整数倍。若评测明显慢于训练，推荐使用下方的单 worker
+# subprocess 模式；它与训练共享 device，忙时只保留最新待评测 checkpoint。
 evaluation: {}
+# evaluation:
+#   enabled: true
+#   interval_control_steps: 1048576
+#   suite_path: ../evaluation/fixed_self_stabilize_v2.yaml
+#   execution:
+#     mode: subprocess
+#     # 允许 1..8；应按 GPU、磁盘余量和评测/触发耗时比设置。
+#     max_in_flight: 4
+#     pending_policy: latest
+#     pin_checkpoint: hardlink
+#     wait_for_final: true
+#     failure_policy: continue_training
 # 精确续训从一个带 .sha256 sidecar 的 checkpoint 启动。正常新实验保持 from: null；
 # 也可以不修改文件，使用 CLI --resume-from /absolute/path/step_N.pt。
 checkpoint:

@@ -134,6 +134,16 @@ class AttitudeTrackingTask:
             reward_valid, reward_output.reward, torch.zeros_like(reward_output.reward)
         )
         info = dict(reward_output.terms.items())
+        if reward_output.diagnostics is not None:
+            diagnostics = reward_output.diagnostics
+            if (
+                diagnostics.batch_size != torch.Size([self.batch_size])
+                or diagnostics.device != self.device
+            ):
+                raise ValueError(
+                    "RewardCalculator.diagnostics must use the task batch/device"
+                )
+            info.update(dict(diagnostics.items()))
         info.update(
             {
                 "attitude_error_rad": attitude_error,

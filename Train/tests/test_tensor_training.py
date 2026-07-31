@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import copy
+import json
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,17 +19,26 @@ from flight_train.config import (
     PPOConfig,
     SACConfig,
     TaskConfig,
+    continuation_resume_config_sha256,
+    exact_resume_config_sha256,
     load_experiment_config,
     override_run_config,
 )
 from flight_train.core import EnvSpec
-from flight_train.envs import SimEnvAdapter
+from flight_train.envs import SimEnvAdapter, _load_timing
 from flight_train.evaluation import load_fixed_evaluation_suite
 from flight_train.math import quaternion_geodesic_angle
-from flight_train.models import build_actor_critic, build_sac_actor_critic
+from flight_train.models import (
+    BoundedNormalParameters,
+    build_actor_critic,
+    build_sac_actor_critic,
+)
 from flight_train.randomization import StaticParameterSpec, StaticRandomizer
 from flight_train.rewards import AttitudeRewardCalculator, RewardOutput
-from flight_train.runner import _restore_policy
+from flight_train.runner import (
+    _apply_sac_continuation_overrides,
+    _restore_policy,
+)
 from flight_train.tasks import AttitudeTrackingTask
 from simenv.config import load_and_materialize
 
@@ -34,7 +46,7 @@ from simenv.config import load_and_materialize
 class TensorEnv:
     def __init__(self, batch: int = 4, device: torch.device | None = None) -> None:
         device = device or torch.device("cpu")
-        self.spec = EnvSpec(batch, 21, 4, device, torch.float32, 5000, 500, ())
+        self.spec = EnvSpec(batch, 21, 4, device, torch.float32, 500, 500, ())
         self._step = torch.zeros(batch, dtype=torch.int64, device=device)
 
     def reset(self, mask=None):
@@ -70,6 +82,59 @@ class TensorEnv:
 
 
 class TensorTrainingTests(unittest.TestCase):
+    def test_source_simenv_configs_use_fixed_single_step_timebase(self):
+        environment_root = Path(__file__).parents[1] / "configs/environment"
+        expected_strides = {
+            "sim_smoke.json": 1,
+            "gru_sac_upright_height_only_small_tip.yaml": 20,
+            "gru_sac_truth_nominal_no_randomization.yaml": 20,
+            "mlp_nominal_baseline_1.yaml": 20,
+        }
+        for name, expected_stride in expected_strides.items():
+            with self.subTest(config=name):
+                materialized = load_and_materialize(
+                    environment_root / name,
+                    parallel_count=2,
+                    device=torch.device("cpu"),
+                    dtype=torch.float32,
+                )
+                self.assertEqual(materialized.timing.physics_hz, 500)
+                self.assertEqual(materialized.timing.control_hz, 500)
+                self.assertEqual(materialized.timing.substeps, 1)
+                self.assertEqual(
+                    materialized.logging.physics_step_stride,
+                    expected_stride,
+                )
+                for sensor in ("gyro", "accelerometer", "motor_speed"):
+                    torch.testing.assert_close(
+                        materialized.parameters[f"sensors.{sensor}.sample_hz"],
+                        torch.full((2,), 500.0),
+                    )
+                self.assertEqual(
+                    materialized.sensor_interpolation["gyro"], "linear"
+                )
+                self.assertEqual(
+                    materialized.sensor_interpolation["accelerometer"],
+                    "linear",
+                )
+
+    def test_train_timing_preflight_rejects_legacy_multirate_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "timing": {
+                            "physics_hz": {"value": 5000},
+                            "control_hz": {"value": 500},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "must both equal 500"):
+                _load_timing(path)
+
     def test_v2_smoke_config_parses(self):
         path = Path(__file__).parents[1] / "configs/experiments/gru_ppo_smoke.json"
         config = load_experiment_config(path)
@@ -1185,7 +1250,7 @@ class TensorTrainingTests(unittest.TestCase):
         params = config.reward.calculator.params
         self.assertEqual(config.checkpoint.resume_mode, "policy")
         self.assertEqual(
-            config.checkpoint.resume_from.name, "step_16777216.pt"
+            config.checkpoint.resume_from.name, "step_3145728.pt"
         )
         self.assertEqual(
             config.task.terminate_angular_rate_axes, "roll_pitch"
@@ -1214,6 +1279,413 @@ class TensorTrainingTests(unittest.TestCase):
             suite.checkpoint_selection.maximum_hover_yaw_rate_rmse_rad_s,
             0.5,
         )
+
+    def test_v8_uses_dense_full_history_and_worst_axis_reward(self):
+        config = load_experiment_config(
+            Path(__file__).parents[1]
+            / "configs/experiments/"
+            "mlp_sac_upright_height_only_small_tip_stability_v8.yaml"
+        )
+        params = config.reward.calculator.params
+        self.assertEqual(
+            config.name,
+            "mlp_sac_upright_height_only_small_tip_stability_v8",
+        )
+        self.assertEqual(
+            config.control_contract.observation_history_mode,
+            "uniform",
+        )
+        self.assertEqual(
+            config.control_contract.observation_history_frames,
+            61,
+        )
+        self.assertEqual(
+            config.control_contract.observation_history_stride_steps,
+            1,
+        )
+        self.assertEqual(
+            config.control_contract.observation_history_span_steps,
+            60,
+        )
+        self.assertEqual(config.control_contract.observation_dim, 1281)
+        self.assertIsNone(config.checkpoint.resume_from)
+        self.assertEqual(config.sac.policy_anchor_weight, 0.0)
+        self.assertEqual(config.sac.replay_capacity, 524_288)
+        self.assertTrue(config.model.sac_learnable_action_std)
+        self.assertEqual(
+            config.model.sac_initial_action_std,
+            (0.10, 0.10, 0.10, 0.10),
+        )
+        self.assertEqual(config.sac.initial_alpha, 0.01)
+        self.assertGreater(params["joint_tracking_weight"], 0.0)
+        self.assertEqual(params["roll_pitch_weight"], 0.0)
+        self.assertEqual(params["tilt_weight"], 0.0)
+        self.assertEqual(params["yaw_rate_weight"], 0.0)
+
+    def test_v9_continues_v8_final_with_moderate_actor_updates(self):
+        config = load_experiment_config(
+            Path(__file__).parents[1]
+            / "configs/experiments/"
+            "mlp_sac_upright_height_only_small_tip_stability_v9.yaml"
+        )
+        params = config.reward.calculator.params
+        self.assertEqual(
+            config.name,
+            "mlp_sac_upright_height_only_small_tip_stability_v9",
+        )
+        self.assertEqual(config.control_contract.observation_dim, 1281)
+        self.assertEqual(config.run.total_control_steps, 33_554_432)
+        self.assertEqual(config.checkpoint.resume_mode, "continuation")
+        self.assertEqual(
+            config.checkpoint.resume_from.name,
+            "step_16777216.pt",
+        )
+        self.assertEqual(config.sac.replay_capacity, 524_288)
+        self.assertEqual(config.sac.critic_pretraining_updates, 2048)
+        self.assertEqual(config.sac.actor_update_interval, 4)
+        self.assertEqual(config.sac.actor_learning_rate, 0.00003)
+        self.assertEqual(config.sac.policy_anchor_weight, 0.0)
+        self.assertTrue(config.model.sac_learnable_action_std)
+        self.assertEqual(
+            config.model.sac_initial_action_std,
+            (0.06, 0.06, 0.06, 0.06),
+        )
+        self.assertEqual(
+            config.model.sac_minimum_action_std,
+            (0.01, 0.01, 0.01, 0.01),
+        )
+        self.assertEqual(
+            config.model.sac_maximum_action_std,
+            (0.12, 0.12, 0.12, 0.12),
+        )
+        self.assertEqual(config.sac.initial_alpha, 0.003)
+        self.assertEqual(config.sac.min_alpha, 0.0003)
+        self.assertEqual(config.sac.max_alpha, 0.01)
+        self.assertEqual(config.evaluation.execution.max_in_flight, 2)
+        self.assertGreater(params["joint_tracking_weight"], 0.0)
+        self.assertEqual(params["roll_pitch_weight"], 0.0)
+        self.assertEqual(params["tilt_weight"], 0.0)
+        self.assertEqual(params["yaw_rate_weight"], 0.0)
+
+        v8 = load_experiment_config(
+            Path(__file__).parents[1]
+            / "configs/experiments/"
+            "mlp_sac_upright_height_only_small_tip_stability_v8.yaml"
+        )
+        self.assertNotEqual(
+            exact_resume_config_sha256(v8),
+            exact_resume_config_sha256(config),
+        )
+        self.assertEqual(
+            continuation_resume_config_sha256(v8),
+            continuation_resume_config_sha256(config),
+        )
+        incompatible = copy.deepcopy(config.raw)
+        incompatible["algorithm"]["entropy"]["max_alpha"] = None
+        self.assertNotEqual(
+            continuation_resume_config_sha256(v8),
+            continuation_resume_config_sha256(incompatible),
+        )
+
+    def test_command_tracking_v1_policy_warm_starts_with_small_envelope(self):
+        config = load_experiment_config(
+            Path(__file__).parents[1]
+            / "configs/experiments/"
+            "mlp_sac_attitude_command_tracking_v1.yaml"
+        )
+        params = config.reward.calculator.params
+        self.assertEqual(
+            config.name,
+            "mlp_sac_attitude_command_tracking_v1",
+        )
+        self.assertEqual(config.checkpoint.resume_mode, "policy")
+        self.assertEqual(
+            config.checkpoint.resume_from.name,
+            "best_fixed_evaluation.pt",
+        )
+        self.assertEqual(config.run.total_control_steps, 16_777_216)
+        self.assertEqual(config.control_contract.observation_dim, 1281)
+        self.assertEqual(config.command_source.max_roll_rad, 0.10)
+        self.assertEqual(config.command_source.max_pitch_rad, 0.10)
+        self.assertEqual(config.command_source.max_yaw_rate_rad_s, 0.35)
+        self.assertEqual(
+            config.task.curriculum_target_scales,
+            (0.0, 0.0, 0.10, 0.25, 0.50, 1.0),
+        )
+        self.assertAlmostEqual(
+            config.task.curriculum_max_roll_pitch_rmse_rad,
+            torch.deg2rad(torch.tensor(2.5)).item(),
+        )
+        self.assertEqual(
+            config.task.curriculum_max_yaw_rate_rmse_rad_s,
+            0.12,
+        )
+        self.assertAlmostEqual(
+            params["joint_roll_pitch_scale_rad"],
+            torch.deg2rad(torch.tensor(5.0)).item(),
+        )
+        self.assertEqual(params["joint_yaw_rate_scale_rad_s"], 0.35)
+        self.assertEqual(
+            config.model.sac_initial_action_std,
+            (0.04, 0.05, 0.05, 0.05),
+        )
+        self.assertTrue(
+            all(value < 0.06 for value in config.model.sac_initial_action_std)
+        )
+        self.assertEqual(
+            config.model.sac_maximum_action_std,
+            (0.06, 0.08, 0.08, 0.08),
+        )
+        suite = load_fixed_evaluation_suite(config.evaluation.suite_path)
+        self.assertEqual(suite.schema_version, 4)
+        self.assertIn(
+            "yaw_rate_full_step",
+            {item.name for item in suite.scenarios},
+        )
+
+    def test_command_tracking_v2_protects_warm_started_policy(self):
+        config = load_experiment_config(
+            Path(__file__).parents[1]
+            / "configs/experiments/"
+            "mlp_sac_attitude_command_tracking_v2.yaml"
+        )
+        self.assertEqual(
+            config.name,
+            "mlp_sac_attitude_command_tracking_v2",
+        )
+        self.assertEqual(config.checkpoint.resume_mode, "policy")
+        self.assertEqual(
+            config.checkpoint.resume_from.name,
+            "best_fixed_evaluation.pt",
+        )
+        self.assertEqual(
+            config.task.curriculum_target_scales,
+            (0.05, 0.10, 0.25, 0.50, 0.75, 1.0),
+        )
+        self.assertEqual(config.sac.critic_pretraining_updates, 2048)
+        self.assertEqual(config.sac.actor_update_interval, 8)
+        self.assertEqual(config.sac.policy_anchor_weight, 10.0)
+        self.assertEqual(
+            config.sac.policy_anchor_max_action_deviation,
+            0.05,
+        )
+        self.assertEqual(config.sac.actor_learning_rate, 0.000015)
+        self.assertEqual(
+            config.model.sac_initial_action_std,
+            (0.04, 0.05, 0.05, 0.05),
+        )
+        self.assertEqual(
+            config.model.sac_maximum_action_std,
+            (0.06, 0.08, 0.08, 0.08),
+        )
+        self.assertEqual(
+            config.evaluation.interval_control_steps,
+            524_288,
+        )
+        self.assertEqual(
+            config.checkpoint.interval_control_steps,
+            524_288,
+        )
+
+    def test_command_tracking_v3_continues_v2_to_full_envelope(self):
+        root = Path(__file__).parents[1] / "configs/experiments"
+        v2 = load_experiment_config(
+            root / "mlp_sac_attitude_command_tracking_v2.yaml"
+        )
+        v3 = load_experiment_config(
+            root / "mlp_sac_attitude_command_tracking_v3.yaml"
+        )
+        self.assertEqual(
+            v3.name,
+            "mlp_sac_attitude_command_tracking_v3",
+        )
+        self.assertEqual(v3.checkpoint.resume_mode, "continuation")
+        self.assertEqual(
+            v3.checkpoint.resume_from.name,
+            "step_16777216.pt",
+        )
+        self.assertEqual(v3.run.total_control_steps, 67_108_864)
+        self.assertEqual(
+            v3.task.curriculum_target_scales,
+            (0.05, 0.10, 0.25, 0.50, 0.75, 1.0),
+        )
+        self.assertEqual(v3.sac.actor_update_interval, 16)
+        self.assertEqual(v3.sac.actor_learning_rate, 0.0000075)
+        self.assertEqual(
+            v3.model.sac_maximum_action_std,
+            (0.05, 0.07, 0.07, 0.07),
+        )
+        self.assertEqual(
+            v3.evaluation.interval_control_steps,
+            4_194_304,
+        )
+        self.assertEqual(
+            v3.checkpoint.interval_control_steps,
+            2_097_152,
+        )
+        self.assertEqual(v3.evaluation.execution.max_in_flight, 1)
+        self.assertEqual(
+            continuation_resume_config_sha256(v3),
+            continuation_resume_config_sha256(v2),
+        )
+        source_run_config = json.loads(
+            (
+                v3.checkpoint.resume_from.parents[1]
+                / "config.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            continuation_resume_config_sha256(v3),
+            continuation_resume_config_sha256(source_run_config),
+        )
+
+    def test_sac_continuation_applies_runtime_bounds_and_learning_rates(self):
+        config = load_experiment_config(
+            Path(__file__).parents[1]
+            / "configs/experiments/"
+            "mlp_sac_upright_height_only_small_tip_stability_v9.yaml"
+        )
+        device = torch.device("cpu")
+        model = build_sac_actor_critic(
+            config.control_contract.observation_dim,
+            4,
+            config.model,
+            device,
+        )
+        algorithm = TorchRLSAC(model, config.sac, device)
+        distribution = next(
+            module
+            for module in model.actor.modules()
+            if hasattr(module, "maximum_std")
+        )
+        distribution.initial_std.fill_(0.10)
+        distribution.minimum_std.fill_(0.025)
+        distribution.maximum_std.fill_(0.20)
+        algorithm.loss.alpha_init.fill_(0.01)
+        algorithm.loss.min_log_alpha.fill_(torch.log(torch.tensor(0.001)))
+        algorithm.loss.max_log_alpha.fill_(torch.log(torch.tensor(0.05)))
+        algorithm.loss.log_alpha.data.fill_(torch.log(torch.tensor(0.02)))
+        algorithm.actor_optimizer.param_groups[0]["lr"] = 0.5
+
+        _apply_sac_continuation_overrides(config, model, algorithm)
+
+        torch.testing.assert_close(
+            distribution.initial_std,
+            torch.full((4,), 0.06),
+        )
+        torch.testing.assert_close(
+            distribution.minimum_std,
+            torch.full((4,), 0.01),
+        )
+        torch.testing.assert_close(
+            distribution.maximum_std,
+            torch.full((4,), 0.12),
+        )
+        self.assertAlmostEqual(
+            float(algorithm.loss.log_alpha.detach().exp()),
+            0.01,
+        )
+        self.assertEqual(
+            algorithm.actor_optimizer.param_groups[0]["lr"],
+            0.00003,
+        )
+        self.assertEqual(
+            algorithm.critic_optimizer.param_groups[0]["lr"],
+            0.0002,
+        )
+        self.assertEqual(
+            algorithm.alpha_optimizer.param_groups[0]["lr"],
+            0.0001,
+        )
+        self.assertAlmostEqual(
+            float(algorithm.loss.min_log_alpha.detach().exp()),
+            0.0003,
+        )
+        self.assertAlmostEqual(
+            float(algorithm.loss.max_log_alpha.detach().exp()),
+            0.01,
+        )
+
+    def test_joint_tracking_reward_is_noncompensatory_and_follows_worst_axis(self):
+        calculator = AttitudeRewardCalculator(
+            {
+                "roll_pitch_weight": 0.0,
+                "tilt_weight": 0.0,
+                "yaw_rate_weight": 0.0,
+                "joint_tracking_weight": 1.0,
+                "joint_roll_pitch_scale_rad": 1.0,
+                "joint_yaw_rate_scale_rad_s": 1.0,
+                "joint_tracking_huber_delta": 1.0,
+                "angular_rate_weight": 0.0,
+                "action_rate_weight": 0.0,
+                "saturation_weight": 0.0,
+                "alive_bonus": 0.0,
+                "tilt_barrier_weight": 0.0,
+                "rate_barrier_weight": 0.0,
+            }
+        )
+        roll_pitch = torch.tensor(
+            [[0.5, 0.0], [0.1, 0.0], [2.0, 0.0], [0.5, 0.0]],
+            requires_grad=True,
+        )
+        yaw_rate = torch.tensor(
+            [[2.0], [2.0], [0.5], [0.5]],
+            requires_grad=True,
+        )
+        context = TensorDict(
+            {
+                "roll_pitch_error_rad": roll_pitch,
+                "yaw_rate_error_rad_s": yaw_rate,
+                "tilt_rad": torch.zeros(4, 1),
+                "angular_velocity_b": torch.zeros(4, 3),
+                "action": torch.zeros(4, 4),
+                "previous_action": torch.zeros(4, 4),
+                "terminated": torch.zeros(4, 1, dtype=torch.bool),
+                "tilt_ratio": torch.zeros(4, 1),
+                "rate_ratio": torch.zeros(4, 1),
+                "episode_age_fraction": torch.zeros(4, 1),
+            },
+            batch_size=[4],
+        )
+        output = calculator(context)
+        # 前两项的 yaw 都是较差轴；继续改善已经较好的 RP 不增加奖励。
+        torch.testing.assert_close(
+            output.terms["reward.joint_tracking"][:, 0],
+            torch.tensor([-3.0, -3.0, -3.0, -0.25]),
+        )
+        torch.testing.assert_close(
+            output.diagnostics["joint_roll_pitch_cost"][:, 0],
+            torch.tensor([0.25, 0.01, 3.0, 0.25]),
+        )
+        torch.testing.assert_close(
+            output.diagnostics["joint_yaw_rate_cost"][:, 0],
+            torch.tensor([3.0, 3.0, 0.25, 0.25]),
+        )
+        torch.testing.assert_close(
+            output.diagnostics["joint_roll_pitch_dominant"][:, 0],
+            torch.tensor([0.0, 0.0, 1.0, 0.5]),
+        )
+        torch.testing.assert_close(
+            output.diagnostics["joint_yaw_rate_dominant"][:, 0],
+            torch.tensor([1.0, 1.0, 0.0, 0.5]),
+        )
+        output.reward.sum().backward()
+        # yaw 很差时只有 yaw 获得主跟踪梯度；RP 很差时则相反。
+        self.assertEqual(float(roll_pitch.grad[0].abs().sum()), 0.0)
+        self.assertGreater(float(yaw_rate.grad[0].abs().sum()), 0.0)
+        self.assertGreater(float(roll_pitch.grad[2].abs().sum()), 0.0)
+        self.assertEqual(float(yaw_rate.grad[2].abs().sum()), 0.0)
+
+    def test_joint_tracking_rejects_legacy_linear_axis_rewards(self):
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            AttitudeRewardCalculator(
+                {
+                    "joint_tracking_weight": 0.01,
+                    "roll_pitch_weight": 0.1,
+                    "tilt_weight": 0.0,
+                    "yaw_rate_weight": 0.0,
+                }
+            )
 
     def test_roll_pitch_reward_cost_can_be_capped(self):
         cap_rad = torch.deg2rad(torch.tensor(20.0)).item()
@@ -1574,31 +2046,72 @@ class TensorTrainingTests(unittest.TestCase):
         self.assertFalse(bool(result.terminated[0]))
         self.assertTrue(bool(result.terminated[1]))
 
-    def test_policy_resume_restores_only_actor(self):
-        model_config = ModelConfig(
+    def test_policy_resume_restores_mean_actor_and_resets_target_std(self):
+        source_config = ModelConfig(
             (32, 32),
             32,
             32,
             architecture="mlp",
-            sac_initial_action_std=(0.04, 0.03, 0.03, 0.03),
+            sac_initial_action_std=(0.06, 0.06, 0.06, 0.06),
             sac_minimum_action_std=(0.01, 0.01, 0.01, 0.01),
-            sac_maximum_action_std=(0.06, 0.05, 0.05, 0.05),
+            sac_maximum_action_std=(0.12, 0.12, 0.12, 0.12),
+        )
+        target_config = ModelConfig(
+            (32, 32),
+            32,
+            32,
+            architecture="mlp",
+            sac_initial_action_std=(0.04, 0.05, 0.05, 0.05),
+            sac_minimum_action_std=(0.01, 0.015, 0.015, 0.015),
+            sac_maximum_action_std=(0.06, 0.08, 0.08, 0.08),
         )
         source = build_sac_actor_critic(
-            21, 4, model_config, torch.device("cpu")
+            21, 4, source_config, torch.device("cpu")
         )
         target = build_sac_actor_critic(
-            21, 4, model_config, torch.device("cpu")
+            21, 4, target_config, torch.device("cpu")
         )
         with torch.no_grad():
             for parameter in source.actor.parameters():
                 parameter.fill_(0.125)
+            for parameter in source.qvalue.parameters():
+                parameter.fill_(0.75)
+        observation = torch.linspace(-1.0, 1.0, 42).reshape(2, 21)
+        source_td = TensorDict(
+            {"observation": observation.clone()},
+            batch_size=[2],
+        )
+        source.policy_module(source_td)
         qvalue_before = {
             name: value.clone() for name, value in target.qvalue.state_dict().items()
         }
         _restore_policy({"actor": source.actor.state_dict()}, model=target)
-        for name, value in source.actor.state_dict().items():
-            torch.testing.assert_close(target.actor.state_dict()[name], value)
+
+        target_td = TensorDict(
+            {"observation": observation.clone()},
+            batch_size=[2],
+        )
+        target.policy_module(target_td)
+        torch.testing.assert_close(target_td["loc"], source_td["loc"])
+        torch.testing.assert_close(
+            target_td["scale"],
+            torch.tensor(
+                target_config.sac_initial_action_std,
+            ).expand(2, -1),
+        )
+        distribution = next(
+            module
+            for module in target.actor.modules()
+            if isinstance(module, BoundedNormalParameters)
+        )
+        torch.testing.assert_close(
+            distribution.minimum_std,
+            torch.tensor(target_config.sac_minimum_action_std),
+        )
+        torch.testing.assert_close(
+            distribution.maximum_std,
+            torch.tensor(target_config.sac_maximum_action_std),
+        )
         for name, value in qvalue_before.items():
             torch.testing.assert_close(target.qvalue.state_dict()[name], value)
 

@@ -213,6 +213,60 @@ class BoundedNormalParameters(nn.Module):
         self.register_buffer("minimum_std", minimum)
         self.register_buffer("maximum_std", maximum)
 
+    @torch.no_grad()
+    def reset_std_configuration(
+        self,
+        initial_std: torch.Tensor,
+        minimum_std: torch.Tensor,
+        maximum_std: torch.Tensor,
+    ) -> None:
+        """应用目标实验的方差边界，并把方差输出头重置到初始值。"""
+
+        initial = initial_std.to(
+            device=self.initial_std.device,
+            dtype=self.initial_std.dtype,
+        )
+        minimum = minimum_std.to(
+            device=self.minimum_std.device,
+            dtype=self.minimum_std.dtype,
+        )
+        maximum = maximum_std.to(
+            device=self.maximum_std.device,
+            dtype=self.maximum_std.dtype,
+        )
+        expected_shape = self.initial_std.shape
+        if (
+            initial.shape != expected_shape
+            or minimum.shape != expected_shape
+            or maximum.shape != expected_shape
+        ):
+            raise ValueError("SAC std configuration shape is incompatible")
+        if not bool(((minimum < initial) & (initial < maximum)).all().item()):
+            raise ValueError(
+                "each SAC action std must satisfy minimum < initial < maximum"
+            )
+
+        self.initial_std.copy_(initial)
+        self.minimum_std.copy_(minimum)
+        self.maximum_std.copy_(maximum)
+        if not self.learnable_std:
+            return
+
+        final_linear = [
+            module
+            for module in self.network.modules()
+            if isinstance(module, nn.Linear)
+        ][-1]
+        action_dim = self.initial_std.numel()
+        raw_initial = torch.logit(
+            (self.initial_std - self.minimum_std)
+            / (self.maximum_std - self.minimum_std)
+        )
+        # 输出层前半部分是动作均值，必须保留 checkpoint 权重；只重置
+        # 后半部分的 raw scale，避免旧任务的方差状态污染新任务。
+        final_linear.weight[action_dim:].zero_()
+        final_linear.bias[action_dim:].copy_(raw_initial)
+
     def forward(
         self, observation: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:

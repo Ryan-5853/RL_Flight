@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import socket
 import time
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -19,6 +20,7 @@ import yaml
 WEBUI_ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = WEBUI_ROOT.parent
 DEFAULT_ROOTS = {
+    "controller": PROJECT_ROOT / "Controller" / "configs",
     "simenv": PROJECT_ROOT / "SimEnv" / "configs",
     "train": PROJECT_ROOT / "Train" / "configs" / "experiments",
 }
@@ -26,6 +28,14 @@ DEFAULT_CHECKPOINT_ROOTS = (PROJECT_ROOT / "Train" / "runs",)
 DEFAULT_RUNTIME_LOG_ROOT = WEBUI_ROOT / "runtime-runs"
 ALLOWED_SUFFIXES = {".yaml", ".yml", ".json"}
 MAX_CONFIG_BYTES = 2 * 1024 * 1024
+
+
+class WebUIHTTPServer(ThreadingHTTPServer):
+    # Control and telemetry use separate persistent browser connections.  A
+    # larger accept queue also protects lifecycle requests during reconnects.
+    request_queue_size = 128
+    daemon_threads = True
+    block_on_close = False
 
 
 def parse_config_roots(values: list[str]) -> dict[str, Path]:
@@ -45,15 +55,47 @@ def parse_config_roots(values: list[str]) -> dict[str, Path]:
 
 class WebUIHandler(SimpleHTTPRequestHandler):
     server_version = "RLFlightWebUI/0.1"
+    protocol_version = "HTTP/1.1"
+
+    def setup(self) -> None:
+        super().setup()
+        self.connection.setsockopt(
+            socket.IPPROTO_TCP,
+            socket.TCP_NODELAY,
+            1,
+        )
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(WEBUI_ROOT), **kwargs)
+
+    def end_headers(self) -> None:
+        # The UI and runtime protocol evolve together. Disabling browser cache
+        # prevents an old runtime-client.js from talking to a new Python server.
+        self.send_header("Cache-Control", "no-store")
+        super().end_headers()
+
+    def log_message(self, format: str, *args: object) -> None:
+        # Synchronously printing every 20 Hz control frame and telemetry
+        # long-poll perturbs the latency being measured and can grow terminal
+        # logs without bound. Keep errors and lifecycle requests visible.
+        status = str(args[1]) if len(args) > 1 else ""
+        high_rate = bool(re.fullmatch(
+            r"/api/runtime/sessions/[0-9a-f-]+/(?:control|telemetry|telemetry-stream)(?:\?.*)?",
+            urlparse(self.path).path + (
+                f"?{urlparse(self.path).query}"
+                if urlparse(self.path).query else ""
+            ),
+        ))
+        if high_rate and status.startswith("2"):
+            return
+        super().log_message(format, *args)
 
     @property
     def config_roots(self) -> dict[str, Path]:
         return self.server.config_roots  # type: ignore[attr-defined]
 
     def do_GET(self) -> None:
+        request_received_ns = time.time_ns()
         parsed = urlparse(self.path)
         if parsed.path == "/api/config/roots":
             self._list_roots()
@@ -67,30 +109,90 @@ class WebUIHandler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/runtime/capabilities":
             payload = self.server.runtime_registry.capabilities()  # type: ignore[attr-defined]
             payload["checkpoint_roots"] = [str(path) for path in self.server.checkpoint_roots]  # type: ignore[attr-defined]
+            payload["api_version"] = 2
+            payload["features"] = {
+                "offline_rollout": True,
+                "offline_rollout_api": "/api/runtime/rollouts",
+            }
             self._json(payload)
+            return
+        if parsed.path == "/api/runtime/clock":
+            self._json({
+                "server_received_ns": request_received_ns,
+                "server_response_started_ns": time.time_ns(),
+            })
             return
         if parsed.path == "/api/runtime/checkpoints":
             self._list_checkpoints()
             return
-        runtime_match = re.fullmatch(r"/api/runtime/sessions/([0-9a-f-]+)(?:/(status|telemetry))?", parsed.path)
+        rollout_match = re.fullmatch(
+            r"/api/(?:runtime/)?rollouts/([0-9a-f-]+)(?:/(data))?",
+            parsed.path,
+        )
+        if rollout_match:
+            self._rollout_get(
+                rollout_match.group(1),
+                rollout_match.group(2) or "status",
+            )
+            return
+        runtime_match = re.fullmatch(
+            r"/api/runtime/sessions/([0-9a-f-]+)(?:/(status|telemetry|telemetry-stream))?",
+            parsed.path,
+        )
         if runtime_match:
-            self._runtime_get(runtime_match.group(1), runtime_match.group(2) or "status", parse_qs(parsed.query))
+            resource = runtime_match.group(2) or "status"
+            if resource == "telemetry-stream":
+                self._runtime_stream(
+                    runtime_match.group(1),
+                    parse_qs(parsed.query),
+                )
+            else:
+                self._runtime_get(
+                    runtime_match.group(1),
+                    resource,
+                    parse_qs(parsed.query),
+                    request_received_ns=request_received_ns,
+                )
             return
         super().do_GET()
 
     def do_POST(self) -> None:
+        request_received_ns = time.time_ns()
         parsed = urlparse(self.path)
         if parsed.path == "/api/runtime/sessions":
             self._runtime_create()
             return
-        runtime_match = re.fullmatch(r"/api/runtime/sessions/([0-9a-f-]+)/(control|start|pause|step|reset)", parsed.path)
+        if parsed.path in {
+            "/api/rollouts",
+            "/api/runtime/rollouts",
+        }:
+            self._rollout_create()
+            return
+        runtime_match = re.fullmatch(r"/api/runtime/sessions/([0-9a-f-]+)/(control|start|pause|step|reset|close)", parsed.path)
         if runtime_match:
-            self._runtime_post(runtime_match.group(1), runtime_match.group(2))
+            self._runtime_post(
+                runtime_match.group(1),
+                runtime_match.group(2),
+                request_received_ns=request_received_ns,
+            )
             return
         self._error("unknown API endpoint", HTTPStatus.NOT_FOUND)
 
     def do_DELETE(self) -> None:
         parsed = urlparse(self.path)
+        rollout_match = re.fullmatch(
+            r"/api/(?:runtime/)?rollouts/([0-9a-f-]+)",
+            parsed.path,
+        )
+        if rollout_match:
+            try:
+                job = self.server.rollout_registry.cancel(  # type: ignore[attr-defined]
+                    rollout_match.group(1)
+                )
+                self._json({"job": job.status()})
+            except KeyError as error:
+                self._error(str(error), HTTPStatus.NOT_FOUND)
+            return
         runtime_match = re.fullmatch(r"/api/runtime/sessions/([0-9a-f-]+)", parsed.path)
         if not runtime_match:
             self._error("unknown API endpoint", HTTPStatus.NOT_FOUND)
@@ -108,7 +210,12 @@ class WebUIHandler(SimpleHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            # A page exit can close an outstanding telemetry long-poll after
+            # the response has been built. The session cleanup path owns it.
+            pass
 
     def _error(self, message: str, status: HTTPStatus = HTTPStatus.BAD_REQUEST) -> None:
         self._json({"error": message}, status)
@@ -124,6 +231,17 @@ class WebUIHandler(SimpleHTTPRequestHandler):
         if not isinstance(value, dict):
             raise ValueError("JSON request body must be an object")
         return value
+
+    def _discard_request_body(self, max_bytes: int = 64 * 1024) -> None:
+        """Consume optional lifecycle bodies so HTTP/1.1 stays synchronized."""
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as error:
+            raise ValueError("invalid Content-Length") from error
+        if length < 0 or length > max_bytes:
+            raise ValueError(f"request body must not exceed {max_bytes} bytes")
+        if length:
+            self.rfile.read(length)
 
     def _resolve_checkpoint(self, raw_path: str) -> Path:
         if not raw_path:
@@ -170,13 +288,91 @@ class WebUIHandler(SimpleHTTPRequestHandler):
             test_yaml = body.get("test_yaml")
             if not isinstance(simenv_yaml, str) or not isinstance(test_yaml, str):
                 raise ValueError("simenv_yaml and test_yaml are required strings")
-            checkpoint = self._resolve_checkpoint(str(body.get("checkpoint_path", "")))
-            session = self.server.runtime_registry.create(simenv_yaml, test_yaml, str(checkpoint))  # type: ignore[attr-defined]
+            parsed_test = yaml.safe_load(test_yaml)
+            if not isinstance(parsed_test, Mapping):
+                raise ValueError("test_yaml must contain a mapping")
+            controller = parsed_test.get("controller", {"type": "neural"})
+            if not isinstance(controller, Mapping):
+                raise ValueError("controller must be a mapping")
+            controller_type = str(controller.get("type", "neural"))
+            replace_existing = body.get("replace_existing", False)
+            if not isinstance(replace_existing, bool):
+                raise ValueError("replace_existing must be a boolean")
+            checkpoint: Path | None = None
+            if controller_type == "neural":
+                checkpoint = self._resolve_checkpoint(
+                    str(body.get("checkpoint_path", ""))
+                )
+            session = self.server.runtime_registry.create(
+                simenv_yaml,
+                test_yaml,
+                None if checkpoint is None else str(checkpoint),
+                replace_existing=replace_existing,
+            )  # type: ignore[attr-defined]
             self._json({"session": session.status()}, HTTPStatus.CREATED)
         except Exception as error:
             self._error(f"{type(error).__name__}: {error}")
 
-    def _runtime_get(self, session_id: str, resource: str, query: dict[str, list[str]]) -> None:
+    def _rollout_create(self) -> None:
+        try:
+            body = self._request_json()
+            simenv_yaml = body.get("simenv_yaml")
+            test_yaml = body.get("test_yaml")
+            if not isinstance(simenv_yaml, str) or not isinstance(
+                test_yaml, str
+            ):
+                raise ValueError(
+                    "simenv_yaml and test_yaml are required strings"
+                )
+            parsed_test = yaml.safe_load(test_yaml)
+            if not isinstance(parsed_test, Mapping):
+                raise ValueError("test_yaml must contain a mapping")
+            controller = parsed_test.get(
+                "controller", {"type": "neural"}
+            )
+            if not isinstance(controller, Mapping):
+                raise ValueError("controller must be a mapping")
+            checkpoint: Path | None = None
+            if str(controller.get("type", "neural")) == "neural":
+                checkpoint = self._resolve_checkpoint(
+                    str(body.get("checkpoint_path", ""))
+                )
+            fps = float(body.get("fps", 30))
+            if not 1 <= fps <= 60:
+                raise ValueError("fps must be between 1 and 60")
+            job = self.server.rollout_registry.create(  # type: ignore[attr-defined]
+                simenv_yaml,
+                test_yaml,
+                None if checkpoint is None else str(checkpoint),
+                fps=fps,
+            )
+            self._json(
+                {"job": job.status()},
+                HTTPStatus.ACCEPTED,
+            )
+        except Exception as error:
+            self._error(f"{type(error).__name__}: {error}")
+
+    def _rollout_get(self, job_id: str, resource: str) -> None:
+        try:
+            job = self.server.rollout_registry.get(job_id)  # type: ignore[attr-defined]
+            if resource == "data":
+                self._json({"rollout": job.result()})
+            else:
+                self._json({"job": job.status()})
+        except KeyError as error:
+            self._error(str(error), HTTPStatus.NOT_FOUND)
+        except RuntimeError as error:
+            self._error(str(error), HTTPStatus.CONFLICT)
+
+    def _runtime_get(
+        self,
+        session_id: str,
+        resource: str,
+        query: dict[str, list[str]],
+        *,
+        request_received_ns: int,
+    ) -> None:
         try:
             session = self.server.runtime_registry.get(session_id)  # type: ignore[attr-defined]
             if resource == "status":
@@ -189,27 +385,191 @@ class WebUIHandler(SimpleHTTPRequestHandler):
             while telemetry is None and time.monotonic() < deadline:
                 time.sleep(.02)
                 telemetry = session.telemetry(after)
+            if telemetry is not None:
+                trace = telemetry.setdefault("latency_trace", {})
+                trace["telemetry_transport"] = "long_poll"
+                trace["telemetry_poll_received_ns"] = request_received_ns
+                trace["server_response_started_ns"] = time.time_ns()
             self._json({"telemetry": telemetry, "session": session.status()})
         except KeyError as error:
             self._error(str(error), HTTPStatus.NOT_FOUND)
         except (TypeError, ValueError) as error:
             self._error(str(error))
 
-    def _runtime_post(self, session_id: str, action: str) -> None:
+    @staticmethod
+    def _compact_webui_telemetry(telemetry: dict[str, Any]) -> dict[str, Any]:
+        """Remove fields the browser does not render while preserving the API."""
+        truth = telemetry.get("truth")
+        if isinstance(truth, dict):
+            visible_truth = {
+                "position_n",
+                "attitude_q_wb",
+                "angular_velocity_b",
+                "motor_speed",
+                "servo_angle",
+                "grid_force_b",
+                "force_b",
+                "grid_moment_b",
+                "moment_b",
+            }
+            telemetry["truth"] = {
+                key: value for key, value in truth.items() if key in visible_truth
+            }
+        controller = telemetry.get("controller")
+        if isinstance(controller, dict):
+            diagnostics = controller.get("diagnostics")
+            if isinstance(diagnostics, dict):
+                controller["diagnostics"] = {
+                    key: value
+                    for key, value in diagnostics.items()
+                    if key == "controller.lqr_blend"
+                }
+        reference = telemetry.get("reference")
+        if isinstance(reference, dict):
+            telemetry["reference"] = {
+                key: value
+                for key, value in reference.items()
+                if key == "target_attitude_q_wb"
+            }
+        return telemetry
+
+    def _write_stream_chunk(self, payload: object) -> None:
+        body = (
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            + "\n"
+        ).encode("utf-8")
+        self.wfile.write(f"{len(body):X}\r\n".encode("ascii"))
+        self.wfile.write(body)
+        self.wfile.write(b"\r\n")
+        self.wfile.flush()
+
+    def _runtime_stream(
+        self,
+        session_id: str,
+        query: dict[str, list[str]],
+    ) -> None:
         try:
+            session = self.server.runtime_registry.get(session_id)  # type: ignore[attr-defined]
+            after = int(query.get("after", ["-1"])[0])
+        except KeyError as error:
+            self._error(str(error), HTTPStatus.NOT_FOUND)
+            return
+        except (TypeError, ValueError) as error:
+            self._error(str(error))
+            return
+
+        self.send_response(HTTPStatus.OK)
+        self.send_header(
+            "Content-Type",
+            "application/x-ndjson; charset=utf-8",
+        )
+        self.send_header("Transfer-Encoding", "chunked")
+        self.send_header("Cache-Control", "no-store, no-transform")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        self.close_connection = True
+        last_write = time.monotonic()
+        try:
+            while True:
+                telemetry = session.telemetry(after)
+                now = time.monotonic()
+                if telemetry is not None:
+                    after = int(telemetry["sequence"])
+                    telemetry = self._compact_webui_telemetry(telemetry)
+                    trace = telemetry.setdefault("latency_trace", {})
+                    trace["telemetry_transport"] = "stream"
+                    trace["server_response_started_ns"] = time.time_ns()
+                    status = session.status()
+                    self._write_stream_chunk({
+                        "telemetry": telemetry,
+                        "session": status,
+                    })
+                    last_write = now
+                    if status["state"] in {"closed", "faulted"}:
+                        break
+                elif now - last_write >= 1.0:
+                    status = session.status()
+                    self._write_stream_chunk({
+                        "heartbeat": True,
+                        "session": status,
+                    })
+                    last_write = now
+                    if status["state"] in {"closed", "faulted"}:
+                        break
+                time.sleep(.01)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            try:
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+    def _runtime_post(
+        self,
+        session_id: str,
+        action: str,
+        *,
+        request_received_ns: int,
+    ) -> None:
+        try:
+            if action == "close":
+                self._discard_request_body()
+                self.server.runtime_registry.close(session_id)  # type: ignore[attr-defined]
+                self._json({"closed": True, "session_id": session_id})
+                return
             session = self.server.runtime_registry.get(session_id)  # type: ignore[attr-defined]
             accepted = True
             if action == "control":
                 body = self._request_json(64 * 1024)
-                accepted = session.update_command(int(body.get("sequence", -1)), _require_mapping(body.get("channels"), "channels"))
+                accepted = session.update_command(
+                    int(body.get("sequence", -1)),
+                    _require_mapping(body.get("channels"), "channels"),
+                    trace=_require_mapping(body.get("trace", {}), "trace"),
+                    server_received_ns=request_received_ns,
+                )
+                # This endpoint is the high-rate input path. Returning the full
+                # runtime status here needlessly couples input latency to
+                # simulation/status lock contention.
+                self._json({
+                    "accepted": accepted,
+                    "server_control_received_ns": request_received_ns,
+                    "server_control_response_started_ns": time.time_ns(),
+                })
+                return
             elif action == "start":
-                session.start()
+                body = self._request_json(64 * 1024)
+                accepted = session.start(
+                    int(body.get("sequence", -1)),
+                    _require_mapping(body.get("channels"), "channels"),
+                    trace=_require_mapping(body.get("trace", {}), "trace"),
+                    server_received_ns=request_received_ns,
+                )
             elif action == "pause":
+                self._discard_request_body()
                 session.pause()
             elif action == "step":
-                session.step_once()
+                body = self._request_json(64 * 1024)
+                accepted = session.step_once(
+                    int(body.get("sequence", -1)),
+                    _require_mapping(body.get("channels"), "channels"),
+                    trace=_require_mapping(body.get("trace", {}), "trace"),
+                    server_received_ns=request_received_ns,
+                )
             elif action == "reset":
+                self._discard_request_body()
                 session.reset()
+            if action in {"start", "step"}:
+                # Start/step already accepted the input atomically. Respond
+                # before any status serialization so the browser can begin its
+                # steady control pump without consuming the watchdog window.
+                self._json({
+                    "accepted": accepted,
+                    "server_control_received_ns": request_received_ns,
+                    "server_control_response_started_ns": time.time_ns(),
+                })
+                return
             self._json({"accepted": accepted, "session": session.status()})
         except KeyError as error:
             self._error(str(error), HTTPStatus.NOT_FOUND)
@@ -276,7 +636,15 @@ class WebUIHandler(SimpleHTTPRequestHandler):
             data = json.loads(text) if path.suffix.lower() == ".json" else yaml.safe_load(text)
             if not isinstance(data, dict):
                 raise ValueError("配置文件顶层必须是映射对象")
-            kind = "simenv" if "timing" in data and "body" in data else "test" if "environment" in data or "command_source" in data else "unknown"
+            kind = (
+                "simenv"
+                if "timing" in data and "body" in data
+                else "test"
+                if "environment" in data or "command_source" in data
+                else "controller"
+                if "type" in data and isinstance(data.get("params", {}), Mapping)
+                else "unknown"
+            )
             self._json({
                 "root": root_name,
                 "path": path.relative_to(root).as_posix(),
@@ -287,10 +655,6 @@ class WebUIHandler(SimpleHTTPRequestHandler):
             })
         except (OSError, UnicodeError, ValueError, json.JSONDecodeError, yaml.YAMLError) as error:
             self._error(str(error))
-
-    def log_message(self, fmt: str, *args: object) -> None:
-        print(f"[{self.log_date_time_string()}] {self.address_string()} {fmt % args}")
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Serve RL Flight WebUI and restricted server config files")
@@ -325,11 +689,12 @@ def main() -> None:
         raise ValueError("every checkpoint root must be an existing server directory")
     runtime_log_root = Path(args.runtime_log_root).expanduser().resolve()
     runtime_log_root.mkdir(parents=True, exist_ok=True)
-    from runtime import RuntimeRegistry
-    server = ThreadingHTTPServer((args.host, args.port), WebUIHandler)
+    from runtime import OfflineRolloutRegistry, RuntimeRegistry
+    server = WebUIHTTPServer((args.host, args.port), WebUIHandler)
     server.config_roots = roots  # type: ignore[attr-defined]
     server.checkpoint_roots = checkpoint_roots  # type: ignore[attr-defined]
     server.runtime_registry = RuntimeRegistry(runtime_log_root)  # type: ignore[attr-defined]
+    server.rollout_registry = OfflineRolloutRegistry(runtime_log_root)  # type: ignore[attr-defined]
     print(f"RL Flight WebUI: http://{args.host}:{args.port}")
     for name, path in roots.items():
         print(f"  config root {name}: {path}")
@@ -341,6 +706,7 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        server.rollout_registry.close_all()  # type: ignore[attr-defined]
         server.runtime_registry.close_all()  # type: ignore[attr-defined]
         server.server_close()
 

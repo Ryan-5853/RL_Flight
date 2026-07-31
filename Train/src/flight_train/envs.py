@@ -613,6 +613,108 @@ class SimEnvAdapter:
             device=self.device,
         )
 
+    @torch.no_grad()
+    def step_without_reset(
+        self,
+        standard_action: torch.Tensor,
+        active_mask: torch.Tensor,
+    ) -> TensorDict:
+        """推进固定评测一步，不执行 episode 自动重置或设备到主机同步。
+
+        固定评测只关心每个实例第一次终止前的轨迹。调用方在设备端维护
+        ``active_mask``，已终止或已经到达场景 horizon 的实例会被冻结。与训练
+        ``step`` 不同，本路径绝不调用 ``simulator.reset``，因此不会为通常为空
+        的 reset mask 在每个 500 Hz 时间步执行 ``.item()`` 同步。
+        """
+
+        assert_tensor_on(
+            standard_action,
+            device=self.device,
+            dtype=self.dtype,
+            shape=(self.batch_size, 4),
+            name="standard_action",
+        )
+        assert_tensor_on(
+            active_mask,
+            device=self.device,
+            dtype=torch.bool,
+            shape=(self.batch_size,),
+            name="evaluation active mask",
+        )
+        pilot = self.command_source.snapshot()
+        command = self.action_to_command(
+            standard_action,
+            pilot.upper_throttle,
+            self.control_contract_config.policy_action_trim,
+            self.control_contract_config.policy_action_residual_scale,
+        )
+        result = self.simulator.advance(command, active_mask=active_mask)
+        base_observation, attitude, angular_velocity, height = (
+            self._base_observation()
+        )
+        transition = self.task.transition(
+            attitude,
+            angular_velocity,
+            pilot.target_attitude_q_wb,
+            standard_action,
+            self.previous_action,
+            episode_step=self.episode_step,
+            max_episode_steps=self.max_episode_steps,
+            env_context=self._reward_environment_context(),
+            desired_yaw_rate=self.command_source.desired_yaw_rate,
+        )
+        valid = result.valid[:, None] & transition.valid
+        terminated = active_mask[:, None] & (
+            transition.terminated | ~valid
+        )
+        self.episode_step = self.episode_step + active_mask.to(torch.int64)
+        self.previous_action = torch.where(
+            active_mask[:, None],
+            standard_action,
+            self.previous_action,
+        )
+        self.command_source.step(
+            height,
+            active_mask=active_mask & ~terminated.squeeze(-1),
+        )
+        no_reset = torch.zeros_like(active_mask)
+        # 与训练 step 保持相同的观测时序：飞手命令和 previous_action 更新后，
+        # 再构造交给下一控制周期的观测。上面的 base_observation 只属于本次
+        # transition，不能写入下一帧历史。
+        next_base_observation, _attitude, _rate, _height = (
+            self._base_observation()
+        )
+        self._append_observation_history(next_base_observation, no_reset)
+        observation = self._history_observation()
+        truth = self.simulator.observe(
+            "truth",
+            ("position_n", "velocity_n", "attitude_q_wb"),
+        ).values
+        info = dict(transition.info)
+        info["truth.position_n"] = truth["position_n"]
+        info["truth.velocity_n"] = truth["velocity_n"]
+        info["truth.attitude_q_wb"] = truth["attitude_q_wb"]
+        return TensorDict(
+            {
+                "observation": observation,
+                "reward": transition.reward,
+                "terminated": terminated,
+                "truncated": torch.zeros_like(terminated),
+                "done": terminated,
+                "valid": valid,
+                "is_init": no_reset[:, None],
+                "episode_id": self.episode_id.clone(),
+                "episode_step": self.episode_step.clone(),
+                "info": TensorDict(
+                    info,
+                    batch_size=[self.batch_size],
+                    device=self.device,
+                ),
+            },
+            batch_size=[self.batch_size],
+            device=self.device,
+        )
+
     def _observation(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """读取当前物理状态，并返回不改变历史游标的策略观测。"""
 
@@ -855,7 +957,7 @@ class SimEnvAdapter:
 
 
 def _load_timing(path: Path) -> tuple[int, int]:
-    """从公开配置读取结构性频率，不访问 SimEnv 私有成员。"""
+    """从公开配置读取固定 500 Hz 单步时基，不访问 SimEnv 私有成员。"""
     text = path.read_text(encoding="utf-8")
     try:
         config = json.loads(text)
@@ -873,9 +975,11 @@ def _load_timing(path: Path) -> tuple[int, int]:
         or not isinstance(physics_hz, int)
         or isinstance(control_hz, bool)
         or not isinstance(control_hz, int)
-        or physics_hz <= 0
-        or control_hz <= 0
-        or physics_hz % control_hz
+        or physics_hz != 500
+        or control_hz != 500
     ):
-        raise ValueError("simulator timing must contain positive integral physics/control frequencies")
+        raise ValueError(
+            "simulator timing.physics_hz and timing.control_hz must both "
+            "equal 500 for single-step simulation"
+        )
     return physics_hz, control_hz

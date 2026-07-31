@@ -40,16 +40,16 @@ CASES = (
 
 
 def expected_grid_values(
-    thrust: float, servo_commands: tuple[float, float, float]
+    thrust: float, servo_angles: tuple[float, float, float]
 ) -> tuple[torch.Tensor, torch.Tensor]:
     forces: list[list[float]] = []
     moments: list[list[float]] = []
     neutral = [0.0, 0.0, -1.0]
-    for index, command in enumerate(servo_commands):
+    for index, servo_angle in enumerate(servo_angles):
         theta = index * 2.0 * math.pi / 3.0
         axis = [math.cos(theta), math.sin(theta), 0.0]
         arm = [0.1 * axis[0], 0.1 * axis[1], 0.25]
-        direction = rodrigues(neutral, axis, 0.2 * command)
+        direction = rodrigues(neutral, axis, servo_angle)
         force = [thrust * component / 3.0 for component in direction]
         forces.append(force)
         moments.append(cross(arm, force))
@@ -73,7 +73,8 @@ def run() -> None:
                 raise AssertionError(f"invalid instances: {result.error_code.tolist()}")
             truth = env.observe("truth").values
 
-        expected_speed = 100.0 * (1.0 - math.exp(-1.0))
+        dt = 1.0 / 500.0
+        expected_speed = 100.0 * (1.0 - math.exp(-dt / 0.01))
         expected_thrust = 2.0e-3 * expected_speed**2
         assert_close(
             truth["motor_speed"],
@@ -88,8 +89,17 @@ def run() -> None:
 
         expected_total_moments = []
         for row, (_, servo) in enumerate(CASES):
+            expected_servo_angles = tuple(
+                0.2 * command * (1.0 - math.exp(-dt / 0.01))
+                for command in servo
+            )
             expected_force, expected_moment = expected_grid_values(
-                expected_thrust, servo
+                expected_thrust, expected_servo_angles
+            )
+            assert_close(
+                truth["servo_angle"][row],
+                torch.tensor(expected_servo_angles),
+                label=f"{CASES[row][0]} exact servo response",
             )
             assert_close(
                 truth["grid_force_b"][row],
@@ -135,4 +145,3 @@ def run() -> None:
 
 if __name__ == "__main__":
     run()
-

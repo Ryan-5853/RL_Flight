@@ -15,6 +15,7 @@ class RewardOutput:
     reward: torch.Tensor
     terms: TensorDictBase
     valid: torch.Tensor | None = None
+    diagnostics: TensorDictBase | None = None
 
 
 class RewardCalculator(Protocol):
@@ -28,7 +29,7 @@ class RewardCalculator(Protocol):
 
 
 class AttitudeRewardCalculator:
-    """姿态自稳奖励 v3：生存优先、分轴跟踪与提前安全 barrier。"""
+    """姿态自稳奖励 v3：生存优先、可选最差轴联合跟踪与安全 barrier。"""
 
     version = 3
 
@@ -95,6 +96,51 @@ class AttitudeRewardCalculator:
         ):
             raise ValueError("yaw_rate_cost_cap must be positive when configured")
         self.angular_rate_weight = float(params.get("angular_rate_weight", 0.05))
+        self.joint_tracking_weight = float(
+            params.get("joint_tracking_weight", 0.0)
+        )
+        self.joint_roll_pitch_scale_rad = float(
+            params.get(
+                "joint_roll_pitch_scale_rad",
+                math.radians(10.0),
+            )
+        )
+        self.joint_yaw_rate_scale_rad_s = float(
+            params.get("joint_yaw_rate_scale_rad_s", 1.0)
+        )
+        self.joint_tracking_huber_delta = float(
+            params.get("joint_tracking_huber_delta", 1.0)
+        )
+        if (
+            not math.isfinite(self.joint_tracking_weight)
+            or self.joint_tracking_weight < 0
+        ):
+            raise ValueError("joint_tracking_weight must be finite and nonnegative")
+        for name, value in (
+            (
+                "joint_roll_pitch_scale_rad",
+                self.joint_roll_pitch_scale_rad,
+            ),
+            (
+                "joint_yaw_rate_scale_rad_s",
+                self.joint_yaw_rate_scale_rad_s,
+            ),
+            (
+                "joint_tracking_huber_delta",
+                self.joint_tracking_huber_delta,
+            ),
+        ):
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+        if self.joint_tracking_weight > 0 and (
+            self.roll_pitch_weight != 0
+            or self.tilt_weight != 0
+            or self.yaw_rate_weight != 0
+        ):
+            raise ValueError(
+                "joint tracking is mutually exclusive with roll_pitch_weight, "
+                "tilt_weight, and yaw_rate_weight"
+            )
         self.action_rate_weight = float(params.get("action_rate_weight", 0.01))
         self.saturation_weight = float(params.get("saturation_weight", 0.02))
         self.alive_bonus = float(params.get("alive_bonus", 0.0))
@@ -182,6 +228,44 @@ class AttitudeRewardCalculator:
                 / (self.yaw_rate_cost_cap + yaw_rate_cost)
             )
         reward_yaw_rate = -self.yaw_rate_weight * yaw_rate_cost
+        normalized_roll_pitch = (
+            torch.linalg.vector_norm(
+                roll_pitch_error,
+                dim=-1,
+                keepdim=True,
+            )
+            / self.joint_roll_pitch_scale_rad
+        )
+        normalized_yaw_rate = (
+            yaw_rate_error.abs() / self.joint_yaw_rate_scale_rad_s
+        )
+        delta = self.joint_tracking_huber_delta
+        joint_roll_pitch_cost = torch.where(
+            normalized_roll_pitch <= delta,
+            normalized_roll_pitch.square(),
+            2.0 * delta * normalized_roll_pitch - delta**2,
+        )
+        joint_yaw_rate_cost = torch.where(
+            normalized_yaw_rate <= delta,
+            normalized_yaw_rate.square(),
+            2.0 * delta * normalized_yaw_rate - delta**2,
+        )
+        # 最差轴（Chebyshev）聚合是非补偿式标量化：已经较好的轴继续变好
+        # 不会掩盖另一轴的坏结果，也不会给“牺牲好轴换取坏轴收益”提供奖励。
+        # 在两项不相等时，主奖励变化完全由当前较差的一项决定。
+        reward_joint_tracking = -self.joint_tracking_weight * torch.maximum(
+            joint_roll_pitch_cost,
+            joint_yaw_rate_cost,
+        )
+        # 主导轴比例用于判断 worst-axis 奖励是否在两个目标之间正常切换。
+        # 完全相等时 torch.maximum 会在两边分配次梯度，诊断也各记 0.5，
+        # 从而保证两个 dominance 指标逐样本之和恒为 1。
+        joint_cost_tie = joint_roll_pitch_cost == joint_yaw_rate_cost
+        joint_roll_pitch_dominant = (
+            (joint_roll_pitch_cost > joint_yaw_rate_cost).to(action.dtype)
+            + 0.5 * joint_cost_tie.to(action.dtype)
+        )
+        joint_yaw_rate_dominant = 1.0 - joint_roll_pitch_dominant
         reward_rate = -self.angular_rate_weight * rate_cost
         reward_action_rate = -self.action_rate_weight * action_rate_cost
         reward_saturation = -self.saturation_weight * saturation_cost
@@ -204,6 +288,7 @@ class AttitudeRewardCalculator:
         )
         reward = (
             reward_alive + reward_attitude + reward_tilt + reward_yaw_rate
+            + reward_joint_tracking
             + reward_rate + reward_action_rate
             + reward_saturation + reward_risk + reward_survival - termination_cost
         )
@@ -213,6 +298,7 @@ class AttitudeRewardCalculator:
                 "reward.attitude": reward_attitude,
                 "reward.tilt": reward_tilt,
                 "reward.yaw_rate": reward_yaw_rate,
+                "reward.joint_tracking": reward_joint_tracking,
                 "reward.angular_rate": reward_rate,
                 "reward.action_rate": reward_action_rate,
                 "reward.saturation": reward_saturation,
@@ -223,9 +309,24 @@ class AttitudeRewardCalculator:
             batch_size=context.batch_size,
             device=context.device,
         )
+        diagnostics = TensorDict(
+            {
+                "joint_roll_pitch_cost": joint_roll_pitch_cost,
+                "joint_yaw_rate_cost": joint_yaw_rate_cost,
+                "joint_roll_pitch_dominant": joint_roll_pitch_dominant,
+                "joint_yaw_rate_dominant": joint_yaw_rate_dominant,
+            },
+            batch_size=context.batch_size,
+            device=context.device,
+        )
         if reward.shape != (context.batch_size[0], 1):
             raise ValueError("RewardCalculator must return reward with shape [B, 1]")
-        return RewardOutput(reward=reward, terms=terms, valid=torch.isfinite(reward))
+        return RewardOutput(
+            reward=reward,
+            terms=terms,
+            valid=torch.isfinite(reward),
+            diagnostics=diagnostics,
+        )
 
     def state_dict(self) -> Mapping[str, Any]:
         return {"version": self.version}

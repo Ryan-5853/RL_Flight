@@ -17,7 +17,8 @@
 | 时间、频率 | s、Hz |
 | PWM 命令 | 归一化无量纲值；电机 `[0,1]`，舵机 `[-1,1]` |
 
-默认物理仿真频率为 5 kHz，控制输入频率为 500 Hz。两个控制时刻之间使用零阶保持。
+物理仿真和控制统一使用固定 500 Hz 时基，步长为 2 ms。每次 `advance()` 对每个
+激活实例恰好推进一个仿真步，不存在隐藏的物理子步。
 
 `position_n` 和 `velocity_n` 描述质心在 NED 世界系中的位置和速度。机体原点用于定义机体几何；`center_of_mass_b`、直接推力中心和三个格栅气动中心均相对该机体原点给出。平动方程在质心处积分，转动力矩必须先用各作用点减去 `center_of_mass_b` 得到力臂。
 
@@ -28,7 +29,7 @@
 - 长度为 `K` 的查表为 `[B,K,2]`，格栅耦合矩阵为 `[B,3,3]`。
 - 所有浮点张量使用环境创建时指定的 `dtype` 和 `device`；索引、状态码和掩码分别使用 `torch.int64`、`torch.int32` 和 `torch.bool`。
 - 批量维只表示并行实例，任何物理公式都不得在维度 0 上求和、平均或归一化。
-- 一个批次内的实例具有相同模型拓扑、表格长度、物理频率和控制频率；参数值、初始状态、噪声、零偏和延迟可以不同。
+- 一个批次内的实例具有相同模型拓扑、表格长度和固定 500 Hz 时基；参数值、初始状态、噪声、零偏和延迟可以不同。
 
 ## 2. 可随机化量
 
@@ -54,7 +55,9 @@ mass:
 
 参数随机化只在 `create` 时为每个实例独立采样一次，并在该实例的整个生命周期内保持不变。标量、向量、表格和矩阵采样后分别存为 `[B]`、`[B,...]`、`[B,K,2]` 和 `[B,...,...]`，即使某个参数未启用随机化，也必须在逻辑上广播到批量维。运行时的电机噪声和传感器噪声按各自采样频率持续生成。噪声模型中的 `stddev`、`bias`、`delay` 等参数本身仍可使用上述字段进行实例级随机化。
 
-`physics_hz`、`control_hz`、设备数量、传感器类型、传感器插值策略和表格长度属于批次结构，不做实例级随机化。传感器 `sample_hz` 可以按实例随机化，但随机化后的每个值都必须整除 `physics_hz`。需要不同结构或不同时基时，应创建另一个批次；这样可避免按实例分支破坏张量化执行。
+`physics_hz` 和 `control_hz` 都必须以不可随机化的 `{value: 500}` 声明。设备数量、
+传感器类型、传感器插值策略和表格长度属于批次结构。传感器 `sample_hz` 可以按
+实例随机化，但随机化后的每个值都必须整除 500 Hz；低频传感器使用采样保持。
 
 ## 3. 创建环境 `create`
 
@@ -100,7 +103,7 @@ parallel:
   independent_rng: true  # 必须为 true；false 为非法配置
 
 timing:
-  physics_hz: {value: 5000}
+  physics_hz: {value: 500}
   control_hz: {value: 500}
 
 initial_state:
@@ -162,7 +165,8 @@ motors:
 - `pwm_to_rpm_table`：`[pwm, rad/s]` 分段线性查表；横轴必须严格递增，区间外钳位到端点。
 - `time_constant`：该桨从转速指令到实际转速的一阶惯性时间常数；上、下桨分别配置，可以不同。加速和减速使用该桨的同一个时间常数。
 - `torque_coefficient`：该桨的反扭矩平方系数，必须非负；上下桨可以不同。
-- `noise`：叠加到用于推力和反扭矩计算的有效转速，每个物理步重采样；不改变电机内部转速状态。
+- `noise`：叠加到用于推力和反扭矩计算的有效转速，每个 500 Hz 仿真步
+  重采样一次并在该 2 ms 步内保持；不改变电机内部转速状态。
 
 每个桨的转速状态按下式独立更新，其中 `tau_i` 取该桨自己的 `time_constant`：
 
@@ -170,14 +174,19 @@ motors:
 d(rpm_i)/dt = (rpm_target_i - rpm_i) / tau_i
 ```
 
-每个物理步内 PWM 目标保持常数，因此实现使用该一阶方程的精确离散响应：
+每个 2 ms 仿真步内 PWM 目标保持常数，因此周期中点和周期末转速都使用该
+一阶方程的精确离散响应：
 
 ```text
+rpm_mid_i  = rpm_i + (1 - exp(-0.5*dt / tau_i)) * (rpm_target_i - rpm_i)
 rpm_next_i = rpm_i + (1 - exp(-dt / tau_i)) * (rpm_target_i - rpm_i)
 rpm_effective_i = max(rpm_next_i + noise_i, 0)
 ```
 
-`rpm_effective` 只用于推力和反扭矩计算，内部 `motor_speed` 状态仍为 `rpm_next`；真值中的 `effective_motor_speed` 可用于核对噪声实际作用后的转速。两台共轴反桨电机均以产生 `+z_b` 向下气流为正转速方向。各桨反扭矩幅值和机体反扭矩向量定义为：
+中点有效转速用于 2 ms 宏步的刚体积分；周期末 `rpm_effective` 用于周期末气动力
+真值和传感器。内部 `motor_speed` 状态仍为 `rpm_next`，真值中的
+`effective_motor_speed` 可用于核对周期末噪声实际作用后的转速。两台共轴反桨
+电机均以产生 `+z_b` 向下气流为正转速方向。各桨反扭矩幅值和机体反扭矩向量定义为：
 
 ```text
 Q_upper = torque_coefficient_upper * rpm_effective_upper^2
@@ -212,7 +221,14 @@ servos:
 
 舵角正方向遵循机体系右手定则；每个格栅的偏转轴由气动配置给出。
 
-实现为每个舵机维护 `servo_effective_pwm`、`servo_command_angle`、`servo_target_angle`、`servo_motion_direction` 和 `servo_backlash_remaining`。PWM 变化未越过死区时保持有效 PWM；运动方向反转时先由后续命令角变化消耗 `backlash`，剩余角变化才传递到目标角。实际舵角使用 `(target-angle)/tau` 得到角速度，再由 `max_speed` 限幅并按物理步积分。
+实现为每个舵机维护 `servo_effective_pwm`、`servo_command_angle`、
+`servo_target_angle`、`servo_motion_direction` 和 `servo_backlash_remaining`。
+PWM 变化未越过死区时保持有效 PWM；运动方向反转时先由后续命令角变化消耗
+`backlash`，剩余角变化才传递到目标角。对
+`angle_dot=clip((target-angle)/tau, ±max_speed)` 使用解析分段解：若初始误差位于
+限速区，先按 `max_speed` 线性推进到指数区，再对剩余时间使用一阶系统精确解。
+实现同时求出 1 ms 中点角和 2 ms 周期末角，中点角用于刚体积分，周期末角写入
+`servo_angle` 真值和日志。
 
 ### 3.5 格栅气动参数
 
@@ -292,12 +308,13 @@ M_grid_i = (aerodynamic_center_b_i - center_of_mass_b) x F_grid_i
 ```yaml
 sensors:
   gyro:
-    sample_hz: {value: 5000}       # 默认等于 physics_hz
+    sample_hz: {value: 500}        # 默认等于固定仿真频率
     noise:
       distribution: normal
       stddev: {value: [0.002, 0.002, 0.002]} # rad/s
     bias: {value: [0.0, 0.0, 0.0]}             # rad/s
     delay: {value: 0.001}                       # s
+    interpolation: linear                       # 0.5 步延迟必须显式插值
 ```
 
 - 首版支持的传感器字段和理想输入固定如下：
@@ -309,11 +326,11 @@ sensors:
 | `motor_speed` | `[B,2]` | rad/s | 两台电机的实际 `motor_speed` |
 
 - 未声明的传感器名称必须在创建时失败，不能猜测其真值来源或单位。
-- 省略 `sample_hz` 时使用 `physics_hz`。
+- 省略 `sample_hz` 时使用 500 Hz。
 - `noise` 在每个传感器采样时刻重新采样。
 - `bias` 在创建时确定，此后保持不变；其 `value` 或随机化结果就是本实例零偏。
 - `delay` 表示从真值采样时刻到表观值可见时刻的固定延迟。
-- `sample_hz` 必须能整除 `physics_hz`；未到采样时刻时保持上一次表观值。
+- `sample_hz` 必须能整除 500 Hz；未到采样时刻时保持上一次表观值。
 - 整数物理步延迟直接读取对应历史真值。非整数物理步延迟必须配置 `interpolation: linear`，在相邻两个物理步真值间线性插值；未指定时创建失败，不得隐式取整。
 - 创建和 reset 时，历史缓冲区使用当时的初始真值填充，初始表观值为 `ideal + bias`；初始化本身不消耗运行时噪声样本。第一次正时间采样才叠加 counter 0 对应的噪声。
 
@@ -424,7 +441,12 @@ def advance(
 
 `control` 的 dtype、device 和批量大小必须与环境一致。环境逐实例检查越界和非有限控制量：合法且 `active_mask=True` 的实例推进；未激活实例保持状态和时钟不变；输入非法或已经数值失败的实例标记为无效并冻结，不得阻止其他实例推进。控制量在整个控制周期内保持不变。
 
-环境依次更新电机、舵机、气动力/力矩、六自由度状态和传感器，并将每个物理子步交给日志采样器。`full` 模式逐步保存；`compact` 模式按显式 stride/fields 保存。`physics_hz=5000`、`control_hz=500` 时，每个激活实例一次调用准确推进 10 个物理步和 2 ms。
+环境依次更新电机、舵机、气动力/力矩、六自由度状态和传感器。物理与控制时钟
+统一为 500 Hz，因此每个激活实例一次调用准确推进一个 2 ms 仿真步：
+`physics_step`、`control_step` 和 `physics_steps_advanced` 都增加 1。保留
+`physics_step` 和 `physics_steps_advanced` 字段名是为了兼容既有调用方和日志读取器；
+在单步模型中，前者是 500 Hz 仿真步计数，后者对每行只能为 0 或 1。
+`full` 模式每次推进保存一帧；`compact` 模式按显式 stride/fields 保存。
 
 ```python
 @dataclass(frozen=True)
@@ -434,7 +456,7 @@ class AdvanceResult:
     physics_step: torch.Tensor           # [B], int64
     control_step: torch.Tensor           # [B], int64
     sim_time_s: torch.Tensor             # [B]
-    physics_steps_advanced: torch.Tensor # [B], int64；未激活实例为 0
+    physics_steps_advanced: torch.Tensor # [B], int64；成功为 1，未推进为 0
     valid: torch.Tensor                  # [B], bool
     error_code: torch.Tensor             # [B], int32；0 表示正常
 ```
@@ -471,18 +493,44 @@ shape、有限性、传感器历史容量和动态随机化身份。checkpoint �
 加载；通过校验后张量会复制到目标环境 device。字段缺失或不兼容时必须失败，不能使用
 默认初始状态填补。
 
+5 kHz 旧 checkpoint 的 `physics_step`、随机计数器和传感器历史均建立在 0.2 ms
+时钟上，不能无损映射到新的 2 ms 时钟，因此会由既有的 `physics_hz/control_hz`
+兼容校验明确拒绝，不做静默换算。500 Hz 单步版本之间仍使用相同 schema version 1
+和相同公开张量结构，保存/恢复接口不变。
+
 `batch_id`、`instance_ids` 和日志线程不参与物理数值演化，不从旧状态覆盖到新环境。
 恢复后的环境保留新日志身份，并追加 `event_code=3` 的 resume 边界。验收要求连续运行
 N+M 步与运行 N 步、保存、创建新环境、恢复后运行 M 步的 truth、传感器、随机计数器
 和下一状态逐张量完全一致。
 
+旧 5 kHz timeline 文件本身仍可由既有读取器读取；新版本没有删除或改名任何
+timeline 字段。读取器应优先使用新增的 `metadata.json.simulation_hz` 和
+`simulation_step_s` 判断时基。没有这些字段的旧日志按其配置快照中的
+`timing.physics_hz` 解释，不能仅凭 `physics_step` 数值把新旧日志拼接为一条连续
+时间线。
+
 ## 7. 日志与校验
 
-创建批次时建立 `logs/<batch_id>/`，保存 `instance_ids`、原始配置、shape 为 `[B,...]` 的实际参数和 `[time,B,...]` 分块时间线。`logging.mode=full` 时默认逐物理步保存全部控制、真值、传感器和状态字段，可用于逐步复盘；`compact` 时由 `physics_step_stride` 和 `fields` 显式声明降采样与字段裁剪，不能宣称物理级逐步可重放。初始化和恢复事件不受 stride 影响，始终写入共享时间线；`full` 模式的重置事件也写入共享时间线，`compact` 模式的重置后状态则按选中实例稀疏写入对应 reset snapshot 的 `post_reset_timeline`，避免为少量重置复制完整批次。实际模式、stride、字段清单写入 `metadata.json`。`event_code=-1` 表示该日志行对该槽位无事件，0 表示物理调度步，1 表示初始状态，2 表示重置事件，3 表示从完整动态状态恢复。
+创建批次时建立 `logs/<batch_id>/`，保存 `instance_ids`、原始配置、shape 为
+`[B,...]` 的实际参数和 `[time,B,...]` 分块时间线。`logging.mode=full` 时默认逐
+500 Hz 仿真步保存全部控制、真值、传感器和状态字段，可用于逐步复盘；`compact`
+时由 `physics_step_stride` 和 `fields` 显式声明降采样与字段裁剪，不能宣称逐步
+可重放。`physics_step_stride=N` 现在明确表示每 `N*2 ms` 保存一次普通帧。
+初始化和恢复事件不受 stride 影响，始终写入共享时间线；`full` 模式的重置事件也
+写入共享时间线，`compact` 模式的重置后状态则按选中实例稀疏写入对应 reset
+snapshot 的 `post_reset_timeline`，避免为少量重置复制完整批次。`metadata.json`
+保留既有字段，并额外写入 `simulation_hz=500`、`simulation_step_s=0.002` 和
+`timeline_step_semantics`，旧读取器可忽略这些新增字段。`event_code=-1` 表示该
+日志行对该槽位无事件，0 表示普通仿真步，1 表示初始状态，2 表示重置事件，
+3 表示从完整动态状态恢复。
 
 每次非空重置还必须追加一条 UUID 映射事件，并保存 `reset_mask[B]`、该次重置的配置快照和参数。`full` 模式保存完整 `[B,...]` 候选参数；`compact` 模式保存 `parameter_instance_indices` 以及 mask 选中行，避免高并行训练反复复制未重置槽位。通过 `instance_index + generation` 可以将共享时间线无歧义地映射到对应 UUID。共享存储只是写入优化，不改变实例的逻辑隔离。
 
-创建时必须校验：`parallel.independent_rng` 为 true；质量和三轴惯量为正；四元数已归一化；所有表格横轴严格递增；上下桨时间常数为正；反扭矩系数非负；推力系数组合对非负转速不产生负推力；推力分配比例之和为 1；所有气动作用点和质心采用同一机体系；推力方向与格栅轴均为单位向量；衰减比例合法；传感器频率可由物理时间步调度；`physics_hz / control_hz` 为正整数。
+创建时必须校验：`parallel.independent_rng` 为 true；`physics_hz` 和
+`control_hz` 都严格等于 500；质量和三轴惯量为正；四元数已归一化；所有表格
+横轴严格递增；上下桨时间常数为正；反扭矩系数非负；推力系数组合对非负转速
+不产生负推力；推力分配比例之和为 1；所有气动作用点和质心采用同一机体系；
+推力方向与格栅轴均为单位向量；衰减比例合法；传感器频率能整除 500 Hz。
 
 相同配置、seed、`parallel_count` 和控制序列必须产生相同的实例参数、状态和传感器序列。检测到 `NaN`、`Inf` 或物理约束错误时，只冻结对应实例并记录具体字段；除非日志设备或执行设备发生批次级故障，否则不得停止其他实例。
 
@@ -510,7 +558,9 @@ coupling_attenuation    # [B,3,3]
 
 ### 8.2 动力学与执行器
 
-每个物理子步依次执行：电机状态、舵机状态、四路推力与力矩、刚体加速度、速度/角速度、位置/四元数、传感器。控制量在整个控制周期内零阶保持。所有查表均使用端点钳位的批量分段线性插值。
+每个 2 ms 仿真步依次执行：离散机械事件、电机与舵机的解析中点/周期末状态、
+中点四路推力与力矩、中点刚体积分、周期末气动力真值和传感器。控制量在整个
+仿真步内零阶保持。所有查表均使用端点钳位的批量分段线性插值。
 
 四路机体系力及总力矩为：
 
@@ -537,7 +587,29 @@ angular_acceleration_b = (
 ) / inertia_diagonal_b
 ```
 
-其中 NED 重力为 `gravity_n=[0,0,9.80665] m/s^2`。平动和角速度使用半隐式 Euler：先更新速度，再用新速度更新位置；Hamilton 四元数满足 `q_dot=0.5*q⊗[0,omega_b]`，每步更新后重新归一化。四元数积分使用更新后的机体系角速度。
+其中 NED 重力为 `gravity_n=[0,0,9.80665] m/s^2`。刚体使用固定 2 ms 的显式
+中点法。周期中点机体系力矩先预测中点角速度，再由中点陀螺项得到周期末角速度；
+周期中点姿态把中点机体系合力旋转到 NED。平动更新为：
+
+```text
+v_next = v + a_mid * dt
+p_next = p + v * dt + 0.5 * a_mid * dt^2
+```
+
+姿态使用中点机体系角速度的 Hamilton 四元数指数映射：
+
+```text
+delta_q = [
+    cos(norm(omega_mid)*dt/2),
+    unit(omega_mid)*sin(norm(omega_mid)*dt/2)
+]
+q_next = normalize(q * delta_q)
+```
+
+零角速度极限使用 `delta_q.vector = 0.5*dt*omega_mid`，避免除零。公开的
+`linear_acceleration_n`、`angular_acceleration_b`、气动力和力矩字段均在周期末
+状态重新计算，因此同一条日志记录中的可观测真值共享同一个时间戳；内部中点量
+不加入公开 truth schema，从而保持接口和日志字段兼容。
 
 上下桨各自的时间常数、PWM 死区、舵机死区、回差、限速和实例有效状态都使用 `[B,...]` 张量或布尔掩码实现，不能使用基于单个实例值的 Python `if`。耦合推力二次式和两个独立反扭矩平方项同样在整个批次上直接计算。
 
@@ -554,7 +626,9 @@ grid_moment_b = torch.linalg.cross(
 
 时间线中的动力学分量至少包括 `motor_speed[B,2]`、`effective_motor_speed[B,2]`、`total_thrust[B]`、`motor_torque[B,2]`、`direct_force_b[B,3]`、`grid_force_b[B,3,3]`、`direct_moment_b[B,3]`、`grid_moment_b[B,3,3]`、`motor_reaction_moment_b[B,3]`、`force_b[B,3]` 和 `moment_b[B,3]`。`motor_torque` 保存上、下桨各自的非负反扭矩幅值，最终机体轴向反扭矩取二者之差；`total_thrust` 是含 `k3` 耦合项的整体推力，不提供可线性求和的单桨推力字段。
 
-物理子步在时间上存在严格前后依赖，因此允许对固定的 `substeps = physics_hz // control_hz` 做循环；循环体内部必须完全张量化，不得包含 `for instance in range(B)`。固定子步循环可由 `torch.compile` 捕获并融合；是否启用自动微分由调用方决定，不影响接口。
+推进路径不得存在物理子步循环；一次 `advance()` 只调用一次动力学内核、一次
+传感器内核和一次日志调度。循环体内部仍不得包含 `for instance in range(B)`；
+是否启用自动微分由调用方决定，不影响接口。
 
 ### 8.3 传感器与延迟
 
@@ -572,11 +646,14 @@ random_key = hash(base_seed, instance_index, subsystem_id, sample_counter)
 
 其中 `subsystem_id` 区分参数随机化、电机 1/2 和各传感器，`sample_counter` 为 `[B]` 独立计数。传感器层用这些张量 key 直接生成完整 `[B,...]` 标准正态噪声，再用采样到期掩码提交并只递增到期实例的 counter。这样暂停、冻结、reset 或修改实例 `i` 不会改变实例 `j` 的随机序列；增加批量大小也不会改变原有索引实例的序列。
 
-若首版只使用单个 `torch.Generator`，也必须每个物理步为所有 B 个实例生成固定 shape 的噪声，不能根据 `active_mask` 改变随机数消耗量。但该方案只保证固定批次下可复现，不满足严格的实例随机流隔离，因此不作为最终实现。
+若使用单个 `torch.Generator`，也必须每个 500 Hz 仿真步为所有 B 个实例生成固定
+shape 的噪声，不能根据 `active_mask` 改变随机数消耗量。但该方案只保证固定批次
+下可复现，不满足严格的实例随机流隔离，因此不作为最终实现。
 
 ### 8.5 故障隔离
 
-环境维护 `valid[B]` 和 `error_code[B]`。每个物理子步计算候选新状态后，先逐实例检查有限性和物理边界，再通过掩码提交：
+环境维护 `valid[B]` 和 `error_code[B]`。每个 500 Hz 仿真步计算候选新状态后，
+先逐实例检查有限性和物理边界，再通过掩码提交：
 
 ```python
 commit = active_mask & valid & candidate_is_finite
@@ -588,7 +665,10 @@ valid = valid & candidate_is_finite
 
 ### 8.6 张量化日志
 
-每个物理步直接写入设备上的预分配日志块 `[chunk_steps,B,...]`。块满后使用 pinned memory 和非阻塞复制交给后台写线程，推进路径中禁止逐实例写文件、调用 `.item()` 或每步执行同步 `.cpu()`。日志块带有 `active_mask`、`valid` 和 `instance_index`，因此暂停实例和失败实例仍可被准确解释。
+每个被日志 stride 选中的 500 Hz 仿真步直接写入设备上的预分配日志块
+`[chunk_steps,B,...]`。块满后使用 pinned memory 和非阻塞复制交给后台写线程，
+推进路径中禁止逐实例写文件、调用 `.item()` 或每步执行同步 `.cpu()`。日志块带有
+`active_mask`、`valid` 和 `instance_index`，因此暂停实例和失败实例仍可被准确解释。
 
 若日志写入速度低于仿真速度，环境必须按配置选择阻塞或报告溢出错误，不得静默丢弃记录。日志缓冲区大小属于批次结构，在创建时完成分配。`logging.minimum_free_space_bytes` 指定日志写入后必须保留的磁盘余量（默认 512 MiB）；每个 tensor 文件写入前按实际 storage 大小预检，并通过临时文件、`fsync` 和原子替换发布。余量不足时抛出 `InsufficientDiskSpaceError`，不发布半截 timeline，调用方应在最近的训练安全边界停止。
 

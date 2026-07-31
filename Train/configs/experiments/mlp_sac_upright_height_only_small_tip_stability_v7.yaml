@@ -210,14 +210,25 @@ evaluation:
   enabled: true
   interval_control_steps: 1048576
   suite_path: ../evaluation/fixed_self_stabilize_v2.yaml
+  execution:
+    # 训练与固定评测共享 cuda:0，但评测在独立 spawn 子进程中运行。
+    mode: subprocess
+    # V100 优化后完整评测实测约 3.1 min；最多 4 个 worker 为共享 GPU
+    # 受其他任务干扰、评测到达突发和训练结束时的 final 评测保留余量。
+    max_in_flight: 4
+    # 评测慢于触发间隔时只保留最新 checkpoint，禁止任务无限积压。
+    pending_policy: latest
+    # 用硬链接固定完整 checkpoint；worker 只加载单独的小型 actor 快照。
+    pin_checkpoint: hardlink
+    # 训练结束前消费所有在途结果，并保证最终 checkpoint 接受完整评测。
+    wait_for_final: true
+    # 周期评测故障会被记录，但不牺牲已进行的训练。
+    failure_policy: continue_training
 
 checkpoint:
-  # checkpoint 预计约 5 GiB；写前还必须保留 8 GiB 给状态和日志收尾。
   minimum_free_space_bytes: 8589934592
   resume:
-    # v6 保留点中，最终 checkpoint 的训练生存最高、动作最小，且完整
-    # p/q-only 悬停评测能跑满 10 s；这里只加载 actor，不加载旧 Q/replay。
-    from: ../../runs/mlp_sac_upright_height_only_small_tip_stability_v6/20260725T231938Z_ef791427f690_d8f8c4a0/checkpoints/step_16777216.pt
+    from: ../../runs/mlp_sac_upright_height_only_small_tip_stability_v7/20260730T022839Z_358f29c69d10_b50e9f9b/checkpoints/step_3145728.pt
     mode: policy
   interval_control_steps: 524288
   keep_last: 4

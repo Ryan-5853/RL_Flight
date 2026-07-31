@@ -52,6 +52,10 @@ class TensorDynamicsKernel:
         candidates = {
             "motor_response": 1.0
             - torch.exp(-physics_dt / parameters["motors.time_constant"]),
+            "motor_midpoint_response": 1.0
+            - torch.exp(
+                -0.5 * physics_dt / parameters["motors.time_constant"]
+            ),
             "direct_arm_b": (
                 parameters["aerodynamics.direct_thrust_center_b"]
                 - parameters["body.center_of_mass_b"]
@@ -111,16 +115,23 @@ class TensorDynamicsKernel:
         next_state = dict(state)
 
         # 执行器先响应当前保持不变的控制信号，再由实际转速和实际舵角计算气动力。
-        motor_speed, effective_motor_speed, total_thrust, motor_torque = self._update_motors(
+        (
+            motor_speed,
+            effective_motor_speed,
+            total_thrust,
+            motor_torque,
+            midpoint_total_thrust,
+            midpoint_motor_torque,
+        ) = self._update_motors(
             state,
             parameters,
             control[:, :2],
-            physics_dt,
             instance_seeds,
             motor_noise_counters,
         )
         (
             servo_angle,
+            midpoint_servo_angle,
             servo_effective_pwm,
             servo_command_angle,
             servo_target_angle,
@@ -130,23 +141,72 @@ class TensorDynamicsKernel:
             state, parameters, control[:, 2:], physics_dt
         )
 
+        # 执行器在 2 ms 宏步内按解析模型推进；周期中点的力和力矩用于二阶刚体积分，
+        # 周期末的分量则作为可观测真值和日志值，保证所有公开字段位于同一时间戳。
+        midpoint_force_components = self._forces_and_moments(
+            parameters,
+            midpoint_total_thrust,
+            midpoint_motor_torque,
+            midpoint_servo_angle,
+        )
         force_components = self._forces_and_moments(
             parameters, total_thrust, motor_torque, servo_angle
         )
-        force_b = force_components["force_b"]
-        moment_b = force_components["moment_b"]
-        linear_acceleration_n, angular_acceleration_b = self._accelerations(
-            state, parameters, force_b, moment_b
-        )
 
-        # 半隐式 Euler：先更新线速度和角速度，再用新速度推进位置和姿态。
-        velocity_n = state["velocity_n"] + linear_acceleration_n * physics_dt
-        position_n = state["position_n"] + velocity_n * physics_dt
+        midpoint_moment_b = midpoint_force_components["moment_b"]
+        initial_angular_acceleration = self._angular_acceleration(
+            state["angular_velocity_b"],
+            parameters["body.inertia_diagonal_b"],
+            midpoint_moment_b,
+        )
+        midpoint_angular_velocity_b = (
+            state["angular_velocity_b"]
+            + 0.5 * initial_angular_acceleration * physics_dt
+        )
+        midpoint_angular_acceleration = self._angular_acceleration(
+            midpoint_angular_velocity_b,
+            parameters["body.inertia_diagonal_b"],
+            midpoint_moment_b,
+        )
         angular_velocity_b = (
-            state["angular_velocity_b"] + angular_acceleration_b * physics_dt
+            state["angular_velocity_b"]
+            + midpoint_angular_acceleration * physics_dt
+        )
+        midpoint_attitude_q_wb = self._integrate_quaternion(
+            state["attitude_q_wb"],
+            midpoint_angular_velocity_b,
+            0.5 * physics_dt,
         )
         attitude_q_wb = self._integrate_quaternion(
-            state["attitude_q_wb"], angular_velocity_b, physics_dt
+            state["attitude_q_wb"],
+            midpoint_angular_velocity_b,
+            physics_dt,
+        )
+
+        midpoint_linear_acceleration_n = self._linear_acceleration(
+            midpoint_attitude_q_wb,
+            parameters["body.mass"],
+            midpoint_force_components["force_b"],
+        )
+        velocity_n = (
+            state["velocity_n"] + midpoint_linear_acceleration_n * physics_dt
+        )
+        position_n = (
+            state["position_n"]
+            + state["velocity_n"] * physics_dt
+            + 0.5 * midpoint_linear_acceleration_n * physics_dt * physics_dt
+        )
+
+        # 加速度真值使用周期末状态和周期末气动力，供日志与传感器在同一时间戳读取。
+        linear_acceleration_n = self._linear_acceleration(
+            attitude_q_wb,
+            parameters["body.mass"],
+            force_components["force_b"],
+        )
+        angular_acceleration_b = self._angular_acceleration(
+            angular_velocity_b,
+            parameters["body.inertia_diagonal_b"],
+            force_components["moment_b"],
         )
 
         next_state.update(
@@ -177,11 +237,10 @@ class TensorDynamicsKernel:
         state: Mapping[str, torch.Tensor],
         parameters: Mapping[str, torch.Tensor],
         motor_pwm: torch.Tensor,
-        physics_dt: float,
         instance_seeds: torch.Tensor,
         noise_counters: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """更新上下桨转速，并计算耦合总推力和各桨反扭矩幅值。"""
+    ) -> tuple[torch.Tensor, ...]:
+        """解析推进上下桨，并计算周期中点和周期末推力/反扭矩。"""
         target_speed = self._lookup(
             motor_pwm,
             self._derived_parameters["motor_table_x"],
@@ -197,21 +256,54 @@ class TensorDynamicsKernel:
         # 控制量在物理步内恒定，因此直接使用一阶惯性环节的精确离散解。
         response = self._derived_parameters["motor_response"]
         motor_speed = current_speed + response * (target_speed - current_speed)
+        midpoint_speed = current_speed + self._derived_parameters[
+            "motor_midpoint_response"
+        ] * (target_speed - current_speed)
 
-        # 噪声只作用于曲线查表，不反馈到电机内部转速状态，且有效转速不得为负。
+        # 每个 2 ms 仿真步采样一次运行时转速扰动，在本步内保持；扰动不反馈
+        # 到电机内部状态。周期末有效转速仍是公开真值字段的定义。
         noise = self._motor_noise(instance_seeds, noise_counters)
+        speed_noise = noise * parameters["motors.noise.stddev"]
         effective_speed = torch.clamp_min(
-            motor_speed + noise * parameters["motors.noise.stddev"], 0.0
+            motor_speed + speed_noise, 0.0
         )
+        midpoint_effective_speed = torch.clamp_min(
+            midpoint_speed + speed_noise, 0.0
+        )
+        total_thrust, motor_torque = self._motor_forces(
+            effective_speed, parameters
+        )
+        midpoint_total_thrust, midpoint_motor_torque = self._motor_forces(
+            midpoint_effective_speed, parameters
+        )
+        return (
+            motor_speed,
+            effective_speed,
+            total_thrust,
+            motor_torque,
+            midpoint_total_thrust,
+            midpoint_motor_torque,
+        )
+
+    @staticmethod
+    def _motor_forces(
+        effective_speed: torch.Tensor,
+        parameters: Mapping[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         upper_speed, lower_speed = effective_speed.unbind(dim=1)
-        k1, k2, k3 = parameters["aerodynamics.thrust_coefficients"].unbind(dim=1)
+        k1, k2, k3 = parameters[
+            "aerodynamics.thrust_coefficients"
+        ].unbind(dim=1)
         total_thrust = (
             k1 * upper_speed.square()
             + k2 * lower_speed.square()
             + k3 * upper_speed * lower_speed
         )
-        motor_torque = parameters["motors.torque_coefficient"] * effective_speed.square()
-        return motor_speed, effective_speed, total_thrust, motor_torque
+        motor_torque = (
+            parameters["motors.torque_coefficient"]
+            * effective_speed.square()
+        )
+        return total_thrust, motor_torque
 
     def _update_servos(
         self,
@@ -220,7 +312,7 @@ class TensorDynamicsKernel:
         servo_pwm: torch.Tensor,
         physics_dt: float,
     ) -> tuple[torch.Tensor, ...]:
-        """更新三个舵机的死区、反向回差、一阶惯性和速度限制状态。"""
+        """处理离散机械事件，并解析推进带限速的一阶舵机。"""
         previous_pwm = state["servo_effective_pwm"]
         # PWM 变化不足以跨越死区时保持上一次有效命令，避免舵机在死区内抖动。
         outside_deadzone = (
@@ -260,21 +352,55 @@ class TensorDynamicsKernel:
             command_direction != 0, command_direction, previous_direction
         )
 
-        # 舵机一阶响应得到的角速度还要受到实际最大机械速度约束。
-        angle_rate = torch.clamp(
-            (target_angle - state["servo_angle"]) / parameters["servos.tau"],
-            min=-parameters["servos.max_speed"],
-            max=parameters["servos.max_speed"],
+        midpoint_servo_angle = self._servo_response(
+            state["servo_angle"],
+            target_angle,
+            parameters["servos.tau"],
+            parameters["servos.max_speed"],
+            0.5 * physics_dt,
         )
-        servo_angle = state["servo_angle"] + angle_rate * physics_dt
+        servo_angle = self._servo_response(
+            state["servo_angle"],
+            target_angle,
+            parameters["servos.tau"],
+            parameters["servos.max_speed"],
+            physics_dt,
+        )
         return (
             servo_angle,
+            midpoint_servo_angle,
             effective_pwm,
             command_angle,
             target_angle,
             motion_direction,
             backlash_remaining,
         )
+
+    @staticmethod
+    def _servo_response(
+        initial_angle: torch.Tensor,
+        target_angle: torch.Tensor,
+        tau: torch.Tensor,
+        max_speed: torch.Tensor,
+        duration: float,
+    ) -> torch.Tensor:
+        """精确求解 ``angle_dot=clip((target-angle)/tau, ±max_speed)``。"""
+        error = target_angle - initial_angle
+        direction = torch.sign(error)
+        exponential_boundary = tau * max_speed
+        linear_time = torch.clamp_min(
+            (torch.abs(error) - exponential_boundary) / max_speed,
+            0.0,
+        )
+        duration_tensor = torch.full_like(initial_angle, duration)
+        linear_duration = torch.minimum(linear_time, duration_tensor)
+        angle_after_linear = (
+            initial_angle + direction * max_speed * linear_duration
+        )
+        exponential_duration = duration_tensor - linear_duration
+        return target_angle + (
+            angle_after_linear - target_angle
+        ) * torch.exp(-exponential_duration / tau)
 
     def _forces_and_moments(
         self,
@@ -352,27 +478,26 @@ class TensorDynamicsKernel:
             "moment_b": moment_b,
         }
 
-    def _accelerations(
+    def _linear_acceleration(
         self,
-        state: Mapping[str, torch.Tensor],
-        parameters: Mapping[str, torch.Tensor],
+        attitude_q_wb: torch.Tensor,
+        mass: torch.Tensor,
         force_b: torch.Tensor,
+    ) -> torch.Tensor:
+        """由同一时刻的姿态和机体系合力计算 NED 线加速度。"""
+        force_n = self._rotate_body_to_world(attitude_q_wb, force_b)
+        return force_n / mass[:, None] + self._gravity_n
+
+    @staticmethod
+    def _angular_acceleration(
+        angular_velocity: torch.Tensor,
+        inertia: torch.Tensor,
         moment_b: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """由总外力和总外力矩计算质心线加速度与机体系角加速度。"""
-        # q_wb 将机体系合力旋转到 NED；NED 的重力方向是 +z_n。
-        force_n = self._rotate_body_to_world(state["attitude_q_wb"], force_b)
-        linear_acceleration_n = (
-            force_n / parameters["body.mass"][:, None] + self._gravity_n
-        )
-        # 接口不考虑惯量积，因此 Iω 可由三轴主惯量逐元素相乘得到。
-        angular_velocity = state["angular_velocity_b"]
-        inertia = parameters["body.inertia_diagonal_b"]
+    ) -> torch.Tensor:
+        """由同一时刻的角速度和外力矩计算机体系角加速度。"""
         angular_momentum = inertia * angular_velocity
-        # 机体系欧拉方程：I·ω_dot = M - ω×(Iω)。
         gyroscopic = torch.linalg.cross(angular_velocity, angular_momentum)
-        angular_acceleration_b = (moment_b - gyroscopic) / inertia
-        return linear_acceleration_n, angular_acceleration_b
+        return (moment_b - gyroscopic) / inertia
 
     @staticmethod
     def _lookup(
@@ -418,17 +543,34 @@ class TensorDynamicsKernel:
     def _integrate_quaternion(
         q_wb: torch.Tensor, angular_velocity_b: torch.Tensor, physics_dt: float
     ) -> torch.Tensor:
-        """按 ``q_dot = 0.5*q⊗[0,ω_b]`` 积分姿态并逐实例归一化。"""
+        """用恒定机体系角速度的四元数指数映射推进姿态。"""
+        angular_speed = torch.linalg.vector_norm(
+            angular_velocity_b, dim=1, keepdim=True
+        )
+        half_angle = 0.5 * physics_dt * angular_speed
+        half_dt = torch.full_like(angular_speed, 0.5 * physics_dt)
+        vector_scale = torch.where(
+            angular_speed > torch.finfo(q_wb.dtype).eps,
+            torch.sin(half_angle) / angular_speed.clamp_min(
+                torch.finfo(q_wb.dtype).tiny
+            ),
+            half_dt,
+        )
+        delta_scalar = torch.cos(half_angle)
+        delta_vector = angular_velocity_b * vector_scale
+
         scalar = q_wb[:, :1]
         vector = q_wb[:, 1:]
-        q_dot_scalar = -(vector * angular_velocity_b).sum(dim=1, keepdim=True)
-        q_dot_vector = (
-            scalar * angular_velocity_b
-            + torch.linalg.cross(vector, angular_velocity_b)
+        candidate_scalar = (
+            scalar * delta_scalar
+            - (vector * delta_vector).sum(dim=1, keepdim=True)
         )
-        candidate = q_wb + 0.5 * physics_dt * torch.cat(
-            (q_dot_scalar, q_dot_vector), dim=1
+        candidate_vector = (
+            scalar * delta_vector
+            + delta_scalar * vector
+            + torch.linalg.cross(vector, delta_vector)
         )
+        candidate = torch.cat((candidate_scalar, candidate_vector), dim=1)
         return candidate / torch.linalg.vector_norm(
             candidate, dim=1, keepdim=True
         ).clamp_min(torch.finfo(candidate.dtype).tiny)

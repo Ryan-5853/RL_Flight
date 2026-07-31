@@ -158,10 +158,21 @@ class CheckpointConfig:
 
 
 @dataclass(frozen=True)
+class EvaluationExecutionConfig:
+    mode: str = "synchronous"
+    max_in_flight: int = 1
+    pending_policy: str = "latest"
+    pin_checkpoint: str = "hardlink"
+    wait_for_final: bool = True
+    failure_policy: str = "stop_training"
+
+
+@dataclass(frozen=True)
 class EvaluationConfig:
     enabled: bool
     interval_control_steps: int | None
     suite_path: Path | None
+    execution: EvaluationExecutionConfig = EvaluationExecutionConfig()
 
 
 @dataclass(frozen=True)
@@ -936,6 +947,69 @@ def exact_resume_config_sha256(config: ExperimentConfig | Mapping[str, Any]) -> 
 
     raw = config.raw if isinstance(config, ExperimentConfig) else config
     normalized = copy.deepcopy(dict(raw))
+    _normalize_resume_config(normalized)
+    payload = json.dumps(
+        normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def continuation_resume_config_sha256(
+    config: ExperimentConfig | Mapping[str, Any],
+) -> str:
+    """计算受限调参续训摘要，只放宽不改变张量结构/训练目标的参数。
+
+    continuation 完整恢复模型、双 Q、target、replay、环境、课程与 RNG，但允许
+    调整 actor 更新节奏、优化器学习率、探索方差边界和 entropy alpha 边界。
+    其余配置仍必须与来源 checkpoint 一致。
+    """
+
+    raw = config.raw if isinstance(config, ExperimentConfig) else config
+    normalized = copy.deepcopy(dict(raw))
+    _normalize_resume_config(normalized)
+    experiment = normalized.get("experiment")
+    if isinstance(experiment, dict):
+        experiment.pop("name", None)
+    model = normalized.get("model")
+    if isinstance(model, dict):
+        distribution = model.get("policy_distribution")
+        if isinstance(distribution, dict):
+            for key in (
+                "initial_action_std",
+                "minimum_action_std",
+                "maximum_action_std",
+            ):
+                distribution.pop(key, None)
+    algorithm = normalized.get("algorithm")
+    if isinstance(algorithm, dict):
+        algorithm.pop("actor_update_interval", None)
+        optimizer = algorithm.get("optimizer")
+        if isinstance(optimizer, dict):
+            for key in (
+                "actor_learning_rate",
+                "critic_learning_rate",
+                "alpha_learning_rate",
+            ):
+                optimizer.pop(key, None)
+        entropy = algorithm.get("entropy")
+        if isinstance(entropy, dict):
+            entropy.pop("initial_alpha", None)
+            # SACLoss 是否注册上下界 buffer 取决于这里是否为 null。续训可以
+            # 改界限数值，但不能改变 state_dict 的结构。
+            for key in ("min_alpha", "max_alpha"):
+                if key in entropy:
+                    entropy[key] = (
+                        None if entropy[key] is None else "__configured__"
+                    )
+    payload = json.dumps(
+        normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _normalize_resume_config(normalized: dict[str, Any]) -> None:
+    """原地移除只影响运行身份、长度、产物与评测调度的配置。"""
+
     run = normalized.get("run", {})
     if isinstance(run, dict):
         run.pop("total_control_steps", None)
@@ -944,10 +1018,13 @@ def exact_resume_config_sha256(config: ExperimentConfig | Mapping[str, Any]) -> 
     if isinstance(checkpoint, dict):
         # checkpoint 调度和来源只影响产物，不改变数值训练语义。
         normalized.pop("checkpoint", None)
-    payload = json.dumps(
-        normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-    )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    evaluation = normalized.get("evaluation")
+    if isinstance(evaluation, dict):
+        # 评测间隔和同步/子进程调度只改变评测执行时机/位置，不改变训练张量
+        # 语义。续训可按运行成本重新安排，但仍保留 enabled 与 suite_path，
+        # 防止无意改变是否评测以及采用哪套选择标准。
+        evaluation.pop("interval_control_steps", None)
+        evaluation.pop("execution", None)
 
 
 def _component(node: Mapping[str, Any], path: str) -> ComponentConfig:
@@ -995,9 +1072,9 @@ def _checkpoint_config(node: Mapping[str, Any], source: Path) -> CheckpointConfi
         raise ConfigError("checkpoint.resume must be a mapping")
     _keys(resume, {"from", "mode"}, "checkpoint.resume")
     mode = str(resume.get("mode", "exact"))
-    if mode not in {"exact", "policy"}:
+    if mode not in {"exact", "continuation", "policy"}:
         raise ConfigError(
-            "checkpoint.resume.mode must be exact or policy"
+            "checkpoint.resume.mode must be exact, continuation, or policy"
         )
     value = resume.get("from")
     if value is None or value == "":
@@ -1025,7 +1102,11 @@ def _evaluation_config(
 ) -> EvaluationConfig:
     if not node:
         return EvaluationConfig(False, None, None)
-    _keys(node, {"enabled", "interval_control_steps", "suite_path"}, "evaluation")
+    _keys(
+        node,
+        {"enabled", "interval_control_steps", "suite_path", "execution"},
+        "evaluation",
+    )
     enabled = bool(node.get("enabled", False))
     if not enabled:
         return EvaluationConfig(False, None, None)
@@ -1033,7 +1114,64 @@ def _evaluation_config(
     suite_path = (source.parent / str(node.get("suite_path", ""))).resolve()
     if not suite_path.is_file():
         raise ConfigError(f"evaluation suite does not exist: {suite_path}")
-    return EvaluationConfig(True, interval, suite_path)
+    execution_node = node.get("execution", {})
+    if not isinstance(execution_node, Mapping):
+        raise ConfigError("evaluation.execution must be a mapping")
+    _keys(
+        execution_node,
+        {
+            "mode",
+            "max_in_flight",
+            "pending_policy",
+            "pin_checkpoint",
+            "wait_for_final",
+            "failure_policy",
+        },
+        "evaluation.execution",
+    )
+    mode = str(execution_node.get("mode", "synchronous"))
+    if mode not in {"synchronous", "subprocess"}:
+        raise ConfigError(
+            "evaluation.execution.mode must be synchronous or subprocess"
+        )
+    max_in_flight = _positive_int_value(
+        execution_node.get("max_in_flight", 1),
+        "evaluation.execution.max_in_flight",
+    )
+    if max_in_flight > 8:
+        raise ConfigError(
+            "evaluation.execution.max_in_flight must not exceed 8"
+        )
+    pending_policy = str(execution_node.get("pending_policy", "latest"))
+    if pending_policy != "latest":
+        raise ConfigError(
+            "evaluation.execution.pending_policy must equal latest"
+        )
+    pin_checkpoint = str(execution_node.get("pin_checkpoint", "hardlink"))
+    if pin_checkpoint != "hardlink":
+        raise ConfigError(
+            "evaluation.execution.pin_checkpoint must equal hardlink"
+        )
+    failure_policy = str(
+        execution_node.get(
+            "failure_policy",
+            "continue_training" if mode == "subprocess" else "stop_training",
+        )
+    )
+    if failure_policy not in {"continue_training", "stop_training"}:
+        raise ConfigError(
+            "evaluation.execution.failure_policy must be "
+            "continue_training or stop_training"
+        )
+    execution = EvaluationExecutionConfig(
+        mode=mode,
+        max_in_flight=max_in_flight,
+        pending_policy=pending_policy,
+        pin_checkpoint=pin_checkpoint,
+        wait_for_final=bool(execution_node.get("wait_for_final", True)),
+        failure_policy=failure_policy,
+    )
+    return EvaluationConfig(True, interval, suite_path, execution)
 
 
 def _virtual_pilot(node: Mapping[str, Any]) -> VirtualPilotConfig:

@@ -11,7 +11,7 @@ parallel:
   independent_rng: true
 
 timing:
-  physics_hz: {value: 5000}
+  physics_hz: {value: 500}
   control_hz: {value: 500}
 
 initial_state:
@@ -99,21 +99,23 @@ aerodynamics:
 
 sensors:
   gyro:
-    sample_hz: {value: 5000}
+    sample_hz: {value: 500}
     noise:
       distribution: normal
       stddev: {value: [0.0, 0.0, 0.0]}
     bias: {value: [0.0, 0.0, 0.0]}
     delay: {value: 0.001}
+    interpolation: linear
   accelerometer:
-    sample_hz: {value: 5000}
+    sample_hz: {value: 500}
     noise:
       distribution: normal
       stddev: {value: [0.0, 0.0, 0.0]}
     bias: {value: [0.0, 0.0, 0.0]}
     delay: {value: 0.001}
+    interpolation: linear
   motor_speed:
-    sample_hz: {value: 5000}
+    sample_hz: {value: 500}
     noise:
       distribution: normal
       stddev: {value: [0.0, 0.0]}
@@ -125,7 +127,7 @@ logging:
   # 日志不得侵占训练器保存下一份大型 checkpoint 所需的安全余量。
   minimum_free_space_bytes: 8589934592
   mode: compact
-  physics_step_stride: 200
+  physics_step_stride: 20
   fields:
     - physics_step
     - control_step

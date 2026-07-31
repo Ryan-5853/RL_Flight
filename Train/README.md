@@ -130,9 +130,10 @@ update 边界保存；`null` 表示只保存最终版本。`checkpoint.keep_last
 `final` 或 `interrupt`）。第一次收到 SIGINT/SIGTERM 后训练会完成当前安全边界、保存
 `interrupt` checkpoint 并将运行标记为 `interrupted`；第二次信号会立即退出。
 
-正式 MLP 配置对应的 SimEnv 日志默认采用显式 `compact` 模式：5000 Hz 物理时间线
-每 10 步保存一次（500 Hz），并只保存配置列出的诊断字段。初始化、reset 和 resume
-边界始终保存；需要逐物理步复盘时将环境配置改为 `mode: full`、
+正式长训练配置对应的 SimEnv 日志默认采用显式 `compact` 模式：500 Hz 仿真时间线
+每 20 步保存一次（25 Hz），并只保存配置列出的诊断字段；smoke 配置使用 stride 1
+保留每个 500 Hz 控制/仿真步。初始化、reset 和 resume 边界始终保存；需要逐步复盘时
+将环境配置改为 `mode: full`、
 `physics_step_stride: 1`，并移除 `fields` 裁剪。
 
 运行 CPU 接口冒烟：
@@ -206,13 +207,16 @@ checkpoint 的 `keep_last` 清理。
 PPO/SAC 阶段同时显示已完成/总 update；SAC 汇总额外显示 replay size、alpha
 以及当前 rollout 上四路 actor 标准差和 `warmup/critic-only/actor` 阶段。
 重定向到文件或作业系统时不输出逐采样临时行，只保留阶段切换、每轮汇总、checkpoint
-和最终状态，避免日志刷屏。每轮汇总包含完成比例、累计控制步、已用时间、ETA、吞吐量、
+和最终状态，避免日志刷屏。每轮汇总包含完成比例、累计控制步、已用时间、ETA、纯采样
+吞吐量和最近 8 轮端到端吞吐量。纯采样吞吐只计 `collector.collect()`，端到端吞吐还
+包含算法更新、记录和周期任务；续训时两者均不把 checkpoint 中的历史步数计入新进程
+吞吐，ETA 也使用本次会话的滚动端到端速率。
 平均奖励、姿态误差 P95、终止率和动作饱和率。例如：
 
 ```text
 [======>.................] 25.00% | 262,144/1,048,576 | 已用 00:03:10 | ETA 00:09:30
 | 第 4/16 轮完成 | reward=0.421 | 姿态P95=3.17° | 终止=0.42%
-| 动作饱和=4.81% | 1,380 sample/s
+| 动作饱和=4.81% | 采样=12,800 sample/s | 端到端(近8轮)=6,970 step/s
 checkpoint 已保存 | 类型=periodic | 控制步=262,144
 ```
 

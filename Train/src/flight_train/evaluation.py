@@ -79,6 +79,7 @@ class FixedScenario:
     circle_period_s: float
     roll_amplitude_rad: float
     pitch_amplitude_rad: float
+    yaw_rate_amplitude_rad_s: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -126,15 +127,45 @@ class ScriptedEvaluationCommandSource:
     def __init__(
         self,
         base: VirtualPilotCommandSource,
-        scenario: FixedScenario,
+        scenario: FixedScenario | tuple[FixedScenario, ...],
         control_hz: int,
+        *,
+        group_size: int | None = None,
     ) -> None:
         self.base = base
-        self.scenario = scenario
+        self.scenarios = (
+            (scenario,) if isinstance(scenario, FixedScenario) else scenario
+        )
+        if not self.scenarios:
+            raise ValueError("scripted evaluation requires at least one scenario")
+        self.group_size = (
+            base.batch_size if group_size is None else int(group_size)
+        )
+        if (
+            self.group_size <= 0
+            or self.group_size * len(self.scenarios) != base.batch_size
+        ):
+            raise ValueError(
+                "scripted evaluation scenario groups must cover the batch"
+            )
         self.control_hz = control_hz
         self.elapsed_steps = torch.zeros(
             base.batch_size, dtype=torch.int64, device=base.device
         )
+        self._desired_yaw_rate = torch.zeros(
+            base.batch_size, 1, dtype=base.dtype, device=base.device
+        )
+        yaw_rate_limit = base.config.max_yaw_rate_rad_s
+        for item in self.scenarios:
+            if (
+                item.type == "command_step"
+                and item.yaw_rate_amplitude_rad_s > yaw_rate_limit + 1e-9
+            ):
+                raise ValueError(
+                    f"scenario {item.name!r} yaw-rate amplitude "
+                    f"{item.yaw_rate_amplitude_rad_s} exceeds command limit "
+                    f"{yaw_rate_limit}"
+                )
         self._apply_target()
 
     @property
@@ -151,13 +182,38 @@ class ScriptedEvaluationCommandSource:
 
     @property
     def desired_yaw_rate(self) -> torch.Tensor:
-        return self.base.desired_yaw_rate
+        return self._desired_yaw_rate
 
     def set_curriculum_scale(self, scale: float) -> None:
         self.base.set_curriculum_scale(scale)
 
     def reset(self, mask: torch.Tensor) -> None:
         self.base.reset(mask)
+        # 旧串行实现会为每个科目重新创建同 seed、同 batch 大小的飞手。
+        # 打包科目时把第一组的初始油门/高度控制状态复制到其余组，从而保持
+        # 每个科目使用相同的 0..group_size-1 初始随机流。
+        if len(self.scenarios) > 1 and bool(mask.all().item()):
+            for name in (
+                "upper_throttle",
+                "throttle_target",
+                "spool_remaining",
+                "spool_throttle",
+                "height_controller_output",
+                "height_previous_error",
+                "height_error",
+                "height_target",
+                "hold_remaining",
+            ):
+                value = getattr(self.base, name)
+                first = value[: self.group_size]
+                setattr(
+                    self.base,
+                    name,
+                    first.repeat(
+                        len(self.scenarios),
+                        *([1] * (first.ndim - 1)),
+                    ),
+                )
         self.elapsed_steps = torch.where(
             mask, torch.zeros_like(self.elapsed_steps), self.elapsed_steps
         )
@@ -189,12 +245,52 @@ class ScriptedEvaluationCommandSource:
 
     def _apply_target(self) -> None:
         time_s = self.elapsed_steps.to(self.base.dtype) / float(self.control_hz)
-        roll, pitch, yaw = _scenario_euler(self.scenario, time_s)
-        scripted = torch.stack((roll, pitch, yaw), dim=-1)
-        self.base.stick_target.copy_(scripted)
-        self.base.filtered_stick.copy_(scripted)
-        self.base.target_yaw.copy_(yaw)
-        self.base.target_attitude = euler_to_quaternion(roll, pitch, yaw)
+        scripted_euler = torch.empty(
+            self.base.batch_size,
+            3,
+            device=self.base.device,
+            dtype=self.base.dtype,
+        )
+        scripted_yaw_rate = torch.empty(
+            self.base.batch_size,
+            device=self.base.device,
+            dtype=self.base.dtype,
+        )
+        for index, scenario in enumerate(self.scenarios):
+            group = slice(
+                index * self.group_size,
+                (index + 1) * self.group_size,
+            )
+            roll, pitch, yaw, yaw_rate = _scenario_command(
+                scenario, time_s[group]
+            )
+            scripted_euler[group] = torch.stack(
+                (roll, pitch, yaw), dim=-1
+            )
+            scripted_yaw_rate[group] = yaw_rate
+        yaw_rate_limit = self.base.config.max_yaw_rate_rad_s
+        yaw_stick = (
+            scripted_yaw_rate / yaw_rate_limit
+            if yaw_rate_limit > 0.0
+            else torch.zeros_like(scripted_yaw_rate)
+        )
+        scripted_stick = torch.stack(
+            (
+                scripted_euler[:, 0],
+                scripted_euler[:, 1],
+                yaw_stick,
+            ),
+            dim=-1,
+        )
+        self.base.stick_target.copy_(scripted_stick)
+        self.base.filtered_stick.copy_(scripted_stick)
+        self.base.target_yaw.copy_(scripted_euler[:, 2])
+        self.base.target_attitude = euler_to_quaternion(
+            scripted_euler[:, 0],
+            scripted_euler[:, 1],
+            scripted_euler[:, 2],
+        )
+        self._desired_yaw_rate.copy_(scripted_yaw_rate[:, None])
 
 
 def load_fixed_evaluation_suite(path: str | Path) -> FixedEvaluationSuite:
@@ -217,8 +313,10 @@ def load_fixed_evaluation_suite(path: str | Path) -> FixedEvaluationSuite:
         "evaluation suite",
     )
     schema_version = int(raw.get("schema_version", -1))
-    if schema_version not in {1, 2, 3}:
-        raise ValueError("evaluation schema_version must equal 1, 2, or 3")
+    if schema_version not in {1, 2, 3, 4}:
+        raise ValueError(
+            "evaluation schema_version must equal 1, 2, 3, or 4"
+        )
     scenarios_node = raw.get("scenarios")
     if not isinstance(scenarios_node, list) or not scenarios_node:
         raise ValueError("evaluation scenarios must be a non-empty list")
@@ -227,8 +325,22 @@ def load_fixed_evaluation_suite(path: str | Path) -> FixedEvaluationSuite:
     if len(set(names)) != len(names):
         raise ValueError("evaluation scenario names must be unique")
     required_types = {"hover", "constant_translation", "circle"}
-    if {item.type for item in scenarios} != required_types:
-        raise ValueError(f"evaluation scenarios must contain exactly {sorted(required_types)}")
+    scenario_types = {item.type for item in scenarios}
+    if schema_version <= 3 and scenario_types != required_types:
+        raise ValueError(
+            f"evaluation scenarios must contain exactly "
+            f"{sorted(required_types)}"
+        )
+    if schema_version >= 4:
+        if not required_types.issubset(scenario_types):
+            raise ValueError(
+                f"evaluation scenarios must include "
+                f"{sorted(required_types)}"
+            )
+        if "command_step" not in scenario_types:
+            raise ValueError(
+                "evaluation schema_version 4 requires a command_step scenario"
+            )
 
     scoring = _mapping(raw.get("scoring"), "scoring")
     scoring_fields = {"limits", "weights"}
@@ -344,6 +456,8 @@ def run_fixed_evaluation(
     suite: FixedEvaluationSuite,
     *,
     output_root: str | Path | None = None,
+    report_checkpoint_path: str | Path | None = None,
+    report_checkpoint_sha256: str | None = None,
 ) -> dict[str, Any]:
     """加载策略权重，在三个固定科目上运行确定性评测并保存报告。"""
 
@@ -352,6 +466,24 @@ def run_fixed_evaluation(
         raise RuntimeError(f"CUDA requested but unavailable: {device}")
     checkpoint_source = Path(checkpoint_path).expanduser().resolve()
     state = load_checkpoint(checkpoint_source)
+    checkpoint_reference = (
+        checkpoint_source
+        if report_checkpoint_path is None
+        else Path(report_checkpoint_path).expanduser().resolve()
+    )
+    checkpoint_digest = (
+        _sha256(checkpoint_source)
+        if report_checkpoint_sha256 is None
+        else str(report_checkpoint_sha256)
+    )
+    if len(checkpoint_digest) != 64:
+        raise ValueError("report checkpoint SHA-256 must contain 64 hex characters")
+    try:
+        bytes.fromhex(checkpoint_digest)
+    except ValueError as exc:
+        raise ValueError(
+            "report checkpoint SHA-256 must be hexadecimal"
+        ) from exc
     torch.manual_seed(suite.seed)
     if device.type == "cuda":
         torch.cuda.manual_seed_all(suite.seed)
@@ -375,7 +507,7 @@ def run_fixed_evaluation(
 
     root = Path(output_root).expanduser().resolve() if output_root else suite.output_root
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    evaluation_id = f"{stamp}_{checkpoint_source.stem}_{uuid.uuid4().hex[:8]}"
+    evaluation_id = f"{stamp}_{checkpoint_reference.stem}_{uuid.uuid4().hex[:8]}"
     directory = root / suite.name / evaluation_id
     directory.mkdir(parents=True, exist_ok=False)
     archived_suite = directory / f"suite{suite.source_path.suffix or '.yaml'}"
@@ -386,8 +518,8 @@ def run_fixed_evaluation(
         "suite": suite.name,
         "suite_config": archived_suite.name,
         "suite_config_sha256": _sha256(suite.source_path),
-        "checkpoint": str(checkpoint_source),
-        "checkpoint_sha256": _sha256(checkpoint_source),
+        "checkpoint": str(checkpoint_reference),
+        "checkpoint_sha256": checkpoint_digest,
         "checkpoint_global_control_steps": int(state.get("global_control_steps", -1)),
         "experiment": config.name,
         "device": str(device),
@@ -407,34 +539,421 @@ def run_fixed_evaluation(
         "scenarios": {},
     }
     scenario_scores: list[float] = []
+    env = _create_packed_evaluation_environment(
+        config,
+        suite,
+        device,
+    )
     try:
+        packed_results = _run_packed_scenarios(
+            env,
+            model,
+            suite,
+        )
         for scenario in suite.scenarios:
-            env = _create_evaluation_environment(config, suite, scenario, device)
-            try:
-                result, trajectory = _run_scenario(
-                    env,
-                    model,
-                    scenario,
-                    suite.limits,
-                    suite.score_weights,
-                    self_stabilize_tracking=suite.self_stabilize_tracking,
-                    yaw_rate_tracking_weight=suite.yaw_rate_tracking_weight,
-                )
-                report["scenarios"][scenario.name] = result
-                scenario_scores.append(float(result["total_score"]))
-                torch.save(trajectory, directory / f"trajectory_{scenario.name}.pt")
-            finally:
-                env.close()
+            result, trajectory = packed_results[scenario.name]
+            report["scenarios"][scenario.name] = result
+            scenario_scores.append(float(result["total_score"]))
+            torch.save(
+                trajectory,
+                directory / f"trajectory_{scenario.name}.pt",
+            )
         report["total_score"] = sum(scenario_scores) / len(scenario_scores)
         report["status"] = "completed"
     except BaseException:
         report["status"] = "failed"
         raise
     finally:
+        env.close()
         (directory / "report.json").write_text(
             json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8"
         )
     return {"evaluation_directory": directory, "report": report}
+
+
+def _create_packed_evaluation_environment(
+    config: ExperimentConfig,
+    suite: FixedEvaluationSuite,
+    device: torch.device,
+) -> SimEnvAdapter:
+    """Create one environment whose batch dimension contains every scenario."""
+
+    reward_calculator = ComponentRegistry().build_reward(
+        {
+            "type": config.reward.calculator.type,
+            "version": config.reward.calculator.version,
+            "params": config.reward.calculator.params,
+        }
+    )
+    randomizer = StaticRandomizer((), suite.seed, device, config.torch_dtype)
+    maximum_duration = max(item.duration_s for item in suite.scenarios)
+    evaluation_duration = max(
+        config.task.episode_duration_s,
+        maximum_duration + 1.0,
+    )
+    task = replace(
+        config.task,
+        episode_duration_s=evaluation_duration,
+        curriculum_durations_s=(evaluation_duration,),
+        curriculum_target_scales=(1.0,),
+    )
+    pilot_config = replace(config.command_source, seed=suite.seed)
+    env = SimEnvAdapter.create(
+        config.simulator_config,
+        suite.parallel_count * len(suite.scenarios),
+        device,
+        config.torch_dtype,
+        task,
+        reward_calculator=reward_calculator,
+        static_randomizer=randomizer,
+        dynamic_randomization=None,
+        dynamic_seed=None,
+        reward_context_fields=(),
+        command_source_config=pilot_config,
+        control_contract_config=config.control_contract,
+    )
+    env.command_source = ScriptedEvaluationCommandSource(
+        env.command_source,
+        suite.scenarios,
+        env.spec.control_hz,
+        group_size=suite.parallel_count,
+    )
+    return env
+
+
+def _repeat_packed_scenario_initial_state(
+    env: SimEnvAdapter,
+    group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Repeat legacy batch-local initial state and RNG lanes for every scenario."""
+
+    if env.spec.parallel_count % group_size != 0:
+        raise ValueError("packed evaluation groups do not divide the batch")
+    groups = env.spec.parallel_count // group_size
+    if groups == 1:
+        return (
+            env._history_observation(),
+            torch.ones(
+                env.spec.parallel_count,
+                1,
+                dtype=torch.bool,
+                device=env.spec.device,
+            ),
+        )
+    state = dict(env.simulator.state_dict())
+
+    def repeated(value: torch.Tensor) -> torch.Tensor:
+        if value.shape[0] != env.spec.parallel_count:
+            raise ValueError(
+                "packed simulator state does not use the batch as its first axis"
+            )
+        first = value[:group_size]
+        return first.repeat(
+            groups,
+            *([1] * (first.ndim - 1)),
+        )
+
+    for name in (
+        "parameters",
+        "truth",
+        "sensors",
+        "random_counters",
+    ):
+        values = state[name]
+        if not isinstance(values, Mapping):
+            raise TypeError(f"simulator state {name} must be a mapping")
+        state[name] = {
+            key: repeated(value)
+            for key, value in values.items()
+        }
+    for name in (
+        "physics_step",
+        "control_step",
+        "valid",
+        "error_code",
+        "generation",
+        "control",
+    ):
+        value = state[name]
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(f"simulator state {name} must be a tensor")
+        state[name] = repeated(value)
+    sensor_kernel = state["sensor_kernel"]
+    if not isinstance(sensor_kernel, Mapping):
+        raise TypeError("simulator sensor-kernel state must be a mapping")
+    sensor_kernel = dict(sensor_kernel)
+    history = sensor_kernel["history"]
+    if not isinstance(history, Mapping):
+        raise TypeError("simulator sensor history must be a mapping")
+    sensor_kernel["history"] = {
+        key: repeated(value)
+        for key, value in history.items()
+    }
+    state["sensor_kernel"] = sensor_kernel
+
+    seeds = state["instance_seeds"]
+    if not isinstance(seeds, torch.Tensor):
+        raise TypeError("simulator instance seeds must be a tensor")
+    global_lane = torch.arange(
+        env.spec.parallel_count,
+        device=seeds.device,
+        dtype=torch.int64,
+    )
+    local_lane = global_lane.remainder(group_size)
+    lane_multiplier = 1442695040888963407
+    global_key = (global_lane + 1) * lane_multiplier
+    local_key = (local_lane + 1) * lane_multiplier
+    state["instance_seeds"] = repeated(seeds) ^ global_key ^ local_key
+    env.simulator.load_state_dict(state)
+    initial_mask = torch.ones(
+        env.spec.parallel_count,
+        dtype=torch.bool,
+        device=env.spec.device,
+    )
+    base_observation, _attitude, _rate, _height = (
+        env._base_observation()
+    )
+    env._reset_observation_history(initial_mask, base_observation)
+    return env._history_observation(), initial_mask[:, None]
+
+
+def _precomputed_scenario_trajectory(
+    scenario: FixedScenario,
+    steps: int,
+    batch: int,
+    control_hz: int,
+    initial_position: torch.Tensor,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> dict[str, torch.Tensor]:
+    time_line = (
+        torch.arange(steps, device=device, dtype=dtype)
+        / float(control_hz)
+    )
+    time_s = time_line[:, None].expand(steps, batch)
+    roll, pitch, yaw = _scenario_euler(scenario, time_s)
+    target_euler = torch.stack((roll, pitch, yaw), dim=-1)
+    target_attitude = euler_to_quaternion(roll, pitch, yaw)
+    target_position, target_velocity = _scenario_trajectory(
+        scenario,
+        time_s + 1.0 / float(control_hz),
+        initial_position,
+    )
+    if target_position.ndim == 2:
+        target_position = target_position.unsqueeze(0).expand(
+            steps, batch, 3
+        )
+    if target_velocity.ndim == 2:
+        target_velocity = target_velocity.unsqueeze(0).expand(
+            steps, batch, 3
+        )
+    return {
+        "time_s": time_s,
+        "target_position_n": target_position,
+        "target_velocity_n": target_velocity,
+        "target_attitude_q_wb": target_attitude,
+        "target_euler_rad": target_euler,
+    }
+
+
+def _run_packed_scenarios(
+    env: SimEnvAdapter,
+    model: ActorCritic,
+    suite: FixedEvaluationSuite,
+) -> dict[str, tuple[dict[str, Any], dict[str, torch.Tensor]]]:
+    """Run all fixed scenarios in one batch with no per-step host sync."""
+
+    group_size = suite.parallel_count
+    control_hz = env.spec.control_hz
+    scenario_steps = tuple(
+        round(item.duration_s * control_hz)
+        for item in suite.scenarios
+    )
+    maximum_steps = max(scenario_steps)
+    env.reset()
+    observation, is_init = _repeat_packed_scenario_initial_state(
+        env,
+        group_size,
+    )
+    initial_position = env.simulator.observe(
+        "truth",
+        ("position_n",),
+    ).values["position_n"]
+    trajectories: dict[str, dict[str, torch.Tensor]] = {}
+    for index, (scenario, steps) in enumerate(
+        zip(suite.scenarios, scenario_steps)
+    ):
+        group = slice(index * group_size, (index + 1) * group_size)
+        trajectories[scenario.name] = _precomputed_scenario_trajectory(
+            scenario,
+            steps,
+            group_size,
+            control_hz,
+            initial_position[group],
+            env.spec.device,
+            env.spec.dtype,
+        )
+    packed_trace = {
+        "alive": torch.empty(
+            maximum_steps,
+            env.spec.parallel_count,
+            dtype=torch.bool,
+            device=env.spec.device,
+        ),
+        "action": torch.empty(
+            maximum_steps,
+            env.spec.parallel_count,
+            4,
+            dtype=env.spec.dtype,
+            device=env.spec.device,
+        ),
+        "position_n": torch.empty(
+            maximum_steps,
+            env.spec.parallel_count,
+            3,
+            dtype=env.spec.dtype,
+            device=env.spec.device,
+        ),
+        "velocity_n": torch.empty(
+            maximum_steps,
+            env.spec.parallel_count,
+            3,
+            dtype=env.spec.dtype,
+            device=env.spec.device,
+        ),
+        "attitude_q_wb": torch.empty(
+            maximum_steps,
+            env.spec.parallel_count,
+            4,
+            dtype=env.spec.dtype,
+            device=env.spec.device,
+        ),
+        "yaw_rate_error_rad_s": torch.empty(
+            maximum_steps,
+            env.spec.parallel_count,
+            dtype=env.spec.dtype,
+            device=env.spec.device,
+        ),
+    }
+
+    horizon_steps = torch.tensor(
+        [
+            steps
+            for steps in scenario_steps
+            for _ in range(group_size)
+        ],
+        device=env.spec.device,
+        dtype=torch.int64,
+    )
+    horizon_active = (
+        torch.arange(
+            maximum_steps,
+            device=env.spec.device,
+            dtype=torch.int64,
+        )[:, None]
+        < horizon_steps[None, :]
+    )
+    alive = torch.ones(
+        env.spec.parallel_count,
+        dtype=torch.bool,
+        device=env.spec.device,
+    )
+    survival_s = torch.cat(
+        [
+            torch.full(
+                (group_size,),
+                scenario.duration_s,
+                dtype=env.spec.dtype,
+                device=env.spec.device,
+            )
+            for scenario in suite.scenarios
+        ]
+    )
+    hidden: list[Any | None] = [None] * len(suite.scenarios)
+
+    for step in range(maximum_steps):
+        actions: list[torch.Tensor] = []
+        for index, steps in enumerate(scenario_steps):
+            group = slice(index * group_size, (index + 1) * group_size)
+            if step < steps:
+                group_action, hidden[index] = model.forward_step(
+                    observation[group],
+                    hidden[index],
+                    is_init[group],
+                )
+            else:
+                group_action = torch.zeros(
+                    group_size,
+                    4,
+                    device=env.spec.device,
+                    dtype=env.spec.dtype,
+                )
+            actions.append(group_action)
+        action = torch.cat(actions, dim=0)
+        active = alive & horizon_active[step]
+        transition = env.step_without_reset(action, active)
+        done = transition["done"].squeeze(-1)
+        newly_done = active & done
+        survival_s = torch.where(
+            newly_done,
+            torch.full_like(
+                survival_s,
+                (step + 1) / float(control_hz),
+            ),
+            survival_s,
+        )
+        sample_alive = alive & ~done
+        packed_trace["alive"][step].copy_(sample_alive)
+        packed_trace["action"][step].copy_(action)
+        packed_trace["position_n"][step].copy_(
+            transition[("info", "truth.position_n")]
+        )
+        packed_trace["velocity_n"][step].copy_(
+            transition[("info", "truth.velocity_n")]
+        )
+        packed_trace["attitude_q_wb"][step].copy_(
+            transition[("info", "truth.attitude_q_wb")]
+        )
+        packed_trace["yaw_rate_error_rad_s"][step].copy_(
+            transition[("info", "yaw_rate_error_rad_s")].squeeze(-1)
+        )
+        alive = sample_alive
+        observation = transition["observation"]
+        is_init = transition["is_init"]
+
+    results: dict[
+        str,
+        tuple[dict[str, Any], dict[str, torch.Tensor]],
+    ] = {}
+    for index, scenario in enumerate(suite.scenarios):
+        group = slice(index * group_size, (index + 1) * group_size)
+        steps = scenario_steps[index]
+        trajectory = trajectories[scenario.name]
+        trajectory.update(
+            {
+                name: value[:steps, group]
+                for name, value in packed_trace.items()
+            }
+        )
+        trajectory["actual_euler_rad"] = _quaternion_to_euler(
+            trajectory["attitude_q_wb"]
+        )
+        cpu_trajectory = {
+            name: value.cpu()
+            for name, value in trajectory.items()
+        }
+        metrics = _score_trajectory(
+            cpu_trajectory,
+            survival_s[group].cpu(),
+            scenario,
+            suite.limits,
+            control_hz,
+            suite.score_weights,
+            self_stabilize_tracking=suite.self_stabilize_tracking,
+            yaw_rate_tracking_weight=suite.yaw_rate_tracking_weight,
+        )
+        results[scenario.name] = (metrics, cpu_trajectory)
+    return results
 
 
 def _create_evaluation_environment(
@@ -640,10 +1159,29 @@ def _score_trajectory(
     response_error_deg = (
         roll_pitch_error_deg if self_stabilize_tracking else attitude_error_deg
     )
+    if scenario.type == "command_step" and self_stabilize_tracking:
+        yaw_response_error_deg = (
+            yaw_rate_error
+            / limits.yaw_rate_rmse_bad_rad_s
+            * limits.attitude_rmse_bad_deg
+        )
+        response_error_deg = torch.maximum(
+            response_error_deg,
+            yaw_response_error_deg,
+        )
     if scenario.type == "circle":
         response_s = _circle_phase_lag(
             trajectory["target_euler_rad"], trajectory["actual_euler_rad"], alive,
             control_hz, limits.phase_lag_max_s,
+        )
+    elif scenario.type == "command_step":
+        response_s = _command_step_response_time(
+            response_error_deg,
+            alive,
+            scenario,
+            control_hz,
+            limits.settling_error_deg,
+            limits.settling_window_s,
         )
     elif scenario.type == "hover":
         response_s = _recovery_time_after_peak(
@@ -676,6 +1214,9 @@ def _score_trajectory(
     velocity_score = _lower_is_better(velocity_rmse, limits.velocity_rmse_bad_m_s)
     if scenario.type == "hover":
         tracking_score = 0.6 * inner_attitude_score + 0.4 * position_score
+    elif scenario.type == "command_step":
+        # 指令阶跃只评估姿态/偏航角速度内环；位置没有作为策略目标暴露。
+        tracking_score = inner_attitude_score
     else:
         tracking_score = (
             0.5 * inner_attitude_score
@@ -731,6 +1272,9 @@ def _score_trajectory(
 def _scenario_euler(
     scenario: FixedScenario, time_s: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if scenario.type == "command_step":
+        roll, pitch, yaw, _ = _scenario_command(scenario, time_s)
+        return roll, pitch, yaw
     if scenario.type in {"hover", "constant_translation"}:
         return tuple(torch.full_like(time_s, value) for value in scenario.fixed_euler_rad)  # type: ignore[return-value]
     omega = 2.0 * math.pi / scenario.circle_period_s
@@ -741,18 +1285,66 @@ def _scenario_euler(
     )
 
 
+def _scenario_command(
+    scenario: FixedScenario,
+    time_s: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """返回横滚、俯仰、积分航向和语义明确的偏航角速度目标。"""
+
+    if scenario.type != "command_step":
+        roll, pitch, yaw = _scenario_euler(scenario, time_s)
+        return roll, pitch, yaw, torch.zeros_like(time_s)
+
+    positive_start = 0.20 * scenario.duration_s
+    negative_start = 0.45 * scenario.duration_s
+    zero_start = 0.70 * scenario.duration_s
+    sign = torch.where(
+        time_s < positive_start,
+        torch.zeros_like(time_s),
+        torch.where(
+            time_s < negative_start,
+            torch.ones_like(time_s),
+            torch.where(
+                time_s < zero_start,
+                -torch.ones_like(time_s),
+                torch.zeros_like(time_s),
+            ),
+        ),
+    )
+    roll = scenario.fixed_euler_rad[0] + sign * scenario.roll_amplitude_rad
+    pitch = (
+        scenario.fixed_euler_rad[1]
+        + sign * scenario.pitch_amplitude_rad
+    )
+    yaw_rate = sign * scenario.yaw_rate_amplitude_rad_s
+    positive_elapsed = (time_s - positive_start).clamp(
+        min=0.0,
+        max=negative_start - positive_start,
+    )
+    negative_elapsed = (time_s - negative_start).clamp(
+        min=0.0,
+        max=zero_start - negative_start,
+    )
+    yaw = (
+        scenario.fixed_euler_rad[2]
+        + scenario.yaw_rate_amplitude_rad_s
+        * (positive_elapsed - negative_elapsed)
+    )
+    return roll, pitch, yaw, yaw_rate
+
+
 def _scenario_trajectory(
     scenario: FixedScenario,
     time_s: torch.Tensor,
     origin: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if scenario.type == "hover":
+    if scenario.type in {"hover", "command_step"}:
         return origin, torch.zeros_like(origin)
     if scenario.type == "constant_translation":
         velocity = torch.tensor(
             scenario.target_velocity_n_m_s, device=time_s.device, dtype=time_s.dtype
         ).expand_as(origin)
-        return origin + velocity * time_s[:, None], velocity
+        return origin + velocity * time_s[..., None], velocity
     omega = 2.0 * math.pi / scenario.circle_period_s
     radius = scenario.circle_radius_m
     displacement = torch.stack(
@@ -828,6 +1420,47 @@ def _settling_time(
     return result
 
 
+def _command_step_response_time(
+    error: torch.Tensor,
+    alive: torch.Tensor,
+    scenario: FixedScenario,
+    control_hz: int,
+    threshold: float,
+    window_s: float,
+) -> torch.Tensor:
+    """分别从三次命令跳变计时，并返回每个实例最坏的稳定时间。"""
+
+    window = max(1, round(window_s * control_hz))
+    change_steps = tuple(
+        min(error.shape[0] - 1, round(fraction * scenario.duration_s * control_hz))
+        for fraction in (0.20, 0.45, 0.70)
+    )
+    result = torch.zeros(error.shape[1], dtype=error.dtype)
+    for batch_index in range(error.shape[1]):
+        worst = 0.0
+        for change_index, change_step in enumerate(change_steps):
+            segment_end = (
+                change_steps[change_index + 1]
+                if change_index + 1 < len(change_steps)
+                else error.shape[0]
+            )
+            settled = None
+            last_start = segment_end - window
+            for start in range(change_step, last_start + 1):
+                good = (
+                    error[start : start + window, batch_index] <= threshold
+                ) & alive[start : start + window, batch_index]
+                if bool(good.all().item()):
+                    settled = (start - change_step) / float(control_hz)
+                    break
+            if settled is None:
+                worst = scenario.duration_s
+                break
+            worst = max(worst, settled)
+        result[batch_index] = worst
+    return result
+
+
 def _recovery_time_after_peak(
     error_deg: torch.Tensor,
     alive: torch.Tensor,
@@ -895,10 +1528,16 @@ def _parse_scenario(node: Any, index: int) -> FixedScenario:
     allowed = {
         "name", "type", "duration_s", "fixed_euler_deg", "target_velocity_n_m_s",
         "circle_radius_m", "circle_period_s", "roll_amplitude_deg", "pitch_amplitude_deg",
+        "yaw_rate_amplitude_rad_s",
     }
     _only_keys(value, allowed, f"scenarios[{index}]")
     type_name = str(value.get("type"))
-    if type_name not in {"hover", "constant_translation", "circle"}:
+    if type_name not in {
+        "hover",
+        "constant_translation",
+        "circle",
+        "command_step",
+    }:
         raise ValueError(f"unsupported scenario type: {type_name}")
     euler_deg = _float_triplet(value.get("fixed_euler_deg", [0, 0, 0]), f"scenarios[{index}].fixed_euler_deg")
     velocity = _float_triplet(value.get("target_velocity_n_m_s", [0, 0, 0]), f"scenarios[{index}].target_velocity_n_m_s")
@@ -914,6 +1553,10 @@ def _parse_scenario(node: Any, index: int) -> FixedScenario:
         circle_period_s=circle_period,
         roll_amplitude_rad=math.radians(_nonnegative_float(value.get("roll_amplitude_deg", 0.0), f"scenarios[{index}].roll_amplitude_deg")),
         pitch_amplitude_rad=math.radians(_nonnegative_float(value.get("pitch_amplitude_deg", 0.0), f"scenarios[{index}].pitch_amplitude_deg")),
+        yaw_rate_amplitude_rad_s=_nonnegative_float(
+            value.get("yaw_rate_amplitude_rad_s", 0.0),
+            f"scenarios[{index}].yaw_rate_amplitude_rad_s",
+        ),
     )
 
 

@@ -89,6 +89,7 @@ class SimulationEnvironment:
             materialized.source_path,
             materialized.raw,
             self._parameters,
+            simulation_hz=materialized.timing.physics_hz,
         )
         self._append_log(
             active_mask=torch.zeros_like(self._valid),
@@ -325,54 +326,50 @@ class SimulationEnvironment:
         advance_mask = active & self._valid & legal
         self._control = torch.where(advance_mask[:, None], control, self._control)
 
-        steps_advanced = torch.zeros_like(self._physics_step)
-        for _ in range(self._config.timing.substeps):
-            step_mask = advance_mask & self._valid
-            candidate = self._dynamics.step(
+        # 物理与控制统一为 500 Hz：每次调用只执行一个 2 ms 仿真步。
+        step_mask = advance_mask & self._valid
+        candidate = self._dynamics.step(
+            self._truth,
+            self._parameters,
+            self._control,
+            step_mask,
+            self._config.timing.physics_dt,
+            self._instance_seeds,
+            self._random_counters["motors"],
+        )
+        candidate_finite = self._state_is_finite(candidate)
+        failed = step_mask & ~candidate_finite
+        self._valid = self._valid & ~failed
+        self._error_code = torch.where(
+            failed,
+            torch.full_like(self._error_code, int(ErrorCode.NONFINITE_STATE)),
+            self._error_code,
+        )
+        commit = step_mask & candidate_finite
+        self._commit_state(candidate, commit)
+        self._random_counters["motors"].add_(commit[:, None].to(torch.int64))
+        steps_advanced = commit.to(torch.int64)
+        self._physics_step = self._physics_step + steps_advanced
+        self._control_step = self._control_step + steps_advanced
+        self._sensors = dict(
+            self._sensor_kernel.step(
+                self._sensors,
                 self._truth,
                 self._parameters,
-                self._control,
-                step_mask,
-                self._config.timing.physics_dt,
+                commit,
+                self._physics_step,
                 self._instance_seeds,
-                self._random_counters["motors"],
+                {
+                    name: self._random_counters[f"sensor.{name}"]
+                    for name in self._sensors
+                },
             )
-            candidate_finite = self._state_is_finite(candidate)
-            failed = step_mask & ~candidate_finite
-            self._valid = self._valid & ~failed
-            self._error_code = torch.where(
-                failed,
-                torch.full_like(self._error_code, int(ErrorCode.NONFINITE_STATE)),
-                self._error_code,
-            )
-            commit = step_mask & candidate_finite
-            self._commit_state(candidate, commit)
-            self._random_counters["motors"].add_(
-                commit[:, None].to(torch.int64)
-            )
-            self._physics_step = self._physics_step + commit.to(torch.int64)
-            steps_advanced = steps_advanced + commit.to(torch.int64)
-            self._sensors = dict(
-                self._sensor_kernel.step(
-                    self._sensors,
-                    self._truth,
-                    self._parameters,
-                    commit,
-                    self._physics_step,
-                    self._instance_seeds,
-                    {
-                        name: self._random_counters[f"sensor.{name}"]
-                        for name in self._sensors
-                    },
-                )
-            )
-            self._append_log(
-                active_mask=commit,
-                event_code=self._zero_event_code,
-            )
+        )
+        self._append_log(
+            active_mask=commit,
+            event_code=self._zero_event_code,
+        )
 
-        completed = steps_advanced == self._config.timing.substeps
-        self._control_step = self._control_step + completed.to(torch.int64)
         return AdvanceResult(
             batch_id=self.batch_id,
             instance_ids=self.instance_ids,

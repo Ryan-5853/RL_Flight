@@ -3,7 +3,7 @@
   "seed": 20260721,
   "parallel": {"independent_rng": true},
   "timing": {
-    "physics_hz": {"value": 5000},
+    "physics_hz": {"value": 500},
     "control_hz": {"value": 500}
   },
   "initial_state": {
@@ -53,14 +53,14 @@
     "coupling_attenuation": {"value": [[0.0, 0.1, 0.1], [0.1, 0.0, 0.1], [0.1, 0.1, 0.0]]}
   },
   "sensors": {
-    "gyro": {"sample_hz": {"value": 5000}, "noise": {"distribution": "normal", "stddev": {"value": [0.002, 0.002, 0.002]}}, "bias": {"value": [0.0, 0.0, 0.0]}, "delay": {"value": 0.001}},
-    "accelerometer": {"sample_hz": {"value": 5000}, "noise": {"distribution": "normal", "stddev": {"value": [0.02, 0.02, 0.02]}}, "bias": {"value": [0.0, 0.0, 0.0]}, "delay": {"value": 0.001}},
-    "motor_speed": {"sample_hz": {"value": 5000}, "noise": {"distribution": "normal", "stddev": {"value": [2.0, 2.0]}}, "bias": {"value": [0.0, 0.0]}, "delay": {"value": 0.0}}
+    "gyro": {"sample_hz": {"value": 500}, "noise": {"distribution": "normal", "stddev": {"value": [0.002, 0.002, 0.002]}}, "bias": {"value": [0.0, 0.0, 0.0]}, "delay": {"value": 0.001}, "interpolation": "linear"},
+    "accelerometer": {"sample_hz": {"value": 500}, "noise": {"distribution": "normal", "stddev": {"value": [0.02, 0.02, 0.02]}}, "bias": {"value": [0.0, 0.0, 0.0]}, "delay": {"value": 0.001}, "interpolation": "linear"},
+    "motor_speed": {"sample_hz": {"value": 500}, "noise": {"distribution": "normal", "stddev": {"value": [2.0, 2.0]}}, "bias": {"value": [0.0, 0.0]}, "delay": {"value": 0.0}}
   },
   "logging": {
     "directory": "../../runs/simulator",
     "mode": "compact",
-    "physics_step_stride": 10,
+    "physics_step_stride": 1,
     "fields": ["physics_step", "control_step", "sim_time_s", "control", "active_mask", "valid", "error_code", "generation", "event_code", "truth.position_n", "truth.attitude_q_wb", "truth.angular_velocity_b", "truth.motor_speed", "truth.total_thrust", "truth.servo_angle"],
     "chunk_steps": 1024,
     "queue_chunks": 2,

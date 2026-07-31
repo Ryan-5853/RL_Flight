@@ -31,8 +31,8 @@ def check_free_fall(path: Path, dt: float, steps: int = 5) -> None:
             env.advance(zero_control)
             truth = env.observe("truth").values
             expected_velocity = GRAVITY_N * (step * dt)
-            # Semi-implicit Euler: sum(k * g * dt^2), k=1..step.
-            expected_position = GRAVITY_N * (dt**2 * step * (step + 1) / 2.0)
+            # 中点常加速度位置更新对自由落体是精确的。
+            expected_position = 0.5 * GRAVITY_N * (step * dt) ** 2
             assert_close(
                 truth["linear_acceleration_n"][0],
                 GRAVITY_N,
@@ -73,21 +73,52 @@ def check_forced_steps(path: Path, dt: float, steps: int = 6) -> None:
             old_position = previous["position_n"][0]
             old_omega = previous["angular_velocity_b"][0]
 
-            force_n = rotate_body_to_world(old_q, current["force_b"][0])
-            expected_linear_acceleration = force_n / mass + GRAVITY_N
             angular_momentum = inertia * old_omega
-            expected_angular_acceleration = (
+            initial_angular_acceleration = (
                 current["moment_b"][0]
                 - torch.linalg.cross(old_omega, angular_momentum)
             ) / inertia
+            midpoint_omega = old_omega + 0.5 * initial_angular_acceleration * dt
+            midpoint_q = integrate_quaternion(old_q, midpoint_omega, 0.5 * dt)
+            force_n = rotate_body_to_world(midpoint_q, current["force_b"][0])
+            expected_linear_acceleration = force_n / mass + GRAVITY_N
+            midpoint_angular_momentum = inertia * midpoint_omega
+            midpoint_angular_acceleration = (
+                current["moment_b"][0]
+                - torch.linalg.cross(midpoint_omega, midpoint_angular_momentum)
+            ) / inertia
             expected_velocity = old_velocity + expected_linear_acceleration * dt
-            expected_position = old_position + expected_velocity * dt
-            expected_omega = old_omega + expected_angular_acceleration * dt
-            expected_q = integrate_quaternion(old_q, expected_omega, dt)
+            expected_position = (
+                old_position
+                + old_velocity * dt
+                + 0.5 * expected_linear_acceleration * dt**2
+            )
+            expected_omega = old_omega + midpoint_angular_acceleration * dt
+            expected_q = integrate_quaternion(old_q, midpoint_omega, dt)
+            final_force_n = rotate_body_to_world(
+                expected_q, current["force_b"][0]
+            )
+            expected_final_linear_acceleration = (
+                final_force_n / mass + GRAVITY_N
+            )
+            expected_final_angular_acceleration = (
+                current["moment_b"][0]
+                - torch.linalg.cross(
+                    expected_omega, inertia * expected_omega
+                )
+            ) / inertia
 
             checks = (
-                (current["linear_acceleration_n"][0], expected_linear_acceleration, "a"),
-                (current["angular_acceleration_b"][0], expected_angular_acceleration, "alpha"),
+                (
+                    current["linear_acceleration_n"][0],
+                    expected_final_linear_acceleration,
+                    "a",
+                ),
+                (
+                    current["angular_acceleration_b"][0],
+                    expected_final_angular_acceleration,
+                    "alpha",
+                ),
                 (current["velocity_n"][0], expected_velocity, "velocity"),
                 (current["position_n"][0], expected_position, "position"),
                 (current["angular_velocity_b"][0], expected_omega, "omega"),
@@ -119,7 +150,7 @@ def check_forced_steps(path: Path, dt: float, steps: int = 6) -> None:
 
 
 def run() -> None:
-    physics_hz = 100
+    physics_hz = 500
     dt = 1.0 / physics_hz
     with tempfile.TemporaryDirectory(prefix="simenv-step-check-") as directory:
         root = Path(directory)
@@ -131,11 +162,21 @@ def run() -> None:
 
         forced_config = deterministic_config(root / "forced-logs")
         configure_clean_actuators(forced_config)
+        # 令执行器在 2 ms 内达到指令，使该检查可独立核对恒定力/力矩的
+        # 中点刚体积分，而不重复实现执行器内部的解析过渡过程。
+        for motor in forced_config["motors"]:
+            value(motor["time_constant"], 1.0e-6)
+        for servo in forced_config["servos"]:
+            value(servo["tau"], 1.0e-6)
+            value(servo["max_speed"], 1.0e9)
         configure_symmetric_grids(forced_config)
         value(forced_config["body"]["mass"], 2.0)
         forced_path = write_config(forced_config, root / "forced.yaml")
         check_forced_steps(forced_path, dt)
-    print("\nPASS: rigid-body equations, semi-implicit Euler, and q integration agree.")
+    print(
+        "\nPASS: 500 Hz midpoint rigid-body equations, exact translation, "
+        "and quaternion exponential integration agree."
+    )
 
 
 if __name__ == "__main__":

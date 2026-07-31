@@ -67,7 +67,7 @@ def _config(log_directory: str) -> dict:
         "schema_version": 1,
         "seed": 1234,
         "parallel": {"independent_rng": True},
-        "timing": {"physics_hz": _randomizable(5000), "control_hz": _randomizable(500)},
+        "timing": {"physics_hz": _randomizable(500), "control_hz": _randomizable(500)},
         "initial_state": {
             "position_n": _randomizable([0.0, 0.0, 0.0]),
             "velocity_n": _randomizable([0.0, 0.0, 0.0]),
@@ -107,10 +107,11 @@ def _config(log_directory: str) -> dict:
         },
         "sensors": {
             "gyro": {
-                "sample_hz": _randomizable(5000),
+                "sample_hz": _randomizable(500),
                 "noise": {"distribution": "normal", "stddev": _randomizable([0.002] * 3)},
                 "bias": _randomizable([0.0] * 3),
                 "delay": _randomizable(0.001),
+                "interpolation": "linear",
             }
         },
         "logging": {
@@ -155,6 +156,26 @@ class SimulationEnvironmentTests(unittest.TestCase):
                 self.assertEqual(env.parameters["motors.pwm_to_rpm_table"].shape, (4, 2, 3, 2))
                 self.assertEqual(env.parameters["servos.pwm_angle_table"].shape, (4, 3, 3, 2))
                 self.assertEqual(env.parameters["aerodynamics.coupling_attenuation"].shape, (4, 3, 3))
+
+    def test_create_requires_fixed_500_hz_single_step_timebase(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for physics_hz, control_hz in ((5000, 500), (1000, 500), (500, 250)):
+                config = _config(str(root / f"logs-{physics_hz}-{control_hz}"))
+                config["timing"] = {
+                    "physics_hz": _randomizable(physics_hz),
+                    "control_hz": _randomizable(control_hz),
+                }
+                path = self._write_named_config(
+                    root,
+                    f"invalid-{physics_hz}-{control_hz}.json",
+                    config,
+                )
+                with self.assertRaisesRegex(
+                    ConfigurationError,
+                    "must both equal 500",
+                ):
+                    SimulationEnvironment.create(path, 1, "cpu")
 
     def test_dynamic_randomization_uses_environment_nominal_and_rejects_baseline(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -333,8 +354,8 @@ class SimulationEnvironmentTests(unittest.TestCase):
             root = Path(directory)
             config = _config(str(root / "logs"))
             config["timing"] = {
-                "physics_hz": _randomizable(100),
-                "control_hz": _randomizable(100),
+                "physics_hz": _randomizable(500),
+                "control_hz": _randomizable(500),
             }
             self._disable_motor_noise(config)
             self._zero_sensor_delays(config)
@@ -347,10 +368,10 @@ class SimulationEnvironmentTests(unittest.TestCase):
                     truth["linear_acceleration_n"], expected_acceleration
                 )
                 torch.testing.assert_close(
-                    truth["velocity_n"], expected_acceleration * 0.01
+                    truth["velocity_n"], expected_acceleration * 0.002
                 )
                 torch.testing.assert_close(
-                    truth["position_n"], expected_acceleration * 0.0001
+                    truth["position_n"], expected_acceleration * 0.000002
                 )
                 torch.testing.assert_close(truth["force_b"], torch.zeros((2, 3)))
                 torch.testing.assert_close(truth["moment_b"], torch.zeros((2, 3)))
@@ -360,8 +381,8 @@ class SimulationEnvironmentTests(unittest.TestCase):
             root = Path(directory)
             config = _config(str(root / "logs"))
             config["timing"] = {
-                "physics_hz": _randomizable(100),
-                "control_hz": _randomizable(100),
+                "physics_hz": _randomizable(500),
+                "control_hz": _randomizable(500),
             }
             config["body"]["mass"] = _randomizable(1.0)
             config["body"]["center_of_mass_b"] = _randomizable([0.0, 0.0, 0.0])
@@ -390,7 +411,7 @@ class SimulationEnvironmentTests(unittest.TestCase):
                 control[1, 0] = 1.0
                 env.advance(control)
                 truth = env.observe("truth").values
-                expected_speed = 100.0 * (1.0 - torch.exp(torch.tensor(-1.0)))
+                expected_speed = 100.0 * (1.0 - torch.exp(torch.tensor(-0.2)))
                 torch.testing.assert_close(
                     truth["motor_speed"][0], expected_speed.expand(2)
                 )
@@ -415,8 +436,8 @@ class SimulationEnvironmentTests(unittest.TestCase):
             root = Path(directory)
             config = _config(str(root / "logs"))
             config["timing"] = {
-                "physics_hz": _randomizable(100),
-                "control_hz": _randomizable(100),
+                "physics_hz": _randomizable(500),
+                "control_hz": _randomizable(500),
             }
             config["aerodynamics"]["thrust_coefficients"] = _randomizable(
                 [1.0e-3, 2.0e-3, 3.0e-4]
@@ -437,8 +458,8 @@ class SimulationEnvironmentTests(unittest.TestCase):
             with SimulationEnvironment.create(path, 1, "cpu") as env:
                 env.advance(torch.tensor([[1.0, 1.0, 0.0, 0.0, 0.0]]))
                 truth = env.observe("truth").values
-                upper_speed = 100.0 * (1.0 - torch.exp(torch.tensor(-1.0)))
-                lower_speed = 100.0 * (1.0 - torch.exp(torch.tensor(-0.5)))
+                upper_speed = 100.0 * (1.0 - torch.exp(torch.tensor(-0.2)))
+                lower_speed = 100.0 * (1.0 - torch.exp(torch.tensor(-0.1)))
                 expected_speeds = torch.stack((upper_speed, lower_speed))
                 torch.testing.assert_close(truth["motor_speed"][0], expected_speeds)
 
@@ -461,8 +482,8 @@ class SimulationEnvironmentTests(unittest.TestCase):
             root = Path(directory)
             config = _config(str(root / "logs"))
             config["timing"] = {
-                "physics_hz": _randomizable(100),
-                "control_hz": _randomizable(100),
+                "physics_hz": _randomizable(500),
+                "control_hz": _randomizable(500),
             }
             config["initial_state"]["attitude_q_wb"] = _randomizable(
                 [0.7071067811865476, 0.0, 0.7071067811865476, 0.0]
@@ -503,8 +524,8 @@ class SimulationEnvironmentTests(unittest.TestCase):
             root = Path(directory)
             config = _config(str(root / "logs"))
             config["timing"] = {
-                "physics_hz": _randomizable(100),
-                "control_hz": _randomizable(100),
+                "physics_hz": _randomizable(500),
+                "control_hz": _randomizable(500),
             }
             config["body"]["center_of_mass_b"] = _randomizable([0.0, 0.0, 0.0])
             config["aerodynamics"]["thrust_partition"] = {
@@ -538,8 +559,8 @@ class SimulationEnvironmentTests(unittest.TestCase):
                 servo["pwm_angle_table"] = _randomizable(
                     [[-1.0, -1.5707963267948966], [0.0, 0.0], [1.0, 1.5707963267948966]]
                 )
-                servo["tau"] = _randomizable(0.01)
-                servo["max_speed"] = _randomizable(1000.0)
+                servo["tau"] = _randomizable(0.0001)
+                servo["max_speed"] = _randomizable(1.0e6)
                 servo["backlash"] = _randomizable(0.0)
                 servo["deadzone"] = _randomizable(0.0)
             self._disable_motor_noise(config)
@@ -580,8 +601,8 @@ class SimulationEnvironmentTests(unittest.TestCase):
             root = Path(directory)
             config = _config(str(root / "logs"))
             config["timing"] = {
-                "physics_hz": _randomizable(100),
-                "control_hz": _randomizable(100),
+                "physics_hz": _randomizable(500),
+                "control_hz": _randomizable(500),
             }
             for servo in config["servos"]:
                 servo["pwm_angle_table"] = _randomizable(
@@ -609,15 +630,15 @@ class SimulationEnvironmentTests(unittest.TestCase):
             root = Path(directory)
             config = _config(str(root / "logs"))
             config["timing"] = {
-                "physics_hz": _randomizable(100),
-                "control_hz": _randomizable(50),
+                "physics_hz": _randomizable(500),
+                "control_hz": _randomizable(500),
             }
             gyro = config["sensors"]["gyro"]
             for motor in config["motors"]:
                 motor["noise"]["stddev"] = _randomizable(0.0)
-            gyro["sample_hz"] = _randomizable(50)
+            gyro["sample_hz"] = _randomizable(250)
             gyro["noise"]["stddev"] = _randomizable([0.0, 0.0, 0.0])
-            gyro["delay"] = _randomizable(0.02)
+            gyro["delay"] = _randomizable(0.002)
             path = self._write_named_config(root, "sensor-delay.json", config)
 
             with SimulationEnvironment.create(path, 1, "cpu") as env:
@@ -637,15 +658,15 @@ class SimulationEnvironmentTests(unittest.TestCase):
             root = Path(directory)
             config = _config(str(root / "logs"))
             config["timing"] = {
-                "physics_hz": _randomizable(100),
-                "control_hz": _randomizable(100),
+                "physics_hz": _randomizable(500),
+                "control_hz": _randomizable(500),
             }
             gyro = config["sensors"]["gyro"]
             for motor in config["motors"]:
                 motor["noise"]["stddev"] = _randomizable(0.0)
-            gyro["sample_hz"] = _randomizable(100)
+            gyro["sample_hz"] = _randomizable(500)
             gyro["noise"]["stddev"] = _randomizable([0.0, 0.0, 0.0])
-            gyro["delay"] = _randomizable(0.015)
+            gyro["delay"] = _randomizable(0.003)
             gyro["interpolation"] = "linear"
             path = self._write_named_config(root, "sensor-linear.json", config)
 
@@ -705,8 +726,8 @@ class SimulationEnvironmentTests(unittest.TestCase):
             root = Path(directory)
             config = _config(str(root / "logs"))
             config["timing"] = {
-                "physics_hz": _randomizable(100),
-                "control_hz": _randomizable(100),
+                "physics_hz": _randomizable(500),
+                "control_hz": _randomizable(500),
             }
             config["initial_state"]["attitude_q_wb"] = _randomizable(
                 [0.9238795325112867, 0.0, 0.3826834323650898, 0.0]
@@ -716,7 +737,7 @@ class SimulationEnvironmentTests(unittest.TestCase):
             )
             config["sensors"] = {
                 "accelerometer": {
-                    "sample_hz": _randomizable(100),
+                    "sample_hz": _randomizable(500),
                     "noise": {
                         "distribution": "normal",
                         "stddev": _randomizable([0.0, 0.0, 0.0]),
@@ -818,6 +839,7 @@ class SimulationEnvironmentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             fractional = _config(str(root / "fractional_logs"))
+            fractional["sensors"]["gyro"].pop("interpolation")
             fractional["sensors"]["gyro"]["delay"] = _randomizable(0.0001)
             fractional_path = self._write_named_config(
                 root, "fractional.json", fractional
@@ -851,9 +873,13 @@ class SimulationEnvironmentTests(unittest.TestCase):
                 control[2, 0] = -0.1
                 active = torch.tensor([True, False, True, True])
                 result = env.advance(control, active)
-                self.assertEqual(result.physics_steps_advanced.tolist(), [10, 0, 0, 10])
-                self.assertEqual(result.physics_step.tolist(), [10, 0, 0, 10])
+                self.assertEqual(result.physics_steps_advanced.tolist(), [1, 0, 0, 1])
+                self.assertEqual(result.physics_step.tolist(), [1, 0, 0, 1])
                 self.assertEqual(result.control_step.tolist(), [1, 0, 0, 1])
+                torch.testing.assert_close(
+                    result.sim_time_s,
+                    torch.tensor([0.002, 0.0, 0.0, 0.002]),
+                )
                 self.assertEqual(result.valid.tolist(), [True, True, False, True])
                 self.assertEqual(
                     result.error_code.tolist(),
@@ -893,10 +919,20 @@ class SimulationEnvironmentTests(unittest.TestCase):
                 "truth.moment_b",
             ):
                 self.assertIn(field, records[0])
-            self.assertEqual(sum(chunk["physics_step"].shape[0] for chunk in records), 11)
+            self.assertEqual(sum(chunk["physics_step"].shape[0] for chunk in records), 2)
             timeline = torch.cat([chunk["physics_step"] for chunk in records], dim=0)
+            control_timeline = torch.cat(
+                [chunk["control_step"] for chunk in records], dim=0
+            )
             self.assertEqual(timeline[0].tolist(), [0, 0])
-            self.assertEqual(timeline[-1].tolist(), [10, 10])
+            self.assertEqual(timeline[-1].tolist(), [1, 1])
+            torch.testing.assert_close(control_timeline, timeline)
+            metadata = json.loads(
+                (log_directory / "metadata.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(metadata["simulation_hz"], 500)
+            self.assertEqual(metadata["simulation_step_s"], 0.002)
+            self.assertIn("500 Hz", metadata["timeline_step_semantics"])
 
     def test_compact_timeline_downsamples_fields_but_keeps_events(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -917,7 +953,8 @@ class SimulationEnvironmentTests(unittest.TestCase):
             config_path = self._write_named_config(root, "compact.json", config)
             with SimulationEnvironment.create(config_path, 2, "cpu") as env:
                 log_directory = env._logger.directory
-                env.advance(torch.zeros((2, 5), dtype=torch.float32))
+                for _ in range(10):
+                    env.advance(torch.zeros((2, 5), dtype=torch.float32))
             records = [
                 torch.load(path, weights_only=True)
                 for path in sorted(log_directory.glob("timeline_*.pt"))
@@ -1034,7 +1071,7 @@ class SimulationEnvironmentTests(unittest.TestCase):
                     self.assertEqual(result.instance_ids[index], previous_ids[index])
 
                 observation = env.observe("truth", ("position_n",))
-                self.assertEqual(observation.physics_step.tolist(), [0, 10, 0, 10])
+                self.assertEqual(observation.physics_step.tolist(), [0, 1, 0, 1])
                 self.assertEqual(observation.control_step.tolist(), [0, 1, 0, 1])
                 self.assertEqual(observation.valid.tolist(), [True, True, True, True])
                 torch.testing.assert_close(
@@ -1112,8 +1149,8 @@ class SimulationEnvironmentTests(unittest.TestCase):
             replacement["body"]["center_of_mass_b"] = _randomizable(
                 [0.0, 0.0, 0.02]
             )
-            replacement["sensors"]["gyro"]["sample_hz"] = _randomizable(2500)
-            replacement["sensors"]["gyro"]["delay"] = _randomizable(0.0004)
+            replacement["sensors"]["gyro"]["sample_hz"] = _randomizable(250)
+            replacement["sensors"]["gyro"]["delay"] = _randomizable(0.0)
             base_path = self._write_named_config(root, "base.json", base)
             replacement_path = self._write_named_config(
                 root, "replacement.json", replacement
