@@ -21,6 +21,7 @@
   let failurePending = false;
   let virtualInputSequence = 0;
   let usingVirtualInput = false;
+  let pendingTargetPosition = null;
   let telemetryAbortController = null;
   let clockOffsetMs = 0;
   let clockSyncRttMs = Number.NaN;
@@ -200,6 +201,7 @@
         lastTelemetrySequence = -1;
         controlInFlight.clear();
       }
+      if (pendingTargetPosition) await sendPositionTarget();
       await sendControllerAction(singleStep ? 'step' : 'start');
       if (singleStep) {
         const data = await request(`/api/runtime/sessions/${sessionId}/telemetry?after=${lastTelemetrySequence}&timeout=1`);
@@ -256,6 +258,14 @@
       refreshVirtualInput();
     }
     return { ...latestControllerFrame.channels };
+  }
+
+  async function sendPositionTarget(target = pendingTargetPosition) {
+    if (!sessionId || !Array.isArray(target) || target.length !== 3) return;
+    await request(`/api/runtime/sessions/${sessionId}/target`, {
+      method: 'POST',
+      body: JSON.stringify({ target_position_n: target })
+    });
   }
 
   async function sendControllerAction(action) {
@@ -413,6 +423,7 @@
   }
 
   async function resetSession() {
+    pendingTargetPosition = null;
     if (!sessionId) return;
     try { await request(`/api/runtime/sessions/${sessionId}/reset`, { method: 'POST', body: '{}' }); }
     catch (error) { publishError(error); }
@@ -515,6 +526,19 @@
   window.addEventListener('rlflightsimulationstep', event => runSession(event.detail.configuration, event.detail.controller, true));
   window.addEventListener('rlflightsimulationpause', pauseSession);
   window.addEventListener('rlflightsimulationreset', resetSession);
+  window.addEventListener('rlflightpositiontarget', event => {
+    const target = event.detail?.target_position_n;
+    if (!Array.isArray(target) || target.length !== 3 || !target.every(Number.isFinite)) return;
+    pendingTargetPosition = [...target];
+    if (sessionId) sendPositionTarget().catch(failRuntime);
+  });
+  window.addEventListener('rlflightsimulationtelemetry', event => {
+    const reference = event.detail?.reference?.target_position_n;
+    const target = Array.isArray(reference?.[0]) ? reference[0] : reference;
+    if (Array.isArray(target) && target.length === 3 && target.every(Number.isFinite)) {
+      pendingTargetPosition = [...target];
+    }
+  });
   window.addEventListener('rlflightconfigurationapply', event => {
     applyConfiguration(event.detail).catch(failRuntime);
   });

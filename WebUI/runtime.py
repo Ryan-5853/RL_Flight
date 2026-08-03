@@ -242,6 +242,270 @@ def _sim_timing(raw: Mapping[str, Any]) -> tuple[int, int]:
     return physics_hz, control_hz
 
 
+_CONTROLLER_MODEL_KEYS = (
+    "body.mass",
+    "body.center_of_mass_b",
+    "body.inertia_diagonal_b",
+    "motors.pwm_to_rpm_table",
+    "motors.time_constant",
+    "motors.torque_coefficient",
+    "servos.pwm_angle_table",
+    "servos.tau",
+    "aerodynamics.thrust_coefficients",
+    "aerodynamics.neutral_thrust_direction_b",
+    "aerodynamics.direct_thrust_center_b",
+    "aerodynamics.thrust_partition",
+    "aerodynamics.coupling_attenuation",
+    "aerodynamics.grids.aerodynamic_center_b",
+    "aerodynamics.grids.deflection_axis_b",
+    "aerodynamics.grids.self_attenuation_curve",
+    "aerodynamics.grids.vector_deflection.gain",
+    "aerodynamics.grids.vector_deflection.offset",
+)
+
+
+def _nested(node: Mapping[str, Any], path: str) -> Any:
+    current: Any = node
+    for part in path.split("."):
+        if not isinstance(current, Mapping) or part not in current:
+            raise RuntimeConfigurationError(
+                f"controller.params.model_parameters.manual.{path} is required "
+                "when the controller model source is manual"
+            )
+        current = current[part]
+    return current
+
+
+def _manual_controller_model_values(manual: Mapping[str, Any]) -> dict[str, Any]:
+    """Convert the editable model tree into SimEnv's materialized tensors."""
+
+    return {
+        "body.mass": _nested(manual, "body.mass"),
+        "body.center_of_mass_b": _nested(manual, "body.center_of_mass_b"),
+        "body.inertia_diagonal_b": _nested(manual, "body.inertia_diagonal_b"),
+        "motors.pwm_to_rpm_table": [
+            _nested(manual, "motors.upper_pwm_to_rpm_table"),
+            _nested(manual, "motors.lower_pwm_to_rpm_table"),
+        ],
+        "motors.time_constant": _nested(manual, "motors.time_constant"),
+        "motors.torque_coefficient": _nested(
+            manual, "motors.torque_coefficient"
+        ),
+        "servos.pwm_angle_table": [
+            _nested(manual, f"servos.servo_{index}_pwm_angle_table")
+            for index in range(1, 4)
+        ],
+        "servos.tau": _nested(manual, "servos.tau"),
+        "aerodynamics.thrust_coefficients": _nested(
+            manual, "aerodynamics.thrust_coefficients"
+        ),
+        "aerodynamics.neutral_thrust_direction_b": _nested(
+            manual, "aerodynamics.neutral_thrust_direction_b"
+        ),
+        "aerodynamics.direct_thrust_center_b": _nested(
+            manual, "aerodynamics.direct_thrust_center_b"
+        ),
+        "aerodynamics.thrust_partition": _nested(
+            manual, "aerodynamics.thrust_partition"
+        ),
+        "aerodynamics.coupling_attenuation": _nested(
+            manual, "aerodynamics.coupling_attenuation"
+        ),
+        "aerodynamics.grids.aerodynamic_center_b": _nested(
+            manual, "aerodynamics.grids.aerodynamic_center_b"
+        ),
+        "aerodynamics.grids.deflection_axis_b": _nested(
+            manual, "aerodynamics.grids.deflection_axis_b"
+        ),
+        "aerodynamics.grids.self_attenuation_curve": [
+            _nested(
+                manual,
+                f"aerodynamics.grids.grid_{index}_self_attenuation_curve",
+            )
+            for index in range(1, 4)
+        ],
+        "aerodynamics.grids.vector_deflection.gain": _nested(
+            manual, "aerodynamics.grids.vector_deflection_gain"
+        ),
+        "aerodynamics.grids.vector_deflection.offset": _nested(
+            manual, "aerodynamics.grids.vector_deflection_offset"
+        ),
+    }
+
+
+def _controller_model_parameters(
+    actual: Mapping[str, Any],
+    model_config: Mapping[str, Any],
+    torch: Any,
+) -> tuple[str, dict[str, Any]]:
+    """Return an immutable-at-session-start controller model snapshot."""
+
+    source = str(model_config.get("source", "synchronized"))
+    if source not in {"synchronized", "manual"}:
+        raise RuntimeConfigurationError(
+            "controller.params.model_parameters.source must be "
+            "synchronized or manual"
+        )
+    snapshot = {name: value.detach().clone() for name, value in actual.items()}
+    if source == "synchronized":
+        return source, snapshot
+
+    manual = _mapping(
+        model_config.get("manual", {}),
+        "controller.params.model_parameters.manual",
+    )
+    values = _manual_controller_model_values(manual)
+    for name in _CONTROLLER_MODEL_KEYS:
+        reference = actual[name]
+        candidate = torch.as_tensor(
+            values[name], device=reference.device, dtype=reference.dtype
+        )
+        expected_shape = tuple(reference.shape[1:])
+        if tuple(candidate.shape) != expected_shape:
+            raise RuntimeConfigurationError(
+                "controller manual model parameter "
+                f"{name} must have shape {expected_shape}, got "
+                f"{tuple(candidate.shape)}"
+            )
+        if not bool(torch.isfinite(candidate).all().item()):
+            raise RuntimeConfigurationError(
+                f"controller manual model parameter {name} must be finite"
+            )
+        snapshot[name] = candidate.unsqueeze(0).expand_as(reference).clone()
+
+    positive = (
+        "body.mass",
+        "body.inertia_diagonal_b",
+        "motors.time_constant",
+        "servos.tau",
+    )
+    for name in positive:
+        if not bool((snapshot[name] > 0).all().item()):
+            raise RuntimeConfigurationError(
+                f"controller manual model parameter {name} must be positive"
+            )
+    if not bool((snapshot["motors.torque_coefficient"] >= 0).all().item()):
+        raise RuntimeConfigurationError(
+            "controller manual motor torque coefficients must be non-negative"
+        )
+    partition = snapshot["aerodynamics.thrust_partition"]
+    if not bool((partition >= 0).all().item()) or not bool(
+        torch.isclose(
+            partition.sum(dim=1),
+            torch.ones_like(partition[:, 0]),
+            atol=1e-5,
+            rtol=0.0,
+        ).all().item()
+    ):
+        raise RuntimeConfigurationError(
+            "controller manual thrust partition must be non-negative and sum to 1"
+        )
+    for name in (
+        "aerodynamics.neutral_thrust_direction_b",
+        "aerodynamics.grids.deflection_axis_b",
+    ):
+        norms = torch.linalg.vector_norm(snapshot[name], dim=-1)
+        if not bool(
+            torch.isclose(
+                norms, torch.ones_like(norms), atol=1e-5, rtol=1e-5
+            ).all().item()
+        ):
+            raise RuntimeConfigurationError(
+                f"controller manual model parameter {name} must contain unit vectors"
+            )
+    for name in ("motors.pwm_to_rpm_table", "servos.pwm_angle_table"):
+        table = snapshot[name]
+        if not bool((torch.diff(table[..., 0], dim=-1) > 0).all().item()):
+            raise RuntimeConfigurationError(
+                f"controller manual model parameter {name} axes must be strictly increasing"
+            )
+    motor_table = snapshot["motors.pwm_to_rpm_table"]
+    if not bool(
+        (
+            (motor_table[..., 0] >= 0)
+            & (motor_table[..., 0] <= 1)
+            & (motor_table[..., 1] >= 0)
+        ).all().item()
+    ) or not bool((torch.diff(motor_table[..., 1], dim=-1) >= 0).all().item()):
+        raise RuntimeConfigurationError(
+            "controller manual motor table requires PWM in [0,1] and "
+            "non-decreasing non-negative speed"
+        )
+    servo_table = snapshot["servos.pwm_angle_table"]
+    if not bool(
+        ((servo_table[..., 0] >= -1) & (servo_table[..., 0] <= 1)).all().item()
+    ):
+        raise RuntimeConfigurationError(
+            "controller manual servo table PWM axes must be within [-1,1]"
+        )
+    thrust_coefficients = snapshot["aerodynamics.thrust_coefficients"]
+    k1, k2, k3 = thrust_coefficients.unbind(dim=1)
+    if not bool(((k1 >= 0) & (k2 >= 0)).all().item()) or not bool(
+        (k3 + 2.0 * torch.sqrt(k1 * k2) >= 0).all().item()
+    ):
+        raise RuntimeConfigurationError(
+            "controller manual thrust coefficients must produce non-negative thrust"
+        )
+    attenuation = snapshot["aerodynamics.grids.self_attenuation_curve"]
+    if not bool((torch.diff(attenuation[..., 0], dim=-1) > 0).all().item()) or not bool(
+        ((attenuation[..., 1] >= 0) & (attenuation[..., 1] <= 1)).all().item()
+    ):
+        raise RuntimeConfigurationError(
+            "controller manual grid attenuation axes must increase and values "
+            "must be within [0,1]"
+        )
+    return source, snapshot
+
+
+def _configuration_model_summary(parameters: Mapping[str, Any]) -> dict[str, Any]:
+    def values(name: str) -> Any:
+        value = parameters[name][0].detach().cpu()
+        return float(value.item()) if value.ndim == 0 else value.tolist()
+
+    return {
+        "body": {
+            "mass": values("body.mass"),
+            "center_of_mass_b": values("body.center_of_mass_b"),
+            "inertia_diagonal_b": values("body.inertia_diagonal_b"),
+        },
+        "motors": {
+            "time_constant": values("motors.time_constant"),
+            "torque_coefficient": values("motors.torque_coefficient"),
+        },
+        "servos": {"tau": values("servos.tau")},
+        "aerodynamics": {
+            "thrust_coefficients": values(
+                "aerodynamics.thrust_coefficients"
+            ),
+            "thrust_partition": values("aerodynamics.thrust_partition"),
+        },
+    }
+
+
+def _configuration_model_mismatch(
+    actual: Mapping[str, Any], controller: Mapping[str, Any]
+) -> dict[str, Any]:
+    different: list[str] = []
+    maximum = 0.0
+    for name in _CONTROLLER_MODEL_KEYS:
+        actual_value = actual[name]
+        controller_value = controller[name]
+        tensors_equal = actual_value.equal(controller_value)
+        if not tensors_equal:
+            different.append(name)
+        if not tensors_equal:
+            denominator = actual_value.abs().maximum(
+                controller_value.abs()
+            ).clamp_min(1e-12)
+            difference = (actual_value - controller_value).abs() / denominator
+            maximum = max(maximum, float(difference.max().detach().cpu().item()))
+    return {
+        "different_parameter_count": len(different),
+        "different_parameters": different,
+        "maximum_symmetric_relative_difference": maximum,
+    }
+
+
 class CpuRuntimeSession:
     """Own one CPU simulation/controller loop and its lifecycle."""
 
@@ -263,6 +527,8 @@ class CpuRuntimeSession:
         self.raw_simenv = yaml.safe_load(simenv_yaml)
         self.raw_test = yaml.safe_load(test_yaml)
         self.inference_package: RealtimeInferencePackage | None = None
+        self.realtime_height_controller: Any | None = None
+        self.last_height_controller_output: Mapping[str, Any] | None = None
         if not isinstance(self.raw_simenv, Mapping):
             raise RuntimeConfigurationError("SimEnv YAML must contain a mapping")
         if not isinstance(self.raw_test, Mapping):
@@ -349,6 +615,63 @@ class CpuRuntimeSession:
             controller_node = self.raw_test.get("controller", {"type": "neural"})
             controller_config = dict(_mapping(controller_node, "controller"))
             controller_type = str(controller_config.get("type", "neural"))
+            params = controller_config.setdefault("params", {})
+            if not isinstance(params, dict):
+                raise RuntimeConfigurationError(
+                    "controller.params must be a mapping"
+                )
+            collective_mode = str(params.get("collective_mode", "hover"))
+            if collective_mode not in {"hover", "manual"}:
+                raise RuntimeConfigurationError(
+                    "controller collective_mode must be hover or manual"
+                )
+            self.flight_mode = str(params.get("flight_mode", "attitude"))
+            if self.flight_mode not in {"attitude", "position"}:
+                raise RuntimeConfigurationError(
+                    "controller flight_mode must be attitude or position"
+                )
+            if self.flight_mode == "position" and collective_mode != "hover":
+                raise RuntimeConfigurationError(
+                    "position flight_mode requires collective_mode=hover"
+                )
+            model_parameters = _mapping(
+                params.get("model_parameters", {}),
+                "controller.params.model_parameters",
+            )
+            (
+                self.controller_parameter_source,
+                self.controller_parameters,
+            ) = _controller_model_parameters(
+                self.environment.parameters,
+                model_parameters,
+                torch,
+            )
+            position = _mapping(
+                params.get("position", {}),
+                "controller.params.position",
+            )
+            self.position_kp = _number(position, "kp", 1.0)
+            self.position_kd = _number(position, "kd", 1.6)
+            self.position_maximum_acceleration = _number(
+                position,
+                "maximum_acceleration_m_s2",
+                3.0,
+            )
+            self.position_maximum_tilt = _number(
+                position,
+                "maximum_tilt_rad",
+                0.35,
+            )
+            if (
+                self.position_kp < 0
+                or self.position_kd < 0
+                or self.position_maximum_acceleration <= 0
+                or not 0 < self.position_maximum_tilt < math.pi / 2
+            ):
+                raise RuntimeConfigurationError(
+                    "position gains must be non-negative, maximum acceleration "
+                    "must be positive, and maximum tilt must be inside (0,pi/2)"
+                )
             neural_model = None
             if controller_type == "neural":
                 if checkpoint_path is None:
@@ -393,11 +716,6 @@ class CpuRuntimeSession:
                         "SimEnv dynamics; import the training environment config"
                     )
                 neural_model = InferenceModelAdapter(self.inference_package)
-                params = controller_config.setdefault("params", {})
-                if not isinstance(params, dict):
-                    raise RuntimeConfigurationError(
-                        "controller.params must be a mapping"
-                    )
                 params.setdefault(
                     "maximum_angular_rate_rad_s",
                     self.options.max_angular_rate_rad_s,
@@ -412,39 +730,53 @@ class CpuRuntimeSession:
                     raise RuntimeConfigurationError(
                         "controller output_mode does not match inference package"
                     )
+                if collective_mode == "hover" and configured_output != "residual_4":
+                    raise RuntimeConfigurationError(
+                        "neural hover mode requires residual_4 so the external "
+                        "height controller owns the upper motor"
+                    )
                 params["output_mode"] = configured_output
+            controller_context = ControllerContext(
+                batch_size=1,
+                device=self.device,
+                dtype=self.dtype,
+                control_dt=self.control_period,
+                parameters=self.controller_parameters,
+            )
             self.controller = create_controller(
                 controller_config,
-                ControllerContext(
-                    batch_size=1,
-                    device=self.device,
-                    dtype=self.dtype,
-                    control_dt=self.control_period,
-                    parameters=self.environment.parameters,
-                ),
+                controller_context,
                 neural_model=neural_model,
             )
-            parameters = self.environment.parameters
+            if controller_type == "neural" and collective_mode == "hover":
+                # Reuse the exact classical altitude PID and plant mapping.
+                # Only its balanced upper-motor equilibrium is consumed; the
+                # neural policy retains ownership of the remaining channels.
+                self.realtime_height_controller = create_controller(
+                    {
+                        "type": "pid",
+                        "params": dict(controller_config["params"]),
+                    },
+                    controller_context,
+                )
             self.effective_configuration = {
                 "id": self.configuration_id,
                 "simulation_backend": "simenv-realtime-single-v1",
-                "body": {
-                    "mass": float(
-                        parameters["body.mass"][0].detach().cpu().item()
-                    ),
-                    "center_of_mass_b": parameters[
-                        "body.center_of_mass_b"
-                    ][0].detach().cpu().tolist(),
-                    "inertia_diagonal_b": parameters[
-                        "body.inertia_diagonal_b"
-                    ][0].detach().cpu().tolist(),
-                },
                 "controller_parameter_source": (
                     "deployment_package"
                     if controller_type == "neural"
-                    else "environment"
+                    else self.controller_parameter_source
+                ),
+                "controller_auxiliary_parameter_source": (
+                    self.controller_parameter_source
+                    if controller_type == "neural"
+                    else None
+                ),
+                "controller_model": _configuration_model_summary(
+                    self.controller_parameters
                 ),
             }
+            self._refresh_effective_model_configuration()
             self.warmup_seconds = self.simulation.warmup(
                 steps=self.options.warmup_steps
             )
@@ -475,6 +807,10 @@ class CpuRuntimeSession:
                 "truth", ("position_n",)
             ).values
             self.target_position_n = initial_truth["position_n"].clone()
+            self._target_position_command = tuple(
+                float(value)
+                for value in self.target_position_n[0].detach().cpu().tolist()
+            )
             self.target_velocity_n = torch.zeros(
                 (1, 3), device=self.device, dtype=self.dtype
             )
@@ -483,6 +819,7 @@ class CpuRuntimeSession:
             )
             self.last_controller_output = None
             self.last_reference = None
+            self.last_position_controller_output: Mapping[str, Any] | None = None
             self.episode_step = 0
             self.episode_id = 0
             self.controller_compiled = False
@@ -513,6 +850,9 @@ class CpuRuntimeSession:
                     self.controller.reset(reset_mask)
                     if self.inference_package is not None:
                         self.inference_package.reset()
+                    if self.realtime_height_controller is not None:
+                        self.realtime_height_controller.reset(reset_mask)
+                    self.last_height_controller_output = None
                     self.filtered_stick.zero_()
                     self.target_yaw.zero_()
                     self.upper_throttle.fill_(
@@ -521,6 +861,7 @@ class CpuRuntimeSession:
                     self.target_rate.zero_()
                     self.last_controller_output = None
                     self.last_reference = None
+                    self.last_position_controller_output = None
                     self.episode_step = 0
                     self.episode_id = 0
                 self.warmup_seconds += (
@@ -528,6 +869,22 @@ class CpuRuntimeSession:
                 )
                 self.controller_compiled = True
             self.controller_description = self.controller.describe()
+            self.controller_description["flight_mode"] = self.flight_mode
+            self.controller_description["position_controller"] = {
+                "kp": self.position_kp,
+                "kd": self.position_kd,
+                "maximum_acceleration_m_s2": (
+                    self.position_maximum_acceleration
+                ),
+                "maximum_tilt_rad": self.position_maximum_tilt,
+            }
+            if controller_type == "neural":
+                self.controller_description["collective_mode"] = collective_mode
+                self.controller_description["height_controller"] = (
+                    "shared_altitude_pid"
+                    if self.realtime_height_controller is not None
+                    else "manual"
+                )
             if self.inference_package is not None:
                 self.controller_description["inference_package"] = dict(
                     self.inference_package.describe()
@@ -644,6 +1001,23 @@ class CpuRuntimeSession:
                 server_received_ns=server_received_ns,
             )
 
+    def update_target_position(self, target_position_n: Any) -> None:
+        if (
+            not isinstance(target_position_n, (list, tuple))
+            or len(target_position_n) != 3
+        ):
+            raise ValueError("target_position_n must be a three-element vector")
+        values = tuple(float(value) for value in target_position_n)
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("target_position_n must contain finite values")
+        with self._lock:
+            if self._state == "closed":
+                raise RuntimeError("runtime session is closed")
+            # Immutable tuple replacement is atomic for the control thread;
+            # _step_cpu copies it into the device tensor at the next boundary.
+            self._target_position_command = values
+        self._wake.set()
+
     def start(
         self,
         sequence: int | None = None,
@@ -723,6 +1097,20 @@ class CpuRuntimeSession:
         self._wake.set()
         return accepted
 
+    def _refresh_effective_model_configuration(self) -> None:
+        """Publish the current SimEnv sample without changing controller gains."""
+
+        parameters = self.environment.parameters
+        actual_model = _configuration_model_summary(parameters)
+        updated = dict(self.effective_configuration)
+        updated["body"] = actual_model["body"]
+        updated["actual_model"] = actual_model
+        updated["controller_model_mismatch"] = _configuration_model_mismatch(
+            parameters,
+            self.controller_parameters,
+        )
+        self.effective_configuration = updated
+
     def close(self) -> None:
         with self._lock:
             if self._state == "closed":
@@ -761,6 +1149,8 @@ class CpuRuntimeSession:
                 "control_steps": self._control_steps,
                 "episode_id": self.episode_id,
                 "episode_step": self.episode_step,
+                "flight_mode": self.flight_mode,
+                "target_position_n": list(self._target_position_command),
                 "last_reset": copy.deepcopy(self._last_reset),
                 "reset_counts": dict(self._reset_counts),
                 "controller_input": {
@@ -939,28 +1329,20 @@ class CpuRuntimeSession:
         inspect_safety: bool,
         reset_on_termination: bool = True,
         capture_timing: bool = True,
+        apply_realtime_height_control: bool = True,
     ) -> dict[str, Any]:
         torch = self._torch
         from flight_controller import ControllerReference, ControllerState
 
         preparation_started_ns = time.time_ns() if capture_timing else 0
+        target_position_command = self._target_position_command
+        for axis, value in enumerate(target_position_command):
+            self.target_position_n[0, axis] = value
         roll, pitch, yaw, throttle = self.input_tensor.unbind(dim=1)
         raw_stick = torch.stack((roll, pitch, yaw), dim=1)
         self.filtered_stick.add_(self._filter_alpha * (raw_stick - self.filtered_stick))
         self.target_yaw.add_(self.filtered_stick[:, 2] * self.options.max_yaw_rate_rad_s * self.control_period)
         self.target_yaw.copy_(torch.remainder(self.target_yaw + torch.pi, 2 * torch.pi) - torch.pi)
-        target_attitude = self._euler_to_quaternion(
-            self.filtered_stick[:, 0] * self.options.max_roll_rad,
-            self.filtered_stick[:, 1] * self.options.max_pitch_rad,
-            self.target_yaw,
-        )
-        desired_throttle = self.options.throttle_minimum + (throttle[:, None] + 1) * .5 * (
-            self.options.throttle_maximum - self.options.throttle_minimum
-        )
-        lower = self.upper_throttle - self.options.throttle_fall_per_s * self.control_period
-        upper = self.upper_throttle + self.options.throttle_rise_per_s * self.control_period
-        self.upper_throttle.copy_(torch.maximum(torch.minimum(desired_throttle, upper), lower))
-
         truth_fields = (
             "position_n", "velocity_n", "attitude_q_wb", "angular_velocity_b",
             "linear_acceleration_n", "motor_speed", "servo_angle",
@@ -969,6 +1351,28 @@ class CpuRuntimeSession:
             truth_fields,
             self.simulation.state_views("truth", truth_fields),
         ))
+        shared_height_pid = (
+            apply_realtime_height_control
+            and self.realtime_height_controller is not None
+        )
+        if not shared_height_pid:
+            desired_throttle = self.options.throttle_minimum + (
+                throttle[:, None] + 1
+            ) * .5 * (
+                self.options.throttle_maximum
+                - self.options.throttle_minimum
+            )
+            lower = (
+                self.upper_throttle
+                - self.options.throttle_fall_per_s * self.control_period
+            )
+            upper = (
+                self.upper_throttle
+                + self.options.throttle_rise_per_s * self.control_period
+            )
+            self.upper_throttle.copy_(
+                torch.maximum(torch.minimum(desired_throttle, upper), lower)
+            )
         sensor_fields = self.simulation.observation_layout["sensor"]
         sensor = dict(zip(
             sensor_fields,
@@ -1008,6 +1412,74 @@ class CpuRuntimeSession:
                 "motor_speed", truth["motor_speed"]
             )
         state = ControllerState.from_truth(controller_values)
+        if self.flight_mode == "position":
+            position_error = (
+                self.target_position_n[:, :2] - state.position_n[:, :2]
+            )
+            velocity_error = (
+                self.target_velocity_n[:, :2] - state.velocity_n[:, :2]
+            )
+            desired_acceleration = (
+                self.position_kp * position_error
+                + self.position_kd * velocity_error
+            )
+            acceleration_norm = desired_acceleration.norm(dim=1, keepdim=True)
+            acceleration_scale = torch.clamp(
+                self.position_maximum_acceleration
+                / acceleration_norm.clamp_min(1e-8),
+                max=1.0,
+            )
+            desired_acceleration = desired_acceleration * acceleration_scale
+            cosine_yaw = torch.cos(self.target_yaw)
+            sine_yaw = torch.sin(self.target_yaw)
+            acceleration_forward = (
+                cosine_yaw * desired_acceleration[:, 0]
+                + sine_yaw * desired_acceleration[:, 1]
+            )
+            acceleration_right = (
+                -sine_yaw * desired_acceleration[:, 0]
+                + cosine_yaw * desired_acceleration[:, 1]
+            )
+            gravity = torch.full_like(acceleration_forward, 9.80665)
+            # attitude_q_wb rotates FRD body vectors into NED. With thrust
+            # along -Z_body, positive pitch accelerates backward (-forward),
+            # while positive roll accelerates right. Preserve those signs when
+            # converting the desired horizontal acceleration to attitude.
+            target_pitch = torch.atan2(-acceleration_forward, gravity)
+            target_roll = torch.atan2(
+                acceleration_right,
+                torch.sqrt(gravity.square() + acceleration_forward.square()),
+            )
+            target_tilt = torch.sqrt(
+                target_roll.square() + target_pitch.square()
+            )
+            tilt_scale = torch.clamp(
+                self.position_maximum_tilt / target_tilt.clamp_min(1e-8),
+                max=1.0,
+            )
+            target_roll = target_roll * tilt_scale
+            target_pitch = target_pitch * tilt_scale
+            target_attitude = self._euler_to_quaternion(
+                target_roll,
+                target_pitch,
+                self.target_yaw,
+            )
+            self.last_position_controller_output = {
+                "position_error_n_m": position_error,
+                "velocity_error_n_m_s": velocity_error,
+                "desired_acceleration_n_m_s2": desired_acceleration,
+                "target_roll_pitch_rad": torch.stack(
+                    (target_roll, target_pitch),
+                    dim=1,
+                ),
+            }
+        else:
+            target_attitude = self._euler_to_quaternion(
+                self.filtered_stick[:, 0] * self.options.max_roll_rad,
+                self.filtered_stick[:, 1] * self.options.max_pitch_rad,
+                self.target_yaw,
+            )
+            self.last_position_controller_output = None
         self.target_rate.zero_()
         self.target_rate[:, 2] = (
             self.filtered_stick[:, 2] * self.options.max_yaw_rate_rad_s
@@ -1019,6 +1491,40 @@ class CpuRuntimeSession:
             target_angular_velocity_b=self.target_rate,
             collective_command=self.upper_throttle,
         )
+        if shared_height_pid:
+            active = torch.ones(1, device=self.device, dtype=torch.bool)
+            desired_thrust, target_speed, base = (
+                self.realtime_height_controller._desired_actuator_equilibrium(
+                    state,
+                    reference,
+                    active,
+                )
+            )
+            self.upper_throttle.copy_(base[:, :1])
+            height = -state.position_n[:, 2]
+            height_target = -reference.target_position_n[:, 2]
+            vertical_speed = -state.velocity_n[:, 2]
+            vertical_speed_target = -reference.target_velocity_n[:, 2]
+            self.last_height_controller_output = {
+                "target_m": height_target,
+                "height_m": height,
+                "error_m": height_target - height,
+                "vertical_speed_error_m_s": (
+                    vertical_speed_target - vertical_speed
+                ),
+                "desired_thrust_n": desired_thrust,
+                "target_motor_speed_rad_s": target_speed,
+                "upper_throttle": self.upper_throttle,
+            }
+            reference = ControllerReference(
+                target_position_n=self.target_position_n,
+                target_velocity_n=self.target_velocity_n,
+                target_attitude_q_wb=target_attitude,
+                target_angular_velocity_b=self.target_rate,
+                collective_command=self.upper_throttle,
+            )
+        else:
+            self.last_height_controller_output = None
         controller_started_perf_ns = (
             time.perf_counter_ns() if capture_timing else 0
         )
@@ -1093,9 +1599,13 @@ class CpuRuntimeSession:
                 if episode_timeout:
                     reset_mask = torch.ones_like(result.valid)
                 self.environment.reset(reset_mask, self.simenv_path)
+                self._refresh_effective_model_configuration()
                 self.controller.reset(reset_mask)
                 if self.inference_package is not None:
                     self.inference_package.reset()
+                if self.realtime_height_controller is not None:
+                    self.realtime_height_controller.reset(reset_mask)
+                self.last_height_controller_output = None
                 self.filtered_stick.zero_()
                 self.target_yaw.zero_()
                 self.target_position_n.copy_(
@@ -1103,9 +1613,17 @@ class CpuRuntimeSession:
                         "truth", ("position_n",)
                     ).values["position_n"]
                 )
+                self._target_position_command = tuple(
+                    float(value)
+                    for value in self.target_position_n[0]
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
                 self.target_velocity_n.zero_()
                 self.last_controller_output = None
                 self.last_reference = None
+                self.last_position_controller_output = None
                 self.episode_step = 0
                 self.episode_id += 1
         return {
@@ -1231,6 +1749,7 @@ class CpuRuntimeSession:
                     step_result = self._step_cpu(
                         inspect_safety=True,
                         reset_on_termination=False,
+                        apply_realtime_height_control=False,
                     )
                     self._control_steps += 1
                     termination = step_result["termination"]
@@ -1397,9 +1916,13 @@ class CpuRuntimeSession:
         with torch.no_grad():
             mask = torch.ones(1, device=self.device, dtype=torch.bool)
             self.environment.reset(mask, self.simenv_path)
+            self._refresh_effective_model_configuration()
             self.controller.reset(mask)
             if self.inference_package is not None:
                 self.inference_package.reset()
+            if self.realtime_height_controller is not None:
+                self.realtime_height_controller.reset(mask)
+            self.last_height_controller_output = None
             self.filtered_stick.zero_()
             self.target_yaw.zero_()
             self.upper_throttle.fill_(self.options.throttle_minimum)
@@ -1408,9 +1931,17 @@ class CpuRuntimeSession:
                     "truth", ("position_n",)
                 ).values["position_n"]
             )
+            self._target_position_command = tuple(
+                float(value)
+                for value in self.target_position_n[0]
+                .detach()
+                .cpu()
+                .tolist()
+            )
             self.target_velocity_n.zero_()
             self.last_controller_output = None
             self.last_reference = None
+            self.last_position_controller_output = None
         self.episode_step = 0
         self.episode_id += 1
 
@@ -1479,6 +2010,22 @@ class CpuRuntimeSession:
                 "target_attitude_q_wb": self.last_reference.target_attitude_q_wb.detach().cpu().tolist(),
                 "target_angular_velocity_b": self.last_reference.target_angular_velocity_b.detach().cpu().tolist(),
                 "collective_command": self.last_reference.collective_command.detach().cpu().tolist(),
+            }
+        if self.last_height_controller_output is not None:
+            packet["height_controller"] = {
+                "mode": "shared_altitude_pid",
+                **{
+                    name: value.detach().cpu().tolist()
+                    for name, value in self.last_height_controller_output.items()
+                },
+            }
+        if self.last_position_controller_output is not None:
+            packet["position_controller"] = {
+                "mode": "position_outer_loop",
+                **{
+                    name: value.detach().cpu().tolist()
+                    for name, value in self.last_position_controller_output.items()
+                },
             }
         packet["latency_trace"].update({
             "telemetry_pack_started_ns": telemetry_pack_started_ns,

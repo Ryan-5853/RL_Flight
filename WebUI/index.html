@@ -143,7 +143,7 @@
             <canvas id="sceneCanvas" aria-label="带自适应坐标网格和位置轨迹的飞行器三维可视化"></canvas>
             <div class="view-badge"><i></i><span>CAM 01</span><b>AUTO · 1 m GRID</b></div>
             <div class="target-card">
-              <span>目标姿态</span>
+              <span id="targetCardLabel">目标姿态</span>
               <strong id="targetReadout">R +0.0° &nbsp; P +0.0° &nbsp; Y +0.0°</strong>
             </div>
             <div class="moment-legend" id="momentLegend">
@@ -153,7 +153,7 @@
               <div class="total"><i></i><span>RESULTANT FORCE</span><b id="forceTotalValue">0.00 N</b></div>
               <div class="moment"><i></i><span>RESULTANT MOMENT</span><b id="momentTotalValue">0.000 N·m</b></div>
             </div>
-            <div class="canvas-hint">位置轨迹与刻度自动缩放 · 拖拽旋转 · 滚轮微调</div>
+            <div class="canvas-hint" id="canvasHint">位置轨迹与刻度自动缩放 · 拖拽旋转 · 滚轮微调</div>
             <div class="axis-legend"><span class="x">N</span><span class="y">E</span><span class="z">D↓</span></div>
           </div>
 

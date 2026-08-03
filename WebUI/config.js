@@ -5,6 +5,13 @@
   const field = (config, path, label, value, unit = '', type = 'number', extra = {}) => ({ config, path, label, value, unit, type, ...extra });
   const sim = (path, label, value, unit = '', type = 'number', extra = {}) => field('simenv', path, label, value, unit, type, extra);
   const test = (path, label, value, unit = '', type = 'number', extra = {}) => field('test', path, label, value, unit, type, extra);
+  const defaultMotorTable = [[0, 0], [0.08, 0], [0.5, 900], [1, 1800]];
+  const defaultServoTable = [[-1, -0.35], [0, 0], [1, 0.35]];
+  const defaultGridGeometry = [
+    [[0.10, 0, 0.25], [1, 0, 0]],
+    [[-0.05, 0.087, 0.25], [-0.5, 0.8660254, 0]],
+    [[-0.05, -0.087, 0.25], [-0.5, -0.8660254, 0]]
+  ];
 
   const sections = [
     {
@@ -36,7 +43,7 @@
       title: `${name === 'upper' ? '上' : '下'}桨电机`, subtitle: `SIMENV / MOTORS[${index}]`,
       fields: [
         sim(`motors.${index}.pwm_deadzone.value`, 'PWM 死区', 0.08),
-        sim(`motors.${index}.pwm_to_rpm_table.value`, 'PWM—转速表', [[0, 0], [0.08, 0], [0.5, 900], [1, 1800]], 'rad/s', 'matrix'),
+        sim(`motors.${index}.pwm_to_rpm_table.value`, 'PWM—转速表', defaultMotorTable, 'rad/s', 'matrix'),
         sim(`motors.${index}.time_constant.value`, '一阶时间常数', index ? 0.050 : 0.030, 's'),
         sim(`motors.${index}.torque_coefficient.value`, '反扭矩系数', index ? 1.10e-7 : 9.8765432e-8, 'N·m/(rad/s)²'),
         sim(`motors.${index}.noise.distribution`, '转速噪声分布', 'normal', '', 'select', { options: ['normal'] }),
@@ -46,7 +53,7 @@
     {
       title: '三路舵机', subtitle: 'SIMENV / SERVOS',
       fields: [0, 1, 2].flatMap(index => [
-        sim(`servos.${index}.pwm_angle_table.value`, `舵机 ${index + 1} PWM—角度表`, [[-1, -0.35], [0, 0], [1, 0.35]], 'rad', 'matrix'),
+        sim(`servos.${index}.pwm_angle_table.value`, `舵机 ${index + 1} PWM—角度表`, defaultServoTable, 'rad', 'matrix'),
         sim(`servos.${index}.tau.value`, `舵机 ${index + 1} 时间常数`, 0.020, 's'),
         sim(`servos.${index}.max_speed.value`, `舵机 ${index + 1} 最大速度`, 8.0, 'rad/s'),
         sim(`servos.${index}.backlash.value`, `舵机 ${index + 1} 回差`, 0.010, 'rad'),
@@ -69,9 +76,7 @@
     {
       title: '气动格栅', subtitle: 'SIMENV / GRIDS',
       fields: [
-        [[0.10, 0, 0.25], [1, 0, 0]],
-        [[-0.05, 0.087, 0.25], [-0.5, 0.8660254, 0]],
-        [[-0.05, -0.087, 0.25], [-0.5, -0.8660254, 0]]
+        ...defaultGridGeometry
       ].flatMap((values, index) => [
         sim(`aerodynamics.grids.${index}.aerodynamic_center_b.value`, `格栅 ${index + 1} 气动中心`, values[0], 'm', 'vector'),
         sim(`aerodynamics.grids.${index}.deflection_axis_b.value`, `格栅 ${index + 1} 偏转轴`, values[1], '', 'vector'),
@@ -129,10 +134,15 @@
       title: '统一控制器', subtitle: 'CONTROLLER / CONTROL LAW', open: true,
       fields: [
         test('controller.type', '控制器类型', 'hybrid_pid_lqr', '', 'select', { options: ['hybrid_pid_lqr', 'pid', 'lqr', 'neural'] }),
+        test('controller.params.flight_mode', '飞行参考模式', 'attitude', '', 'select', { options: ['attitude', 'position'] }),
         test('controller.params.collective_mode', '总推力模式', 'hover', '', 'select', { options: ['hover', 'manual'] }),
-        test('controller.params.pid.altitude.kp', '高度 PID · Kp', 4.0),
-        test('controller.params.pid.altitude.ki', '高度 PID · Ki', 0.8),
-        test('controller.params.pid.altitude.kd', '高度 PID · Kd', 3.6),
+        test('controller.params.position.kp', '位置外环 · Kp', 1.0, 's⁻²'),
+        test('controller.params.position.kd', '位置外环 · Kd', 1.6, 's⁻¹'),
+        test('controller.params.position.maximum_acceleration_m_s2', '位置外环 · 最大水平加速度', 3.0, 'm/s²'),
+        test('controller.params.position.maximum_tilt_rad', '位置外环 · 最大倾角', 0.35, 'rad'),
+        test('controller.params.pid.altitude.kp', '实时 Hover 高度 PID · Kp', 4.0),
+        test('controller.params.pid.altitude.ki', '实时 Hover 高度 PID · Ki', 0.8),
+        test('controller.params.pid.altitude.kd', '实时 Hover 高度 PID · Kd', 3.6),
         test('controller.params.pid.attitude.roll_pitch_natural_frequency_rad_s', '横滚/俯仰自然频率', 6.0, 'rad/s'),
         test('controller.params.pid.attitude.yaw_rate_bandwidth_rad_s', '偏航角速度带宽', 5.0, 'rad/s'),
         test('controller.params.pid.attitude.damping_ratio', '姿态阻尼比', 0.85),
@@ -140,6 +150,31 @@
         test('controller.params.hybrid.lqr_enter_motor_speed_fraction', 'LQR 接管转速比例', 0.78),
         test('controller.params.hybrid.lqr_enter_attitude_error_rad', 'LQR 接管姿态误差', 0.20944, 'rad'),
         test('controller.params.hybrid.transition_s', 'PID/LQR 混合时间', 0.25, 's')
+      ]
+    },
+    {
+      title: '控制器辨识模型', subtitle: 'CONTROLLER / IDENTIFIED PLANT', syncAction: true,
+      fields: [
+        test('controller.params.model_parameters.source', '参数来源', 'manual', '', 'select', { options: ['manual', 'synchronized'] }),
+        test('controller.params.model_parameters.manual.body.mass', '辨识质量', 2.4, 'kg'),
+        test('controller.params.model_parameters.manual.body.center_of_mass_b', '辨识质心 FRD', [0, 0, 0.08], 'm', 'vector'),
+        test('controller.params.model_parameters.manual.body.inertia_diagonal_b', '辨识三轴惯量', [0.030, 0.028, 0.012], 'kg·m²', 'vector'),
+        test('controller.params.model_parameters.manual.motors.time_constant', '辨识电机时间常数 [上,下]', [0.030, 0.050], 's', 'vector'),
+        test('controller.params.model_parameters.manual.motors.torque_coefficient', '辨识电机反扭矩系数 [上,下]', [9.8765432e-8, 1.10e-7], 'N·m/(rad/s)²', 'vector'),
+        test('controller.params.model_parameters.manual.motors.upper_pwm_to_rpm_table', '辨识上桨 PWM—转速表', defaultMotorTable, 'rad/s', 'matrix'),
+        test('controller.params.model_parameters.manual.motors.lower_pwm_to_rpm_table', '辨识下桨 PWM—转速表', defaultMotorTable, 'rad/s', 'matrix'),
+        test('controller.params.model_parameters.manual.servos.tau', '辨识舵机时间常数', [0.020, 0.020, 0.020], 's', 'vector'),
+        ...[1, 2, 3].map(index => test(`controller.params.model_parameters.manual.servos.servo_${index}_pwm_angle_table`, `辨识舵机 ${index} PWM—角度表`, defaultServoTable, 'rad', 'matrix')),
+        test('controller.params.model_parameters.manual.aerodynamics.thrust_coefficients', '辨识总推力系数 [k1,k2,k3]', [4e-6, 4e-6, 2e-6], 'N/(rad/s)²', 'vector'),
+        test('controller.params.model_parameters.manual.aerodynamics.neutral_thrust_direction_b', '辨识中立推力方向 FRD', [0, 0, -1], '', 'vector'),
+        test('controller.params.model_parameters.manual.aerodynamics.direct_thrust_center_b', '辨识直接推力作用点 FRD', [0, 0, 0.20], 'm', 'vector'),
+        test('controller.params.model_parameters.manual.aerodynamics.thrust_partition', '辨识推力占比 [直接,格栅1,2,3]', [0.40, 0.20, 0.20, 0.20], '', 'vector'),
+        test('controller.params.model_parameters.manual.aerodynamics.coupling_attenuation', '辨识格栅耦合衰减矩阵', [[0, 0.1, 0.1], [0.1, 0, 0.1], [0.1, 0.1, 0]], '', 'matrix'),
+        test('controller.params.model_parameters.manual.aerodynamics.grids.aerodynamic_center_b', '辨识三格栅气动中心', defaultGridGeometry.map(item => item[0]), 'm', 'matrix'),
+        test('controller.params.model_parameters.manual.aerodynamics.grids.deflection_axis_b', '辨识三格栅偏转轴', defaultGridGeometry.map(item => item[1]), '', 'matrix'),
+        ...[1, 2, 3].map(index => test(`controller.params.model_parameters.manual.aerodynamics.grids.grid_${index}_self_attenuation_curve`, `辨识格栅 ${index} 自衰减曲线`, [[0, 1], [0.35, 0.85]], '', 'matrix')),
+        test('controller.params.model_parameters.manual.aerodynamics.grids.vector_deflection_gain', '辨识格栅矢量增益', [1, 1, 1], '', 'vector'),
+        test('controller.params.model_parameters.manual.aerodynamics.grids.vector_deflection_offset', '辨识格栅矢量偏置', [0, 0, 0], 'rad', 'vector')
       ]
     },
     {
@@ -164,7 +199,7 @@
       ]
     },
     {
-      title: '虚拟飞手高度控制', subtitle: 'TRAIN / HEIGHT PI',
+      title: '离线 Rollout 高度控制', subtitle: 'TRAIN / OFFLINE HEIGHT PI',
       fields: [
         test('command_source.params.throttle.height_controller.observation_source', '高度观测来源', 'truth', '', 'select', { options: ['truth'] }),
         test('command_source.params.throttle.height_controller.target_m', '目标高度', 0, 'm'),
@@ -259,7 +294,10 @@
     $('#configSections').innerHTML = sections.map(section => `
       <details${savedState[section.subtitle] ?? section.open ? ' open' : ''} class="config-section" data-section-key="${encodeURIComponent(section.subtitle)}">
         <summary><span>${section.title}<small>${section.subtitle}</small></span><em data-section-count>${section.fields.length}</em><i></i></summary>
-        <div class="detail-body">${section.fields.map(renderField).join('')}</div>
+        <div class="detail-body">
+          ${section.syncAction ? '<div class="config-model-sync"><button type="button" id="syncControllerModel">从 SimEnv 复制到辨识模型</button><span>复制后自动切换为 manual，可继续制造参数失配</span></div>' : ''}
+          ${section.fields.map(renderField).join('')}
+        </div>
       </details>`).join('');
   }
 
@@ -424,6 +462,37 @@
         if (!$('#configSearch')?.value.trim()) persistSectionState();
       });
     });
+    $('#syncControllerModel')?.addEventListener('click', synchronizeControllerModel);
+  }
+
+  function synchronizeControllerModel() {
+    const read = path => parseValue(document.querySelector(`[data-config="simenv"][data-path="${path}"]`));
+    const write = (path, value) => {
+      const input = document.querySelector(`[data-config="test"][data-path="controller.params.model_parameters.manual.${path}"]`);
+      if (!input || !setInputValue(input, value)) throw new Error(`无法同步控制器参数 ${path}`);
+    };
+    write('body.mass', read('body.mass.value'));
+    write('body.center_of_mass_b', read('body.center_of_mass_b.value'));
+    write('body.inertia_diagonal_b', read('body.inertia_diagonal_b.value'));
+    write('motors.time_constant', [0, 1].map(index => read(`motors.${index}.time_constant.value`)));
+    write('motors.torque_coefficient', [0, 1].map(index => read(`motors.${index}.torque_coefficient.value`)));
+    write('motors.upper_pwm_to_rpm_table', read('motors.0.pwm_to_rpm_table.value'));
+    write('motors.lower_pwm_to_rpm_table', read('motors.1.pwm_to_rpm_table.value'));
+    write('servos.tau', [0, 1, 2].map(index => read(`servos.${index}.tau.value`)));
+    [0, 1, 2].forEach(index => write(`servos.servo_${index + 1}_pwm_angle_table`, read(`servos.${index}.pwm_angle_table.value`)));
+    write('aerodynamics.thrust_coefficients', read('aerodynamics.thrust_coefficients.value'));
+    write('aerodynamics.neutral_thrust_direction_b', read('aerodynamics.neutral_thrust_direction_b.value'));
+    write('aerodynamics.direct_thrust_center_b', read('aerodynamics.direct_thrust_center_b.value'));
+    write('aerodynamics.thrust_partition', ['direct', 'grid_1', 'grid_2', 'grid_3'].map(name => read(`aerodynamics.thrust_partition.${name}.value`)));
+    write('aerodynamics.coupling_attenuation', read('aerodynamics.coupling_attenuation.value'));
+    write('aerodynamics.grids.aerodynamic_center_b', [0, 1, 2].map(index => read(`aerodynamics.grids.${index}.aerodynamic_center_b.value`)));
+    write('aerodynamics.grids.deflection_axis_b', [0, 1, 2].map(index => read(`aerodynamics.grids.${index}.deflection_axis_b.value`)));
+    [0, 1, 2].forEach(index => write(`aerodynamics.grids.grid_${index + 1}_self_attenuation_curve`, read(`aerodynamics.grids.${index}.self_attenuation_curve.value`)));
+    write('aerodynamics.grids.vector_deflection_gain', [0, 1, 2].map(index => read(`aerodynamics.grids.${index}.vector_deflection.gain.value`)));
+    write('aerodynamics.grids.vector_deflection_offset', [0, 1, 2].map(index => read(`aerodynamics.grids.${index}.vector_deflection.offset.value`)));
+    const source = document.querySelector('[data-config="test"][data-path="controller.params.model_parameters.source"]');
+    setInputValue(source, 'manual');
+    refreshParameterState({ markDirty: true, statusText: '已复制 SimEnv 参数到手动辨识模型，可继续修改失配项' });
   }
 
   function setPath(root, path, value) {
@@ -495,6 +564,9 @@
     const sum = ['direct', 'grid_1', 'grid_2', 'grid_3'].reduce((total, key) => total + partition[key].value, 0);
     if (Math.abs(sum - 1) > 1e-6) throw new Error('direct 与三个 grid 的推力占比之和必须等于 1。');
     if (testConfig.task.episode_duration_s <= 0) throw new Error('测试时长必须大于 0。');
+    if (testConfig.controller.params.flight_mode === 'position' && testConfig.controller.params.collective_mode !== 'hover') {
+      throw new Error('position 位置模式要求总推力模式为 hover。');
+    }
     if (testConfig.controller.type === 'neural' && !String(testConfig.runtime.checkpoint_path || '').trim()) {
       throw new Error('神经网络控制器必须选择服务器部署推理包。');
     }

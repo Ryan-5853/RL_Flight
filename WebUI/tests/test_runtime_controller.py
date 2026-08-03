@@ -7,7 +7,9 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import yaml
+import torch
 
+from inference_package import InferencePackageMetadata
 from runtime import (
     CpuRuntimeSession,
     RuntimeConfigurationError,
@@ -19,6 +21,111 @@ from runtime import (
 
 ROOT = Path(__file__).resolve().parents[2]
 SIM_CONFIG = ROOT / "SimEnv" / "configs" / "example.yaml"
+
+
+def _manual_controller_model(simenv: dict) -> dict:
+    value = lambda node: node["value"]
+    motors = simenv["motors"]
+    servos = simenv["servos"]
+    aerodynamics = simenv["aerodynamics"]
+    grids = aerodynamics["grids"]
+    partition = aerodynamics["thrust_partition"]
+    return {
+        "body": {
+            "mass": value(simenv["body"]["mass"]),
+            "center_of_mass_b": value(simenv["body"]["center_of_mass_b"]),
+            "inertia_diagonal_b": value(
+                simenv["body"]["inertia_diagonal_b"]
+            ),
+        },
+        "motors": {
+            "upper_pwm_to_rpm_table": value(motors[0]["pwm_to_rpm_table"]),
+            "lower_pwm_to_rpm_table": value(motors[1]["pwm_to_rpm_table"]),
+            "time_constant": [value(item["time_constant"]) for item in motors],
+            "torque_coefficient": [
+                value(item["torque_coefficient"]) for item in motors
+            ],
+        },
+        "servos": {
+            "tau": [value(item["tau"]) for item in servos],
+            **{
+                f"servo_{index + 1}_pwm_angle_table": value(
+                    item["pwm_angle_table"]
+                )
+                for index, item in enumerate(servos)
+            },
+        },
+        "aerodynamics": {
+            "thrust_coefficients": value(
+                aerodynamics["thrust_coefficients"]
+            ),
+            "neutral_thrust_direction_b": value(
+                aerodynamics["neutral_thrust_direction_b"]
+            ),
+            "direct_thrust_center_b": value(
+                aerodynamics["direct_thrust_center_b"]
+            ),
+            "thrust_partition": [
+                value(partition[name])
+                for name in ("direct", "grid_1", "grid_2", "grid_3")
+            ],
+            "coupling_attenuation": value(
+                aerodynamics["coupling_attenuation"]
+            ),
+            "grids": {
+                "aerodynamic_center_b": [
+                    value(item["aerodynamic_center_b"]) for item in grids
+                ],
+                "deflection_axis_b": [
+                    value(item["deflection_axis_b"]) for item in grids
+                ],
+                **{
+                    f"grid_{index + 1}_self_attenuation_curve": value(
+                        item["self_attenuation_curve"]
+                    )
+                    for index, item in enumerate(grids)
+                },
+                "vector_deflection_gain": [
+                    value(item["vector_deflection"]["gain"])
+                    for item in grids
+                ],
+                "vector_deflection_offset": [
+                    value(item["vector_deflection"]["offset"])
+                    for item in grids
+                ],
+            },
+        },
+    }
+
+
+class _ZeroInferencePackage:
+    metadata = InferencePackageMetadata(
+        format_version=1,
+        package_id="zero-policy",
+        observation_dim=21,
+        action_dim=4,
+        output_mode="residual_4",
+    )
+
+    def infer(self, observation, recurrent_state, is_init):
+        del recurrent_state, is_init
+        return observation.new_zeros((1, 4)), None
+
+    def reset(self):
+        return None
+
+    def warmup(self, observation):
+        self.infer(
+            observation,
+            None,
+            torch.ones((1, 1), device=observation.device, dtype=torch.bool),
+        )
+
+    def close(self):
+        return None
+
+    def describe(self):
+        return {"package_id": self.metadata.package_id}
 
 
 class RuntimeOptionsTests(unittest.TestCase):
@@ -74,6 +181,175 @@ class RuntimeOptionsTests(unittest.TestCase):
 
 
 class RuntimeControllerIntegrationTests(unittest.TestCase):
+    def test_neural_hover_uses_shared_realtime_altitude_pid(
+        self,
+    ) -> None:
+        test_config = {
+            "run": {"device": "cpu", "dtype": "float32"},
+            "environment": {"observation_source": "truth"},
+            "runtime": {
+                "cpu_threads": 1,
+                "compile_kernels": False,
+                "telemetry_hz": 30,
+                "command_timeout_ms": 1000,
+            },
+            "controller": {
+                "type": "neural",
+                "params": {
+                    "collective_mode": "hover",
+                    "flight_mode": "position",
+                    "position": {
+                        "kp": 1.0,
+                        "kd": 1.6,
+                        "maximum_acceleration_m_s2": 3.0,
+                        "maximum_tilt_rad": 0.35,
+                    },
+                    "pid": {
+                        "altitude": {
+                            "kp": 6.0,
+                            "ki": 0.0,
+                            "kd": 0.0,
+                        }
+                    },
+                },
+            },
+            "command_source": {
+                "type": "flight_train.commands:VirtualPilotCommandSource",
+                "version": "2",
+                "seed": 51002,
+                "params": {
+                    "throttle": {
+                        "minimum": 0.2,
+                        "maximum": 0.85,
+                        "spool": {
+                            "duration_s": 0.0,
+                            "target_range": [0.4, 0.4],
+                        },
+                        "height_controller": {
+                            "observation_source": "truth",
+                            "target_m": 1.0,
+                            "initial_throttle_range": [0.4, 0.4],
+                            "proportional_gain": 0.1,
+                            "integral_gain": 0.0,
+                            "error_limit_m": 5.0,
+                        },
+                        "slew_rate": {
+                            "rise_per_s": 100.0,
+                            "fall_per_s": 100.0,
+                        },
+                    },
+                    "sticks": {
+                        "roll": {
+                            "mode": "angle",
+                            "limit_rad": 0.35,
+                            "time_constant_s": 0.2,
+                        },
+                        "pitch": {
+                            "mode": "angle",
+                            "limit_rad": 0.35,
+                            "time_constant_s": 0.2,
+                        },
+                        "yaw": {
+                            "mode": "rate",
+                            "limit_rad_s": 1.5,
+                            "time_constant_s": 0.3,
+                        },
+                        "target_sampling": {
+                            "distribution": "centered",
+                            "center_exponent": 2.0,
+                            "hold_duration_s": {"range": [1.0, 4.0]},
+                        },
+                        "reset": {
+                            "filtered_stick": "zero",
+                            "initial_target_scale": 0.25,
+                        },
+                    },
+                },
+            },
+            "task": {
+                "episode_duration_s": 30,
+                "termination": {
+                    "max_tilt_rad": 1.3,
+                    "max_angular_rate_rad_s": 20.0,
+                },
+            },
+            "randomization": {"dynamic": {"parameters": {}}},
+        }
+        simenv_config = yaml.safe_load(
+            SIM_CONFIG.read_text(encoding="utf-8")
+        )
+        with tempfile.TemporaryDirectory() as log_root:
+            session = CpuRuntimeSession(
+                yaml.safe_dump(simenv_config),
+                yaml.safe_dump(test_config),
+                Path(log_root) / "zero-policy",
+                log_root,
+                inference_package_loader=(
+                    lambda path, device, dtype: _ZeroInferencePackage()
+                ),
+            )
+            try:
+                self.assertEqual(
+                    session.status()["controller"]["height_controller"],
+                    "shared_altitude_pid",
+                )
+                self.assertEqual(
+                    session.realtime_height_controller.height_kp,
+                    6.0,
+                )
+                # The throttle stick requests the minimum. A one-metre upward
+                # target must instead make the shared PID command above trim.
+                session.input_tensor[0, 3] = -1.0
+                session.update_target_position([1.0, 0.0, -1.0])
+                self.assertEqual(
+                    session.status()["target_position_n"],
+                    [1.0, 0.0, -1.0],
+                )
+                with self.assertRaisesRegex(ValueError, "three-element"):
+                    session.update_target_position([1.0, 0.0])
+                with torch.no_grad():
+                    session._step_cpu(inspect_safety=False)
+                self.assertGreater(
+                    float(session.last_reference.collective_command[0, 0]),
+                    0.5,
+                )
+                self.assertAlmostEqual(
+                    float(session.last_height_controller_output["error_m"][0]),
+                    1.0,
+                    places=5,
+                )
+                target_attitude = session.last_reference.target_attitude_q_wb
+                # Positive North acceleration requires negative pitch because
+                # thrust acts along -Z_body in the NED/FRD convention.
+                self.assertLess(float(target_attitude[0, 2]), -0.01)
+                self.assertAlmostEqual(
+                    float(
+                        session.last_position_controller_output[
+                            "position_error_n_m"
+                        ][0, 0]
+                    ),
+                    1.0,
+                    places=5,
+                )
+                session._publish_telemetry({})
+                telemetry = session.telemetry()
+                assert telemetry is not None
+                self.assertEqual(
+                    telemetry["height_controller"]["mode"],
+                    "shared_altitude_pid",
+                )
+                self.assertAlmostEqual(
+                    telemetry["height_controller"]["target_m"][0],
+                    1.0,
+                    places=5,
+                )
+                self.assertEqual(
+                    telemetry["position_controller"]["mode"],
+                    "position_outer_loop",
+                )
+            finally:
+                session.close()
+
     def test_offline_rollout_uses_virtual_pilot_and_retains_video_frames(
         self,
     ) -> None:
@@ -88,7 +364,7 @@ class RuntimeControllerIntegrationTests(unittest.TestCase):
                 "command_timeout_ms": 1000,
             },
             "controller": {
-                "type": "pid",
+                "type": "hybrid_pid_lqr",
                 "params": {"collective_mode": "hover"},
             },
             "command_source": {
@@ -216,7 +492,16 @@ class RuntimeControllerIntegrationTests(unittest.TestCase):
             },
             "controller": {
                 "type": "hybrid_pid_lqr",
-                "params": {"collective_mode": "hover"},
+                "params": {
+                    "collective_mode": "hover",
+                    "flight_mode": "position",
+                    "position": {
+                        "kp": 1.0,
+                        "kd": 1.6,
+                        "maximum_acceleration_m_s2": 3.0,
+                        "maximum_tilt_rad": 0.35,
+                    },
+                },
             },
             "command_source": {
                 "params": {
@@ -274,7 +559,17 @@ class RuntimeControllerIntegrationTests(unittest.TestCase):
                 self.assertRegex(effective["id"], r"^[0-9a-f]{12}$")
                 self.assertEqual(
                     effective["controller_parameter_source"],
-                    "environment",
+                    "synchronized",
+                )
+                self.assertEqual(
+                    effective["controller_model_mismatch"][
+                        "different_parameter_count"
+                    ],
+                    0,
+                )
+                self.assertNotEqual(
+                    session.environment.parameters["body.mass"].data_ptr(),
+                    session.controller.context.parameters["body.mass"].data_ptr(),
                 )
                 for actual, expected in zip(
                     effective["body"]["center_of_mass_b"],
@@ -302,6 +597,7 @@ class RuntimeControllerIntegrationTests(unittest.TestCase):
                 )
                 previous_sequence = telemetry["sequence"]
                 session._command_received = 0.0
+                session.update_target_position([1.0, -1.0, 0.0])
                 self.assertTrue(
                     session.step_once(
                         1,
@@ -364,8 +660,27 @@ class RuntimeControllerIntegrationTests(unittest.TestCase):
                 target_quaternion = commanded["reference"][
                     "target_attitude_q_wb"
                 ][0]
-                self.assertGreater(abs(target_quaternion[1]), 1e-4)
-                self.assertGreater(abs(target_quaternion[2]), 1e-4)
+                # Target N>0/E<0 requires negative pitch and negative roll at
+                # near-zero yaw under NED/FRD thrust polarity.
+                self.assertLess(target_quaternion[1], -1e-4)
+                self.assertLess(target_quaternion[2], -1e-4)
+                initial_position = session.environment.observe(
+                    "truth", ("position_n",)
+                ).values["position_n"].clone()
+                with torch.no_grad():
+                    for _ in range(300):
+                        session._step_cpu(inspect_safety=False)
+                moved_position = session.environment.observe(
+                    "truth", ("position_n",)
+                ).values["position_n"]
+                self.assertGreater(
+                    float(moved_position[0, 0] - initial_position[0, 0]),
+                    0.01,
+                )
+                self.assertLess(
+                    float(moved_position[0, 1] - initial_position[0, 1]),
+                    -0.01,
+                )
                 self.assertTrue(
                     session.start(
                         2,
@@ -404,6 +719,93 @@ class RuntimeControllerIntegrationTests(unittest.TestCase):
                     [0.0, 0.0, 0.0, -1.0],
                 )
                 session.pause()
+            finally:
+                session.close()
+
+    def test_manual_controller_model_is_independent_from_simulation_parameters(
+        self,
+    ) -> None:
+        simenv_config = yaml.safe_load(
+            SIM_CONFIG.read_text(encoding="utf-8")
+        )
+        manual = _manual_controller_model(simenv_config)
+        manual["body"]["mass"] = 1.2
+        test_config = {
+            "run": {"device": "cpu", "dtype": "float32"},
+            "environment": {"observation_source": "truth"},
+            "runtime": {
+                "cpu_threads": 1,
+                "compile_kernels": False,
+                "telemetry_hz": 30,
+                "command_timeout_ms": 1000,
+            },
+            "controller": {
+                "type": "hybrid_pid_lqr",
+                "params": {
+                    "collective_mode": "hover",
+                    "model_parameters": {
+                        "source": "manual",
+                        "manual": manual,
+                    },
+                },
+            },
+            "command_source": {
+                "params": {
+                    "throttle": {
+                        "minimum": 0.2,
+                        "maximum": 0.85,
+                        "slew_rate": {
+                            "rise_per_s": 4.0,
+                            "fall_per_s": 0.35,
+                        },
+                    }
+                }
+            },
+            "task": {"episode_duration_s": 1},
+            "randomization": {"dynamic": {"parameters": {}}},
+        }
+        with tempfile.TemporaryDirectory() as log_root:
+            session = CpuRuntimeSession(
+                yaml.safe_dump(simenv_config),
+                yaml.safe_dump(test_config),
+                None,
+                log_root,
+            )
+            try:
+                actual_mass = float(
+                    session.environment.parameters["body.mass"][0]
+                )
+                controller_mass = float(
+                    session.controller.context.parameters["body.mass"][0]
+                )
+                self.assertNotAlmostEqual(actual_mass, controller_mass)
+                self.assertAlmostEqual(controller_mass, 1.2, places=6)
+                self.assertNotEqual(
+                    session.environment.parameters["body.mass"].data_ptr(),
+                    session.controller.context.parameters["body.mass"].data_ptr(),
+                )
+                self.assertAlmostEqual(
+                    float(session.controller.trim.thrust[0]),
+                    controller_mass * session.controller.plant.gravity,
+                    places=4,
+                )
+                self.assertIsNotNone(session.controller._lqr_gain)
+                effective = session.status()["configuration"]
+                self.assertEqual(
+                    effective["controller_parameter_source"], "manual"
+                )
+                self.assertAlmostEqual(
+                    effective["controller_model"]["body"]["mass"],
+                    1.2,
+                    places=6,
+                )
+                self.assertIn(
+                    "body.mass",
+                    effective["controller_model_mismatch"][
+                        "different_parameters"
+                    ],
+                )
+                session.step_once()
             finally:
                 session.close()
 

@@ -185,6 +185,8 @@ button { color: inherit; }
 .view-button.square { width: 29px; padding: 0; font-size: 15px; }
 .canvas-wrap { position: relative; min-height: 0; overflow: hidden; background: #090d0f; }
 #sceneCanvas { display: block; width: 100%; height: 100%; cursor: grab; }
+#sceneCanvas.position-targeting { cursor: crosshair; }
+#sceneCanvas:active { cursor: grabbing; }
 #sceneCanvas:active { cursor: grabbing; }
 .view-badge { position: absolute; top: 16px; left: 16px; display: flex; align-items: center; gap: 7px; padding: 6px 8px; border: 1px solid #243037; background: rgba(10, 15, 18, .82); color: var(--muted); font: 500 7px IBM Plex Mono; }
 .view-badge i { width: 5px; height: 5px; background: var(--cyan); }
@@ -220,6 +222,10 @@ summary::-webkit-details-marker { display: none; }
 summary i::after { content: '+'; color: var(--muted); font-style: normal; font: 400 15px IBM Plex Mono; }
 details[open] summary i::after { content: '−'; }
 .detail-body { padding: 4px 0 18px; display: grid; gap: 2px; }
+.config-model-sync { margin: 4px 12px 8px; padding: 9px; display: flex; align-items: center; gap: 9px; border: 1px solid #26373d; border-radius: 3px; background: #0d1518; }
+.config-model-sync button { flex: 0 0 auto; height: 28px; padding: 0 10px; border: 1px solid #3a626b; border-radius: 3px; background: #132429; color: var(--cyan); font-size: 8px; cursor: pointer; }
+.config-model-sync button:hover { background: #183038; border-color: #4b7b85; }
+.config-model-sync span { color: var(--muted-2); font-size: 7px; line-height: 1.45; }
 .config-section summary > span small { display: block; margin-top: 2px; color: var(--muted-2); font: 500 6px IBM Plex Mono, monospace; letter-spacing: .08em; }
 .config-section summary em { margin-left: auto; margin-right: 10px; color: var(--muted-2); font: normal 500 7px IBM Plex Mono, monospace; }
 .config-field { min-height: 54px; display: grid; grid-template-columns: minmax(128px, .85fr) minmax(0, 1.15fr); align-items: center; gap: 12px; padding: 7px 8px; border: 1px solid transparent; border-radius: 4px; transition: border-color .15s, background .15s; }

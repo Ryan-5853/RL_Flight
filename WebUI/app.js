@@ -29,7 +29,10 @@
     topView: false,
     dragging: false,
     dragX: 0,
-    dragY: 0
+    dragY: 0,
+    pointerDownX: 0,
+    pointerDownY: 0,
+    dragDistance: 0
   };
 
   const MODEL_SCALE = 4;
@@ -152,6 +155,48 @@
     let p = state.topView ? rotateX(relative, Math.PI / 2) : rotateX(rotateZ(relative, state.cameraYaw), state.cameraPitch);
     const scale = Math.min(box.width, box.height) * 0.42 / state.viewHalfSpan * state.zoom;
     return [box.width / 2 + p[0] * scale, box.height * 0.54 - p[2] * scale - p[1] * scale * 0.08, p[1]];
+  }
+
+  function worldPointOnAltitude(screenX, screenY, worldZ) {
+    // worldProject is orthographic. At a fixed altitude its X/Y mapping is a
+    // 2×2 affine transform, so two projected basis vectors give an exact
+    // inverse in both perspective and top views.
+    const origin = worldProject([0, 0, worldZ]);
+    const north = worldProject([1, 0, worldZ]);
+    const west = worldProject([0, 1, worldZ]);
+    const nx = north[0] - origin[0], ny = north[1] - origin[1];
+    const wx = west[0] - origin[0], wy = west[1] - origin[1];
+    const determinant = nx * wy - ny * wx;
+    if (Math.abs(determinant) < 1e-8) return null;
+    const dx = screenX - origin[0], dy = screenY - origin[1];
+    return [
+      (dx * wy - dy * wx) / determinant,
+      (nx * dy - ny * dx) / determinant,
+      worldZ
+    ];
+  }
+
+  function configuredFlightMode() {
+    return document.querySelector('[data-config="test"][data-path="controller.params.flight_mode"]')?.value || 'attitude';
+  }
+
+  function setPositionTargetFromPointer(event) {
+    if (configuredFlightMode() !== 'position') return;
+    const box = canvas.getBoundingClientRect();
+    const worldZ = -state.targetPositionNed[2];
+    const world = worldPointOnAltitude(
+      event.clientX - box.left,
+      event.clientY - box.top,
+      worldZ
+    );
+    if (!world) return;
+    const target = [world[0], -world[1], -world[2]];
+    state.targetPositionNed = target;
+    updateSpatialView();
+    setText('#targetReadout', `N ${target[0].toFixed(2)} m · E ${target[1].toFixed(2)} m · H ${(-target[2]).toFixed(2)} m`);
+    window.dispatchEvent(new CustomEvent('rlflightpositiontarget', {
+      detail: { target_position_n: [...target] }
+    }));
   }
 
   function craftProject(point) {
@@ -656,16 +701,46 @@
     button.classList.add('active'); state.topView = button.dataset.view === 'top';
   }));
 
-  canvas.addEventListener('pointerdown', event => { state.dragging = true; state.dragX = event.clientX; state.dragY = event.clientY; canvas.setPointerCapture(event.pointerId); });
+  canvas.addEventListener('pointerdown', event => {
+    if (event.button !== 0) return;
+    state.dragging = true;
+    state.dragX = event.clientX;
+    state.dragY = event.clientY;
+    state.pointerDownX = event.clientX;
+    state.pointerDownY = event.clientY;
+    state.dragDistance = 0;
+    canvas.setPointerCapture(event.pointerId);
+  });
   canvas.addEventListener('pointermove', event => {
     if (!state.dragging) return;
+    state.dragDistance = Math.hypot(
+      event.clientX - state.pointerDownX,
+      event.clientY - state.pointerDownY
+    );
+    if (state.dragDistance < 4) return;
     state.topView = false; state.cameraYaw += (event.clientX - state.dragX) * .007; state.cameraPitch += (event.clientY - state.dragY) * .007;
     state.cameraPitch = Math.max(-1.2, Math.min(1.2, state.cameraPitch)); state.dragX = event.clientX; state.dragY = event.clientY;
   });
-  canvas.addEventListener('pointerup', () => { state.dragging = false; });
+  canvas.addEventListener('pointerup', event => {
+    const clicked = state.dragging && state.dragDistance < 4;
+    state.dragging = false;
+    if (clicked) setPositionTargetFromPointer(event);
+  });
+  canvas.addEventListener('pointercancel', () => { state.dragging = false; });
   canvas.addEventListener('wheel', event => { event.preventDefault(); state.zoom = Math.max(.55, Math.min(1.8, state.zoom - event.deltaY * .0008)); }, { passive: false });
 
   function updateTargetLabels() {
+    const positionMode = configuredFlightMode() === 'position';
+    $('#targetCardLabel').textContent = positionMode ? '目标位置' : '目标姿态';
+    $('#canvasHint').textContent = positionMode
+      ? '单击设置水平目标点 · 拖拽旋转 · 滚轮微调'
+      : '位置轨迹与刻度自动缩放 · 拖拽旋转 · 滚轮微调';
+    canvas.classList.toggle('position-targeting', positionMode);
+    if (positionMode) {
+      const target = state.targetPositionNed;
+      setText('#targetReadout', `N ${target[0].toFixed(2)} m · E ${target[1].toFixed(2)} m · H ${(-target[2]).toFixed(2)} m`);
+      return;
+    }
     if (!$('#targetRoll')) return;
     const r = Number($('#targetRoll').value), p = Number($('#targetPitch').value), y = Number($('#targetYaw').value);
     setText('#targetRollOut', `${r.toFixed(1)}°`); setText('#targetPitchOut', `${p.toFixed(1)}°`); setText('#targetYawOut', `${y.toFixed(1)}°`);
@@ -771,7 +846,7 @@
       setText('#stateHint', `${controllerType.toUpperCase()} + SimEnv · CPU`);
     }
     const targetQuaternion = firstBatch(payload?.reference?.target_attitude_q_wb, 4);
-    if (validVector(targetQuaternion, 4)) {
+    if (validVector(targetQuaternion, 4) && configuredFlightMode() !== 'position') {
       const targetEuler = quaternionToEuler(targetQuaternion).map(value => value * 180 / Math.PI);
       setText('#targetReadout', `R ${targetEuler[0] >= 0 ? '+' : ''}${targetEuler[0].toFixed(1)}° \u00a0 P ${targetEuler[1] >= 0 ? '+' : ''}${targetEuler[1].toFixed(1)}° \u00a0 Y ${targetEuler[2] >= 0 ? '+' : ''}${targetEuler[2].toFixed(1)}°`);
     }
@@ -779,6 +854,9 @@
     if (validVector(targetPosition)) {
       state.targetPositionNed = [...targetPosition];
       updateSpatialView();
+      if (configuredFlightMode() === 'position') {
+        setText('#targetReadout', `N ${targetPosition[0].toFixed(2)} m · E ${targetPosition[1].toFixed(2)} m · H ${(-targetPosition[2]).toFixed(2)} m`);
+      }
     }
     if (runtime && Number.isFinite(runtime.measured_control_hz)) {
       const effective = runtime.configuration;
@@ -789,14 +867,19 @@
         && centerOfMass.length === 3
         && centerOfMass.every(Number.isFinite)
       ) {
-        const modelSource = effective.controller_parameter_source === 'environment'
-          ? 'CTRL MODEL=ENV'
-          : 'CTRL MODEL=CHECKPOINT';
+        const modelSource = {
+          synchronized: 'CTRL MODEL=SYNC SNAPSHOT',
+          manual: 'CTRL MODEL=MANUAL',
+          deployment_package: 'CTRL MODEL=CHECKPOINT'
+        }[effective.controller_parameter_source] || `CTRL MODEL=${String(effective.controller_parameter_source || 'UNKNOWN').toUpperCase()}`;
+        const mismatchCount = Number(effective.controller_model_mismatch?.different_parameter_count) || 0;
+        const mismatchLabel = mismatchCount ? ` · MISMATCH ${mismatchCount}` : '';
         const effectiveNode = $('#effectiveConfig');
         effectiveNode.classList.add('active');
         effectiveNode.classList.remove('stale');
-        effectiveNode.querySelector('span').textContent = `BACKEND ${effective.id} · COM [${centerOfMass.map(value => Number(value).toFixed(3)).join(', ')}] m · ${modelSource}`;
-        effectiveNode.title = `FRD：x 向前、y 向右、z 正方向向下。后端实际质量 ${Number(effective.body.mass).toFixed(3)} kg。`;
+        effectiveNode.querySelector('span').textContent = `BACKEND ${effective.id} · COM [${centerOfMass.map(value => Number(value).toFixed(3)).join(', ')}] m · ${modelSource}${mismatchLabel}`;
+        const controllerMass = Number(effective.controller_model?.body?.mass);
+        effectiveNode.title = `FRD：x 向前、y 向右、z 正方向向下。实际质量 ${Number(effective.body.mass).toFixed(3)} kg；控制器模型质量 ${Number.isFinite(controllerMass) ? controllerMass.toFixed(3) : '—'} kg；失配参数 ${mismatchCount} 项。`;
       }
       const measured = runtime.measured_control_hz;
       const requested = Math.max(1, Number(runtime.control_hz) || 1);

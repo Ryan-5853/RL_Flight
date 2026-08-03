@@ -32,7 +32,8 @@ python server.py --host 0.0.0.0 --port 8080
 `infer/reset/warmup/close/describe`。默认 `flight_deploy` 适配器还会读取 manifest
 中的 observation history、归一化和 action transform；例如 61 帧 uniform MLP 会在
 适配层组成 `21×61=1281` 维运行时输入。PID、LQR 和混合控制器不读取推理包，它们从
-本次 SimEnv 参数自动求配平、控制分配矩阵和 LQR 增益。普通静态文件服务器只能预览
+独立的控制器辨识模型求配平、控制分配矩阵和 LQR 增益；该模型可手动设置，也可在
+会话创建时从 SimEnv 实际参数复制快照。普通静态文件服务器只能预览
 页面，无法使用配置浏览和 CPU 运行时接口。
 
 角加速度级联 bundle 使用 `angular_acceleration_cascade_v1` contract。WebUI 加载后会
@@ -80,7 +81,7 @@ Windows Gamepad API（未连接时使用零指令虚拟输入）
 服务器独立控制线程（RealtimeSimulationEnvironment，目标 500 Hz）
         │
         ├─ CPU 摇杆滤波、目标姿态与油门斜率限制
-        ├─ PID / LQR / PID+LQR：读取 SimEnv 参数并直接输出 5 维命令
+        ├─ PID / LQR / PID+LQR：读取独立辨识模型并直接输出 5 维命令
         ├─ Neural：CPU 21 维观测和 MLP/GRU 推理
         └─ CPU SimEnv.advance([上桨, 下桨, 舵机1, 舵机2, 舵机3])
         │
@@ -152,11 +153,37 @@ streaming body 时的兼容回退。网络请求频率不会决定 500 Hz 的 CP
 - `lqr`：高度使用 PID，姿态与执行器动态使用离散 LQR；
 - `neural`：调用服务器部署层提供的 `RealtimeInferencePackage`。
 
-`collective_mode: hover` 会把 reset 时的位置作为高度目标；`manual` 将手柄油门映射为
-上桨 PWM，同时由控制器计算反扭矩平衡的下桨基准。没有手柄时页面会发送零姿态虚拟
+所有控制器的实时 `collective_mode: hover` 都使用统一的
+`controller.params.pid.altitude.{kp,ki,kd}` 高度 PID，并把 reset 时的位置作为高度目标。
+神经网络控制器复用同一高度 PID 和推力模型生成上电机 collective，部署包须使用
+`residual_4`，策略继续计算其余四通道。`manual` 将手柄油门映射为上桨 PWM；传统
+控制器同时计算反扭矩平衡的下桨基准。`command_source.params.throttle.height_controller`
+仅供训练和离线 VirtualPilot rollout 使用。没有手柄时页面会发送零姿态虚拟
 输入，因此默认混合控制器可直接启动并观察自稳。页面默认初态故意设置为约
 `roll=8° / pitch=-6°` 并带有小角速度；点击“启动仿真”即可看到 PID 捕获和 LQR
 接管，不需要先修改参数。
+
+`controller.params.flight_mode` 可选择统一参考模式：
+
+- `attitude`：roll/pitch 手柄直接生成目标姿态；
+- `position`：公共位置外环根据 N/E 位置、速度误差生成目标水平加速度，再结合当前
+  偏航转换成目标 roll/pitch；传统和神经网络姿态控制器消费完全相同的姿态参考。
+
+位置外环通过 `controller.params.position` 配置 `kp`、`kd`、最大水平加速度和最大
+倾角，并要求 `collective_mode: hover` 负责垂直位置。切换到 `position` 并应用配置后，
+可在三维视口中单击设置水平目标点；点击会在
+当前目标高度平面反投影，因此只改变 N/E，D（高度）保持不变。拖拽仍用于旋转视角，
+俯视和透视模式均可设置目标。Reset 会把目标点恢复到重置位置。
+
+传统控制器的物理模型位于 `controller.params.model_parameters`，与 SimEnv 实际动力学
+参数完全分离。页面默认使用 `source: manual`，因此质量、惯量、重心、执行器标定与
+时间常数、推力/反扭矩系数和气动分配几何都可以作为辨识值单独修改。点击
+“从 SimEnv 复制到辨识模型”会把参数面板中的当前 SimEnv 配置复制过来，并保持
+`manual`，便于只改一项制造已知失配；选择 `source: synchronized` 则在创建会话时
+直接复制该仿真实例经过随机化后的实际参数。两种方式得到的都是控制器私有快照，
+后续 SimEnv reset/参数重采样不会悄悄改变已经计算好的 PID 增益、Hover 配平、控制
+分配矩阵或 LQR 增益。状态栏会显示 `MANUAL`/`SYNC SNAPSHOT`、失配参数数量，并在
+悬停提示中同时给出实际质量和控制器模型质量。
 
 右侧“推理与观测”中包含以下运行时字段：
 

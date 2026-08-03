@@ -170,7 +170,7 @@ class WebUIHandler(SimpleHTTPRequestHandler):
         }:
             self._rollout_create()
             return
-        runtime_match = re.fullmatch(r"/api/runtime/sessions/([0-9a-f-]+)/(control|start|pause|step|reset|close)", parsed.path)
+        runtime_match = re.fullmatch(r"/api/runtime/sessions/([0-9a-f-]+)/(control|start|pause|step|reset|target|close)", parsed.path)
         if runtime_match:
             self._runtime_post(
                 runtime_match.group(1),
@@ -471,7 +471,7 @@ class WebUIHandler(SimpleHTTPRequestHandler):
             telemetry["reference"] = {
                 key: value
                 for key, value in reference.items()
-                if key == "target_attitude_q_wb"
+                if key in {"target_attitude_q_wb", "target_position_n"}
             }
         return telemetry
 
@@ -601,6 +601,11 @@ class WebUIHandler(SimpleHTTPRequestHandler):
             elif action == "reset":
                 self._discard_request_body()
                 session.reset()
+            elif action == "target":
+                body = self._request_json(64 * 1024)
+                session.update_target_position(
+                    body.get("target_position_n")
+                )
             if action in {"start", "step"}:
                 # Start/step already accepted the input atomically. Respond
                 # before any status serialization so the browser can begin its
