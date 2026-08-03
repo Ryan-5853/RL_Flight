@@ -1,0 +1,43 @@
+schema_version: 1
+
+# Paths are resolved relative to this file.
+simulator_config: ../../SimEnv/configs/example.yaml
+controller_config: ../../Controller/configs/lqr_identification_nominal.yaml
+
+run:
+  seed: 20260803
+  device: cpu
+  dtype: float32
+  parallel_count: 256
+  output_directory: ../datasets/lqr_zero_attitude_yaw_rate_v1
+
+observation:
+  # Ideal mode isolates structural learnability. Use the sensor config below
+  # for deployment-oriented noise and delay evaluation.
+  measurement_mode: ideal
+
+sampling:
+  parameter_groups: 4096
+  initial_conditions_per_group: 16
+  episode_duration_s: 4.0
+  # Every label is log10(scale), so [-1,1] represents [0.1,10] times nominal.
+  log10_effectiveness_range: [-1.0, 1.0]
+
+initial_state:
+  # The vehicle has no yaw-angle feedback. Initial attitude therefore samples
+  # roll/pitch tilt only; all three initial body rates, including yaw, vary.
+  minimum_tilt_rad: 0.0523599
+  maximum_tilt_rad: 0.2617994
+  maximum_angular_rate_rad_s: [0.3, 0.3, 0.3]
+
+convergence:
+  maximum_roll_pitch_error_rad: 0.0349066
+  maximum_angular_rate_rad_s: 0.10
+  hold_s: 0.5
+  safety_tilt_rad: 1.0471976
+  safety_angular_rate_rad_s: 8.0
+
+window:
+  length_s: 1.0
+  stride_s: 1.0
+  split_fractions: [0.70, 0.15, 0.15]

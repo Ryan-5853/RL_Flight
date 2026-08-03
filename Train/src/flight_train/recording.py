@@ -120,6 +120,12 @@ class RunRecorder:
                 .observation_history_sparse_physical_stride_steps
             ),
             "control_contract": config.control_contract.version,
+            "action_transform": (
+                config.control_contract.action_transform_type
+            ),
+            "lower_motor_upper_ratio": (
+                config.control_contract.lower_motor_upper_ratio
+            ),
             "policy_action_fields": list(config.control_contract.policy_action_fields),
             "external_action_fields": list(config.control_contract.external_action_fields),
             "simulator_command_fields": list(config.control_contract.simulator_command_fields),
@@ -210,6 +216,24 @@ class RunRecorder:
                     ),
                     "yaw_rate_rmse_rad_s_mean": float(
                         values["metrics"]["yaw_rate_rmse_rad_s"]["mean"]
+                    ),
+                    "motor_total_variation_per_s_mean": float(
+                        values["metrics"]["motor_total_variation_per_s"]["mean"]
+                    ),
+                    "servo_common_total_variation_per_s_mean": float(
+                        values["metrics"][
+                            "servo_common_total_variation_per_s"
+                        ]["mean"]
+                    ),
+                    "servo_cyclic_total_variation_per_s_mean": float(
+                        values["metrics"][
+                            "servo_cyclic_total_variation_per_s"
+                        ]["mean"]
+                    ),
+                    "roll_pitch_error_band_0_5_2_hz_rms_deg_mean": float(
+                        values["metrics"][
+                            "roll_pitch_error_band_0_5_2_hz_rms_deg"
+                        ]["mean"]
                     ),
                 }
                 for name, values in report["scenarios"].items()

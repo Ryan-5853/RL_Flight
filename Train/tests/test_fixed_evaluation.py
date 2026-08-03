@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import replace
 from pathlib import Path
 import tempfile
@@ -14,6 +15,7 @@ from flight_train.evaluation import (
     ScoreLimits,
     ScriptedEvaluationCommandSource,
     _command_step_response_time,
+    _control_quality_metrics,
     _create_evaluation_environment,
     _create_packed_evaluation_environment,
     _run_packed_scenarios,
@@ -32,6 +34,56 @@ ROOT = Path(__file__).parents[1]
 
 
 class FixedEvaluationTests(unittest.TestCase):
+    def test_control_quality_reports_tv_and_low_frequency_rms(self):
+        control_hz = 100
+        steps = 1000
+        time_s = torch.arange(steps, dtype=torch.float32) / control_hz
+        action = torch.zeros(steps, 1, 4)
+        action[:, 0, 1] = 0.001 * torch.arange(steps)
+        action[:, 0, 2] = -0.001 * torch.arange(steps)
+        roll_pitch_error = torch.zeros(steps, 1, 2)
+        roll_pitch_error[:, 0, 0] = 0.1 * torch.sin(
+            2.0 * torch.pi * time_s
+        )
+        metrics = _control_quality_metrics(
+            {"action": action},
+            torch.ones(steps, 1, dtype=torch.bool),
+            roll_pitch_error,
+            control_hz,
+        )
+
+        self.assertAlmostEqual(
+            metrics["motor_total_variation_per_s"].item(), 0.0
+        )
+        self.assertAlmostEqual(
+            metrics["servo_common_total_variation_per_s"].item(), 0.0,
+            places=6,
+        )
+        self.assertAlmostEqual(
+            metrics["servo_cyclic_total_variation_per_s"].item(), 0.2,
+            places=4,
+        )
+        self.assertAlmostEqual(
+            metrics["actuator_energy_proxy_per_s"].item(), 0.2,
+            places=4,
+        )
+        expected_cyclic_effort = (
+            action[..., 1:4]
+            - action[..., 1:4].mean(dim=-1, keepdim=True)
+        ).square().sum(dim=-1).mean()
+        self.assertAlmostEqual(
+            metrics["actuator_effort_proxy_mean"].item(),
+            expected_cyclic_effort.item(),
+            places=6,
+        )
+        self.assertAlmostEqual(
+            metrics[
+                "roll_pitch_error_band_0_5_2_hz_rms_deg"
+            ].item(),
+            math.degrees(0.1 / math.sqrt(2.0)),
+            places=3,
+        )
+
     def test_suite_parses_three_required_subjects(self):
         suite = load_fixed_evaluation_suite(
             ROOT / "configs/evaluation/fixed_attitude_v1.yaml"

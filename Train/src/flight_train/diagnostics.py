@@ -67,6 +67,9 @@ class _EnvironmentSnapshot:
     curriculum_failures: int
     curriculum_consecutive_passes: int
     curriculum_last_success_fraction: float
+    outer_loop: Mapping[str, Any] | None
+    previous_truth_angular_velocity: torch.Tensor
+    actual_angular_acceleration: torch.Tensor
 
 
 def load_checkpoint_experiment_config(
@@ -248,8 +251,14 @@ def replay_action_gradient_report(
     current_frame_offset = (
         config.control_contract.current_observation_offset
     )
-    yaw_rate_index = current_frame_offset + 6
-    yaw_command_index = current_frame_offset + 15
+    if config.control_contract.observation_profile.startswith(
+        "angular_acceleration_"
+    ):
+        yaw_rate_index = current_frame_offset + 8
+        yaw_command_index = current_frame_offset + 2
+    else:
+        yaw_rate_index = current_frame_offset + 6
+        yaw_command_index = current_frame_offset + 15
     angular_scale = config.task.terminate_angular_rate_rad_s
     _, control_hz = _load_timing(config.simulator_config)
     yaw_rate = observation[:, yaw_rate_index] * angular_scale
@@ -268,7 +277,11 @@ def replay_action_gradient_report(
 
     device = torch.device(config.run.device)
     model = build_sac_actor_critic(
-        observation.shape[-1], 4, config.model, device, config.torch_dtype
+        observation.shape[-1],
+        config.control_contract.action_dim,
+        config.model,
+        device,
+        config.torch_dtype,
     )
     algorithm = TorchRLSAC(model, config.sac, device)
     model.actor.load_state_dict(state["actor"], strict=True)
@@ -366,13 +379,19 @@ def finite_horizon_action_sweep(
     truth = env.simulator.observe(
         "truth", ("angular_velocity_b",)
     ).values["angular_velocity_b"]
+    if context.config.control_contract.observation_profile.startswith(
+        "angular_acceleration_"
+    ):
+        yaw_command_offset = 2
+    else:
+        yaw_command_offset = 15
     selected = (
         (truth[:, 2] > minimum_yaw_rate_rad_s)
         & (
             observation[
                 :,
                 context.config.control_contract.current_observation_offset
-                + 15,
+                + yaw_command_offset,
             ].abs()
             < 0.05
         )
@@ -485,6 +504,8 @@ def transition_contract_report(
         pilot.upper_throttle,
         context.config.control_contract.policy_action_trim,
         context.config.control_contract.policy_action_residual_scale,
+        context.config.control_contract.action_transform_type,
+        context.config.control_contract.lower_motor_upper_ratio,
     )
 
     first = context.env.step(action)
@@ -584,6 +605,15 @@ def _snapshot_environment(
         curriculum_failures=env.curriculum_failures,
         curriculum_consecutive_passes=env.curriculum_consecutive_passes,
         curriculum_last_success_fraction=env.curriculum_last_success_fraction,
+        outer_loop=(
+            _clone_state(env.outer_loop.state_dict())
+            if env.outer_loop is not None
+            else None
+        ),
+        previous_truth_angular_velocity=(
+            env.previous_truth_angular_velocity.clone()
+        ),
+        actual_angular_acceleration=env.actual_angular_acceleration.clone(),
     )
 
 
@@ -618,6 +648,14 @@ def _restore_snapshot(
     env.curriculum_last_success_fraction = (
         snapshot.curriculum_last_success_fraction
     )
+    if env.outer_loop is not None:
+        if snapshot.outer_loop is None:
+            raise ValueError("diagnostic snapshot outer-loop state is missing")
+        env.outer_loop.load_state_dict(snapshot.outer_loop)
+    env.previous_truth_angular_velocity.copy_(
+        snapshot.previous_truth_angular_velocity
+    )
+    env.actual_angular_acceleration.copy_(snapshot.actual_angular_acceleration)
     env.max_episode_steps = env._duration_to_steps(
         context.config.task.curriculum_durations_s[env.curriculum_stage]
     )

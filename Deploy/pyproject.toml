@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Checkpoint optimization, packaging, and low-latency inference runtime"
 requires-python = ">=3.10,<3.11"
 dependencies = [
+    "PyYAML==6.0.2",
     "torch==2.12.1",
 ]
 

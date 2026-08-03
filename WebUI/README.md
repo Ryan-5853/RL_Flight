@@ -27,12 +27,21 @@ python server.py --host 0.0.0.0 --port 8080
 需要替换后端时可增加
 `--inference-loader my_deployment.loader:load_package`。加载函数签名为
 `(path: Path, device: torch.device, dtype: torch.dtype) -> RealtimeInferencePackage`。
-推理包必须声明固定的 21 维基础观测、`residual_4` 或 `physical_5` 输出契约，并实现
+推理包必须声明固定的 21 维基础观测、`residual_4`、`physical_5` 或
+`coaxial_differential_cyclic_3` 输出契约，并实现
 `infer/reset/warmup/close/describe`。默认 `flight_deploy` 适配器还会读取 manifest
 中的 observation history、归一化和 action transform；例如 61 帧 uniform MLP 会在
 适配层组成 `21×61=1281` 维运行时输入。PID、LQR 和混合控制器不读取推理包，它们从
 本次 SimEnv 参数自动求配平、控制分配矩阵和 LQR 增益。普通静态文件服务器只能预览
 页面，无法使用配置浏览和 CPU 运行时接口。
+
+角加速度级联 bundle 使用 `angular_acceleration_cascade_v1` contract。WebUI 加载后会
+自动在神经网络外构造 manifest 指定的姿态 PID、角加速度后向差分、61 帧历史和
+共轴差速/cyclic 分配；上层仍选择 `controller.type: neural`，无需在测试 YAML 中重复
+PID 增益。bundle 要求的 `control_hz` 与 SimEnv 不一致时会拒绝启动。
+专用 bundle 还记录排除 seed、初始状态和日志后的 SimEnv 兼容指纹；机体、执行器、
+气动或传感器契约不匹配时同样拒绝启动。训练使用的环境可从服务器配置根
+`train_environment` 导入。
 
 交互仿真默认使用 SimEnv 的 `RealtimeSimulationEnvironment`：固定单环境 CPU
 执行、编译动力学和传感器内核，并关闭 500 Hz 热路径中的持久化日志。上传配置中的

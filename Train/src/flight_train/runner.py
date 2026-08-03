@@ -128,12 +128,25 @@ def _rollout_diagnostic_metrics(
         "reward.tilt",
         "reward.yaw_rate",
         "reward.joint_tracking",
+        "reward.joint_tracking_worst",
+        "reward.joint_tracking_mean",
         "reward.angular_rate",
         "reward.action_rate",
+        "reward.servo_cyclic",
+        "reward.control_effort",
+        "reward.motor_effort",
+        "reward.servo_common_effort",
+        "reward.servo_cyclic_effort",
+        "reward.physical_servo_common_effort",
+        "reward.control_movement",
+        "reward.motor_movement",
+        "reward.servo_common_movement",
+        "reward.servo_cyclic_movement",
         "reward.saturation",
         "reward.risk",
         "reward.survival",
         "reward.termination",
+        "reward.angular_acceleration_tracking",
     ):
         if reward_key in rollout["next"].keys():
             metrics[f"{reward_key}_mean"] = rollout[("next", reward_key)].mean()
@@ -148,9 +161,36 @@ def _rollout_diagnostic_metrics(
             "joint_yaw_rate_dominant",
             "joint_yaw_rate_dominant_fraction",
         ),
+        (
+            "servo_cyclic_movement_gate",
+            "servo_cyclic_movement_gate_mean",
+        ),
+        (
+            "actuator_energy_proxy",
+            "actuator_energy_proxy_mean",
+        ),
+        (
+            "actuator_effort_proxy",
+            "actuator_effort_proxy_mean",
+        ),
+        (
+            "physical_servo_common_effort_proxy",
+            "physical_servo_common_effort_proxy_mean",
+        ),
     ):
         if source_key in rollout["next"].keys():
             metrics[metric_key] = rollout[("next", source_key)].mean()
+    if "angular_acceleration_error_b" in rollout["next"].keys():
+        error = rollout[("next", "angular_acceleration_error_b")]
+        valid = rollout[("next", "valid")].expand_as(error)
+        squared_error = torch.where(valid, error.square(), torch.zeros_like(error))
+        count = valid.sum(dim=(0, 1)).clamp_min(1)
+        axis_rmse = torch.sqrt(squared_error.sum(dim=(0, 1)) / count)
+        for axis, value in zip("xyz", axis_rmse, strict=True):
+            metrics[f"angular_acceleration_{axis}_rmse_rad_s2"] = value
+        metrics["angular_acceleration_vector_rmse_rad_s2"] = torch.sqrt(
+            squared_error.sum(dim=-1).sum() / valid[..., 0].sum().clamp_min(1)
+        )
     return metrics
 
 
@@ -835,6 +875,13 @@ def _checkpoint_state(
             },
             "static_randomizer": static_randomizer.state_dict(),
             "reward_calculator": reward_calculator.state_dict(),
+            "outer_loop": (
+                env.outer_loop.state_dict() if env.outer_loop is not None else None
+            ),
+            "previous_truth_angular_velocity": (
+                env.previous_truth_angular_velocity
+            ),
+            "actual_angular_acceleration": env.actual_angular_acceleration,
             "episode_curriculum": {
                 "stage": env.curriculum_stage,
                 "successes": env.curriculum_successes,
@@ -951,6 +998,28 @@ def _restore_exact(
     )
     static_randomizer.load_state_dict(training["static_randomizer"])
     reward_calculator.load_state_dict(training["reward_calculator"])
+    outer_loop_state = training.get("outer_loop")
+    if env.outer_loop is None:
+        if outer_loop_state is not None:
+            raise ValueError("checkpoint outer-loop state is incompatible")
+    else:
+        if not isinstance(outer_loop_state, Mapping):
+            raise ValueError("checkpoint attitude PID outer-loop state is missing")
+        env.outer_loop.load_state_dict(outer_loop_state)
+    for tensor, name in (
+        (
+            env.previous_truth_angular_velocity,
+            "previous_truth_angular_velocity",
+        ),
+        (env.actual_angular_acceleration, "actual_angular_acceleration"),
+    ):
+        stored = training.get(name)
+        if stored is None:
+            if env.outer_loop is not None:
+                raise ValueError(f"checkpoint {name} is missing")
+            tensor.zero_()
+        else:
+            _copy_training_tensor(tensor, training, name)
     current_static = training.get("static_parameters")
     if not isinstance(current_static, TensorDictBase):
         raise ValueError("checkpoint static_parameters is missing")

@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import gc
 import hashlib
+import json
 import math
 import sys
 import tempfile
@@ -46,6 +47,34 @@ class RuntimeConfigurationError(ValueError):
 
 class RolloutCancelled(RuntimeError):
     """Raised internally when a queued/offline rollout is cancelled."""
+
+
+def _simulator_compatibility_fingerprint(config: Mapping[str, Any]) -> str:
+    def canonical(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return {str(key): canonical(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [canonical(item) for item in value]
+        if isinstance(value, bool) or value is None or isinstance(value, str):
+            return value
+        if isinstance(value, (int, float)):
+            return float(value)
+        raise RuntimeConfigurationError(
+            f"unsupported simulator configuration value {type(value).__name__}"
+        )
+
+    relevant = {
+        key: value
+        for key, value in config.items()
+        if key not in {"seed", "initial_state", "logging"}
+    }
+    encoded = json.dumps(
+        canonical(relevant),
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _finite_float_or_none(value: Any) -> float | None:
@@ -338,6 +367,31 @@ class CpuRuntimeSession:
                     self.dtype,
                 )
                 self.inference_package.metadata.validate()
+                required_control_hz = getattr(
+                    self.inference_package, "required_control_hz", None
+                )
+                if (
+                    required_control_hz is not None
+                    and int(required_control_hz) != self.control_hz
+                ):
+                    raise RuntimeConfigurationError(
+                        "deployment package requires control_hz="
+                        f"{required_control_hz}, simulator provides {self.control_hz}"
+                    )
+                required_simulator_fingerprint = getattr(
+                    self.inference_package,
+                    "required_simulator_fingerprint",
+                    None,
+                )
+                if (
+                    required_simulator_fingerprint is not None
+                    and _simulator_compatibility_fingerprint(self.raw_simenv)
+                    != required_simulator_fingerprint
+                ):
+                    raise RuntimeConfigurationError(
+                        "deployment package is incompatible with the selected "
+                        "SimEnv dynamics; import the training environment config"
+                    )
                 neural_model = InferenceModelAdapter(self.inference_package)
                 params = controller_config.setdefault("params", {})
                 if not isinstance(params, dict):
@@ -921,13 +975,19 @@ class CpuRuntimeSession:
             self.simulation.state_views("sensor", sensor_fields),
         ))
         controller_values = dict(truth)
+        cascade_truth_contract = (
+            self.inference_package is not None
+            and self.inference_package.metadata.output_mode
+            == "coaxial_differential_cyclic_3"
+        )
         if self.controller.controller_type == "neural":
-            # Preserve the deployed 21-D policy contract: gyro,
-            # accelerometer and motor-speed channels use configured sensors
-            # even when attitude itself is selected from truth.
-            controller_values["angular_velocity_b"] = sensor.get(
-                "gyro", truth["angular_velocity_b"]
-            )
+            # Train always uses configured accelerometer and motor-speed
+            # channels. The cascade profile alone keeps truth angular velocity
+            # because both its rate feature and backward-difference alpha did so.
+            if not cascade_truth_contract:
+                controller_values["angular_velocity_b"] = sensor.get(
+                    "gyro", truth["angular_velocity_b"]
+                )
             controller_values["linear_acceleration_n"] = sensor.get(
                 "accelerometer", truth["linear_acceleration_n"]
             )

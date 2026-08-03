@@ -45,7 +45,10 @@ controller.reset(reset_mask)
 - `module:factory`：配置可以引用自定义工厂，不必修改 SimEnv 或 WebUI。
 
 神经网络 `output_mode` 支持当前四维残差动作 `residual_4`，以及直接输出五路物理
-命令的 `physical_5`。更复杂的 Transformer、时序卷积或自定义观测编码器可以实现
+命令的 `physical_5`。部署层还可以提供 `coaxial_differential_cyclic_3`：三维策略
+动作分别表示下桨差速和两个 cyclic 自由度，模型适配器负责将其映射为五路物理命令，
+控制器则统一管理三维上一动作和 reset 生命周期。更复杂的 Transformer、时序卷积或
+自定义观测编码器可以实现
 `FlightController`，再通过 `register_controller()` 或 `module:factory` 接入。
 
 ## PID + LQR

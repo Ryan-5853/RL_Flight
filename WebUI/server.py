@@ -23,6 +23,7 @@ PROJECT_ROOT = WEBUI_ROOT.parent
 DEFAULT_ROOTS = {
     "controller": PROJECT_ROOT / "Controller" / "configs",
     "simenv": PROJECT_ROOT / "SimEnv" / "configs",
+    "train_environment": PROJECT_ROOT / "Train" / "configs" / "environment",
     "train": PROJECT_ROOT / "Train" / "configs" / "experiments",
 }
 DEFAULT_CHECKPOINT_ROOTS = (WEBUI_ROOT / "artifacts",)

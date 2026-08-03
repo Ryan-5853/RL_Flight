@@ -6,8 +6,13 @@ from typing import Mapping
 import torch
 from tensordict import TensorDict, TensorDictBase
 
-from .config import TaskConfig
-from .math import quaternion_geodesic_angle, quaternion_to_euler, tilt_angle
+from .config import AttitudePidConfig, TaskConfig
+from .math import (
+    attitude_error_rotation_vector,
+    quaternion_geodesic_angle,
+    quaternion_to_euler,
+    tilt_angle,
+)
 from .rewards import AttitudeRewardCalculator, RewardCalculator
 
 
@@ -19,6 +24,101 @@ class TaskTransition:
     terminated: torch.Tensor
     valid: torch.Tensor
     info: Mapping[str, torch.Tensor]
+
+
+class AttitudePidOuterLoop:
+    """Batched attitude PID producing body angular-acceleration commands."""
+
+    def __init__(
+        self,
+        config: AttitudePidConfig,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        control_hz: int,
+    ) -> None:
+        self.config = config
+        self.batch_size = batch_size
+        self.device = device
+        self.dtype = dtype
+        self.dt = 1.0 / float(control_hz)
+        self.proportional_gain = torch.tensor(
+            config.proportional_gain, device=device, dtype=dtype
+        )
+        self.integral_gain = torch.tensor(
+            config.integral_gain, device=device, dtype=dtype
+        )
+        self.derivative_gain = torch.tensor(
+            config.derivative_gain, device=device, dtype=dtype
+        )
+        self.integral_limit = torch.tensor(
+            config.integral_limit_rad_s, device=device, dtype=dtype
+        )
+        self.command_limit = torch.tensor(
+            config.max_angular_acceleration_rad_s2, device=device, dtype=dtype
+        )
+        self.integral_error = torch.zeros(
+            batch_size, 3, device=device, dtype=dtype
+        )
+        self.desired_angular_acceleration = torch.zeros_like(self.integral_error)
+
+    def reset(self, mask: torch.Tensor) -> None:
+        self.integral_error = torch.where(
+            mask[:, None], torch.zeros_like(self.integral_error), self.integral_error
+        )
+        self.desired_angular_acceleration = torch.where(
+            mask[:, None],
+            torch.zeros_like(self.desired_angular_acceleration),
+            self.desired_angular_acceleration,
+        )
+
+    def update(
+        self,
+        attitude_q_wb: torch.Tensor,
+        target_attitude_q_wb: torch.Tensor,
+        angular_velocity_b: torch.Tensor,
+        target_angular_velocity_b: torch.Tensor,
+        active_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        attitude_error = attitude_error_rotation_vector(
+            attitude_q_wb, target_attitude_q_wb
+        )
+        candidate_integral = torch.clamp(
+            self.integral_error + attitude_error * self.dt,
+            min=-self.integral_limit,
+            max=self.integral_limit,
+        )
+        self.integral_error = torch.where(
+            active_mask[:, None], candidate_integral, self.integral_error
+        )
+        rate_error = target_angular_velocity_b - angular_velocity_b
+        command = (
+            self.proportional_gain * attitude_error
+            + self.integral_gain * self.integral_error
+            + self.derivative_gain * rate_error
+        )
+        command = torch.clamp(command, min=-self.command_limit, max=self.command_limit)
+        self.desired_angular_acceleration = torch.where(
+            active_mask[:, None], command, self.desired_angular_acceleration
+        )
+        return self.desired_angular_acceleration
+
+    def state_dict(self) -> Mapping[str, torch.Tensor | int]:
+        return {
+            "version": 1,
+            "integral_error": self.integral_error,
+            "desired_angular_acceleration": self.desired_angular_acceleration,
+        }
+
+    def load_state_dict(self, state: Mapping[str, object]) -> None:
+        if int(state.get("version", -1)) != 1:
+            raise ValueError("incompatible attitude PID outer-loop state")
+        for name in ("integral_error", "desired_angular_acceleration"):
+            value = state.get(name)
+            target = getattr(self, name)
+            if not isinstance(value, torch.Tensor) or value.shape != target.shape:
+                raise ValueError(f"incompatible attitude PID tensor {name}")
+            target.copy_(value.to(device=self.device, dtype=self.dtype))
 
 
 class AttitudeTrackingTask:
@@ -53,6 +153,9 @@ class AttitudeTrackingTask:
         max_episode_steps: int | None = None,
         env_context: TensorDictBase | None = None,
         desired_yaw_rate: torch.Tensor | None = None,
+        desired_angular_acceleration: torch.Tensor | None = None,
+        actual_angular_acceleration: torch.Tensor | None = None,
+        simulator_command: torch.Tensor | None = None,
     ) -> TaskTransition:
         """批量计算奖励分量和安全终止条件。
 
@@ -113,6 +216,12 @@ class AttitudeTrackingTask:
             batch_size=[self.batch_size],
             device=self.device,
         )
+        if desired_angular_acceleration is not None:
+            context["desired_angular_acceleration_b"] = desired_angular_acceleration
+        if actual_angular_acceleration is not None:
+            context["actual_angular_acceleration_b"] = actual_angular_acceleration
+        if simulator_command is not None:
+            context["simulator_command"] = simulator_command
         if env_context is not None:
             context.update(env_context)
         reward_output = self.reward_calculator(context)
@@ -153,6 +262,12 @@ class AttitudeTrackingTask:
                 "angular_rate_norm": rate_norm,
             }
         )
+        if desired_angular_acceleration is not None:
+            info["desired_angular_acceleration_b"] = (
+                desired_angular_acceleration
+            )
+        if actual_angular_acceleration is not None:
+            info["actual_angular_acceleration_b"] = actual_angular_acceleration
         return TaskTransition(
             reward=safe_reward,
             terminated=terminated,

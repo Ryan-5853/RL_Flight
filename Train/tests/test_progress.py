@@ -59,6 +59,8 @@ class TrainingProgressTests(unittest.TestCase):
                 "attitude_error_p95_deg": 1.25,
                 "terminated_fraction": 0.01,
                 "action_saturation_fraction": 0.02,
+                "actuator_energy_proxy_mean": 0.01234,
+                "actuator_effort_proxy_mean": 0.05678,
                 "sampling_steps_per_second": 2048.0,
             },
         )
@@ -69,6 +71,8 @@ class TrainingProgressTests(unittest.TestCase):
         self.assertIn("PPO 更新", output)
         self.assertIn("PPO 更新 2/2", output)
         self.assertIn("姿态P95=1.25°", output)
+        self.assertIn("执行器能耗代理=0.01234/step", output)
+        self.assertIn("执行器持续负载=0.05678", output)
         self.assertIn("采样=2,048 sample/s", output)
         self.assertIn("端到端(近8轮)", output)
         self.assertIn("checkpoint 已保存", output)

@@ -598,6 +598,7 @@ class TensorTrainingTests(unittest.TestCase):
         for disabled_term in (
             "reward.attitude",
             "reward.action_rate",
+            "reward.servo_cyclic",
             "reward.saturation",
             "reward.risk",
             "reward.survival",
@@ -1390,6 +1391,137 @@ class TensorTrainingTests(unittest.TestCase):
             continuation_resume_config_sha256(incompatible),
         )
 
+    def test_stability_v10_starts_fresh_with_actuator_movement_cost(self):
+        root = Path(__file__).parents[1] / "configs/experiments"
+        v8 = load_experiment_config(
+            root / "mlp_sac_upright_height_only_small_tip_stability_v8.yaml"
+        )
+        v10 = load_experiment_config(
+            root / "mlp_sac_upright_height_only_small_tip_stability_v10.yaml"
+        )
+        params = v10.reward.calculator.params
+
+        self.assertEqual(
+            v10.name,
+            "mlp_sac_upright_height_only_small_tip_stability_v10",
+        )
+        self.assertIsNone(v10.checkpoint.resume_from)
+        self.assertEqual(v10.run.total_control_steps, 33_554_432)
+        self.assertEqual(v10.run.parallel_count, 512)
+        self.assertEqual(v10.run.rollout_steps, 256)
+        self.assertEqual(
+            v10.run.parallel_count * v10.run.rollout_steps,
+            v8.run.parallel_count * v8.run.rollout_steps,
+        )
+        self.assertEqual(v10.control_contract.observation_dim, 1281)
+        self.assertEqual(v10.seeds, v8.seeds)
+        self.assertEqual(v10.model, v8.model)
+        self.assertEqual(v10.sac, v8.sac)
+        self.assertEqual(params["action_rate_weight"], 0.001)
+        self.assertEqual(params["motor_movement_weight"], 0.0005)
+        self.assertEqual(params["servo_common_movement_weight"], 0.0015)
+        self.assertEqual(params["servo_cyclic_movement_weight"], 0.005)
+        self.assertEqual(params["servo_cyclic_weight"], 0.0)
+
+    def test_stability_v11_adds_effort_gate_and_lower_exploration(self):
+        root = Path(__file__).parents[1] / "configs/experiments"
+        v10 = load_experiment_config(
+            root / "mlp_sac_upright_height_only_small_tip_stability_v10.yaml"
+        )
+        v11 = load_experiment_config(
+            root / "mlp_sac_upright_height_only_small_tip_stability_v11.yaml"
+        )
+        params = v11.reward.calculator.params
+
+        self.assertEqual(
+            v11.name,
+            "mlp_sac_upright_height_only_small_tip_stability_v11",
+        )
+        self.assertIsNone(v11.checkpoint.resume_from)
+        self.assertEqual(v11.run.parallel_count, 512)
+        self.assertEqual(v11.run.rollout_steps, 256)
+        self.assertEqual(v11.run.total_control_steps, 33_554_432)
+        self.assertEqual(v11.control_contract, v10.control_contract)
+        self.assertEqual(params["motor_effort_weight"], 0.0005)
+        self.assertEqual(params["servo_common_effort_weight"], 0.001)
+        self.assertEqual(params["servo_cyclic_effort_weight"], 0.0015)
+        self.assertEqual(params["motor_movement_weight"], 0.00025)
+        self.assertEqual(params["servo_common_movement_weight"], 0.00075)
+        self.assertEqual(params["servo_cyclic_movement_weight"], 0.005)
+        self.assertEqual(
+            params["servo_cyclic_movement_gate_roll_pitch_scale_rad"],
+            v11.task.curriculum_max_roll_pitch_rmse_rad,
+        )
+        self.assertEqual(
+            params["servo_cyclic_movement_gate_yaw_rate_scale_rad_s"],
+            v11.task.curriculum_max_yaw_rate_rmse_rad_s,
+        )
+        self.assertEqual(
+            params["servo_cyclic_movement_gate_minimum"], 0.10
+        )
+        self.assertEqual(
+            v11.model.sac_initial_action_std,
+            (0.05, 0.05, 0.05, 0.05),
+        )
+        self.assertEqual(
+            v11.model.sac_maximum_action_std,
+            (0.10, 0.10, 0.10, 0.10),
+        )
+        self.assertEqual(v11.sac.actor_update_interval, 4)
+        self.assertEqual(v11.sac.initial_alpha, 0.005)
+        self.assertEqual(v11.sac.max_alpha, 0.01)
+
+    def test_stability_v12_repairs_v11_with_physical_common_effort(self):
+        root = Path(__file__).parents[1] / "configs/experiments"
+        v11 = load_experiment_config(
+            root / "mlp_sac_upright_height_only_small_tip_stability_v11.yaml"
+        )
+        v12 = load_experiment_config(
+            root / "mlp_sac_upright_height_only_small_tip_stability_v12.yaml"
+        )
+        params = v12.reward.calculator.params
+
+        self.assertEqual(
+            v12.name,
+            "mlp_sac_upright_height_only_small_tip_stability_v12",
+        )
+        self.assertEqual(v12.checkpoint.resume_mode, "policy")
+        self.assertEqual(
+            v12.checkpoint.resume_from.name,
+            "best_fixed_evaluation.pt",
+        )
+        self.assertIn(
+            "mlp_sac_upright_height_only_small_tip_stability_v11",
+            str(v12.checkpoint.resume_from),
+        )
+        self.assertEqual(v12.run.parallel_count, 512)
+        self.assertEqual(v12.run.rollout_steps, 256)
+        self.assertEqual(v12.run.total_control_steps, 16_777_216)
+        self.assertEqual(v12.control_contract, v11.control_contract)
+        self.assertEqual(params["motor_effort_weight"], 0.0005)
+        self.assertEqual(params["servo_common_effort_weight"], 0.0)
+        self.assertEqual(params["servo_cyclic_effort_weight"], 0.0015)
+        self.assertEqual(
+            params["physical_servo_common_effort_weight"], 0.004
+        )
+        self.assertEqual(params["servo_cyclic_movement_weight"], 0.005)
+        self.assertEqual(v12.sac.critic_pretraining_updates, 2048)
+        self.assertEqual(v12.sac.actor_update_interval, 8)
+        self.assertEqual(v12.sac.actor_learning_rate, 0.00001)
+        self.assertEqual(v12.sac.policy_anchor_weight, 2.0)
+        self.assertEqual(v12.sac.policy_anchor_max_action_deviation, 0.20)
+        self.assertEqual(v12.sac.target_entropy, -6.0)
+        self.assertEqual(v12.sac.initial_alpha, 0.001)
+        self.assertEqual(v12.sac.max_alpha, 0.003)
+        self.assertEqual(
+            v12.model.sac_initial_action_std,
+            (0.03, 0.04, 0.04, 0.04),
+        )
+        self.assertEqual(
+            v12.model.sac_maximum_action_std,
+            (0.05, 0.06, 0.06, 0.06),
+        )
+
     def test_command_tracking_v1_policy_warm_starts_with_small_envelope(self):
         config = load_experiment_config(
             Path(__file__).parents[1]
@@ -1542,21 +1674,21 @@ class TensorTrainingTests(unittest.TestCase):
             continuation_resume_config_sha256(source_run_config),
         )
 
-    def test_command_tracking_v4_restarts_v3_best_actor_with_aligned_reward(self):
+    def test_command_tracking_v4_exact_continuation_keeps_aligned_reward(self):
         root = Path(__file__).parents[1] / "configs/experiments"
         v4 = load_experiment_config(
             root / "mlp_sac_attitude_command_tracking_v4.yaml"
         )
         params = v4.reward.calculator.params
         self.assertEqual(v4.name, "mlp_sac_attitude_command_tracking_v4")
-        self.assertEqual(v4.checkpoint.resume_mode, "policy")
+        self.assertEqual(v4.checkpoint.resume_mode, "exact")
         self.assertEqual(
             v4.checkpoint.resume_from.name,
-            "best_total_evaluation.pt",
+            "step_50331648.pt",
         )
         self.assertEqual(v4.run.parallel_count, 512)
         self.assertEqual(v4.run.rollout_steps, 256)
-        self.assertEqual(v4.run.total_control_steps, 33_554_432)
+        self.assertEqual(v4.run.total_control_steps, 67_108_864)
         self.assertEqual(
             v4.run.parallel_count * v4.run.rollout_steps,
             131_072,
@@ -1588,6 +1720,7 @@ class TensorTrainingTests(unittest.TestCase):
         )
         self.assertEqual(params["alive_bonus"], 0.005)
         self.assertEqual(params["joint_tracking_weight"], 0.005)
+        self.assertNotIn("joint_tracking_mean_weight", params)
         self.assertEqual(
             params["joint_roll_pitch_scale_rad"],
             v4.task.curriculum_max_roll_pitch_rmse_rad,
@@ -1595,6 +1728,196 @@ class TensorTrainingTests(unittest.TestCase):
         self.assertEqual(
             params["joint_yaw_rate_scale_rad_s"],
             v4.task.curriculum_max_yaw_rate_rmse_rad_s,
+        )
+
+    def test_command_tracking_v5_restarts_v4_best_with_balanced_joint_reward(self):
+        root = Path(__file__).parents[1] / "configs/experiments"
+        v5 = load_experiment_config(
+            root / "mlp_sac_attitude_command_tracking_v5.yaml"
+        )
+        params = v5.reward.calculator.params
+        self.assertEqual(v5.name, "mlp_sac_attitude_command_tracking_v5")
+        self.assertEqual(v5.checkpoint.resume_mode, "policy")
+        self.assertEqual(v5.checkpoint.resume_from.name, "step_48234496.pt")
+        self.assertEqual(v5.run.parallel_count, 512)
+        self.assertEqual(v5.run.rollout_steps, 256)
+        self.assertEqual(v5.run.total_control_steps, 50_331_648)
+        self.assertEqual(
+            v5.run.parallel_count * v5.run.rollout_steps,
+            131_072,
+        )
+        self.assertEqual(v5.sac.critic_pretraining_updates, 2048)
+        self.assertEqual(v5.sac.actor_update_interval, 8)
+        self.assertEqual(v5.sac.actor_learning_rate, 0.000010)
+        self.assertEqual(v5.sac.policy_anchor_weight, 15.0)
+        self.assertEqual(v5.sac.policy_anchor_max_action_deviation, 0.04)
+        self.assertEqual(v5.sac.max_alpha, 0.004)
+        self.assertEqual(
+            v5.model.sac_initial_action_std,
+            (0.030, 0.040, 0.040, 0.040),
+        )
+        self.assertEqual(
+            v5.model.sac_maximum_action_std,
+            (0.040, 0.055, 0.055, 0.055),
+        )
+        self.assertEqual(params["alive_bonus"], 0.005)
+        self.assertEqual(params["joint_tracking_weight"], 0.004)
+        self.assertEqual(params["joint_tracking_mean_weight"], 0.001)
+        self.assertEqual(
+            params["joint_tracking_weight"]
+            + params["joint_tracking_mean_weight"],
+            params["alive_bonus"],
+        )
+        self.assertEqual(
+            params["joint_roll_pitch_scale_rad"],
+            v5.task.curriculum_max_roll_pitch_rmse_rad,
+        )
+        self.assertEqual(
+            params["joint_yaw_rate_scale_rad_s"],
+            v5.task.curriculum_max_yaw_rate_rmse_rad_s,
+        )
+
+    def test_command_tracking_stability_repair_freezes_difficulty_and_rebuilds_sac(self):
+        root = Path(__file__).parents[1] / "configs/experiments"
+        repair = load_experiment_config(
+            root / "mlp_sac_attitude_command_tracking_stability_repair_v1.yaml"
+        )
+        params = repair.reward.calculator.params
+        self.assertEqual(
+            repair.name,
+            "mlp_sac_attitude_command_tracking_stability_repair_v1",
+        )
+        self.assertEqual(repair.checkpoint.resume_mode, "policy")
+        self.assertEqual(repair.checkpoint.resume_from.name, "step_44040192.pt")
+        self.assertEqual(repair.run.total_control_steps, 12_582_912)
+        self.assertEqual(repair.task.curriculum_durations_s, (30.0,))
+        self.assertEqual(repair.task.curriculum_target_scales, (0.50,))
+        self.assertEqual(
+            repair.command_source.hold_duration_range_s,
+            (6.0, 10.0),
+        )
+        self.assertEqual(repair.sac.critic_pretraining_updates, 2048)
+        self.assertEqual(repair.sac.policy_anchor_weight, 2.0)
+        self.assertEqual(repair.sac.policy_anchor_max_action_deviation, 0.08)
+        self.assertEqual(params["joint_tracking_weight"], 0.004)
+        self.assertEqual(params["joint_tracking_mean_weight"], 0.001)
+        self.assertEqual(params["angular_rate_weight"], 0.002)
+        self.assertEqual(params["servo_cyclic_weight"], 0.003)
+        self.assertEqual(
+            repair.task.curriculum_max_angular_rate_rms_rad_s,
+            0.20,
+        )
+
+    def test_command_tracking_stability_repair_v2_uses_control_total_variation(self):
+        root = Path(__file__).parents[1] / "configs/experiments"
+        repair = load_experiment_config(
+            root / "mlp_sac_attitude_command_tracking_stability_repair_v2.yaml"
+        )
+        params = repair.reward.calculator.params
+        self.assertEqual(
+            repair.name,
+            "mlp_sac_attitude_command_tracking_stability_repair_v2",
+        )
+        self.assertEqual(repair.checkpoint.resume_mode, "policy")
+        self.assertEqual(repair.checkpoint.resume_from.name, "step_48234496.pt")
+        self.assertEqual(repair.run.total_control_steps, 25_165_824)
+        self.assertEqual(
+            repair.task.curriculum_durations_s,
+            (10.0, 20.0, 30.0),
+        )
+        self.assertEqual(
+            repair.task.curriculum_target_scales,
+            (0.10, 0.25, 0.50),
+        )
+        self.assertEqual(
+            repair.command_source.hold_duration_range_s,
+            (6.0, 10.0),
+        )
+        self.assertEqual(repair.sac.critic_pretraining_updates, 2048)
+        self.assertEqual(repair.sac.actor_update_interval, 16)
+        self.assertEqual(repair.sac.actor_learning_rate, 0.000005)
+        self.assertEqual(repair.sac.policy_anchor_weight, 20.0)
+        self.assertEqual(repair.sac.policy_anchor_max_action_deviation, 0.02)
+        self.assertEqual(params["joint_tracking_weight"], 0.004)
+        self.assertEqual(params["joint_tracking_mean_weight"], 0.001)
+        self.assertEqual(params["angular_rate_weight"], 0.00015625)
+        self.assertEqual(params["action_rate_weight"], 0.0)
+        self.assertEqual(params["servo_cyclic_weight"], 0.0)
+        self.assertEqual(params["motor_movement_weight"], 0.0005)
+        self.assertEqual(params["servo_common_movement_weight"], 0.0015)
+        self.assertEqual(params["servo_cyclic_movement_weight"], 0.005)
+        self.assertEqual(
+            repair.task.curriculum_max_angular_rate_rms_rad_s,
+            0.20,
+        )
+
+    def test_command_tracking_stability_repair_v3_limits_exploration_and_drift(self):
+        root = Path(__file__).parents[1] / "configs/experiments"
+        repair = load_experiment_config(
+            root / "mlp_sac_attitude_command_tracking_stability_repair_v3.yaml"
+        )
+        params = repair.reward.calculator.params
+        self.assertEqual(
+            repair.name,
+            "mlp_sac_attitude_command_tracking_stability_repair_v3",
+        )
+        self.assertEqual(repair.checkpoint.resume_mode, "policy")
+        self.assertEqual(repair.checkpoint.resume_from.name, "step_48234496.pt")
+        self.assertEqual(repair.run.total_control_steps, 12_582_912)
+        self.assertEqual(repair.checkpoint.keep_last, 8)
+        self.assertEqual(repair.sac.actor_update_interval, 32)
+        self.assertEqual(repair.sac.actor_learning_rate, 0.0000025)
+        self.assertEqual(repair.sac.policy_anchor_weight, 25.0)
+        self.assertEqual(repair.sac.policy_anchor_max_action_deviation, 0.015)
+        self.assertEqual(repair.sac.target_entropy, -8.0)
+        self.assertEqual(repair.model.sac_initial_action_std,
+                         (0.010, 0.015, 0.015, 0.015))
+        self.assertEqual(repair.model.sac_maximum_action_std,
+                         (0.020, 0.025, 0.025, 0.025))
+        self.assertEqual(params["motor_movement_weight"], 0.0)
+        self.assertEqual(params["servo_common_movement_weight"], 0.0)
+        self.assertEqual(params["servo_cyclic_movement_weight"], 0.005)
+
+    def test_command_tracking_stability_repair_v5_gates_cyclic_movement(self):
+        root = Path(__file__).parents[1] / "configs/experiments"
+        repair = load_experiment_config(
+            root / "mlp_sac_attitude_command_tracking_stability_repair_v5.yaml"
+        )
+        params = repair.reward.calculator.params
+        self.assertEqual(
+            repair.name,
+            "mlp_sac_attitude_command_tracking_stability_repair_v5",
+        )
+        self.assertEqual(repair.checkpoint.resume_mode, "policy")
+        self.assertEqual(repair.checkpoint.resume_from.name, "step_12582912.pt")
+        self.assertIn(
+            "mlp_sac_attitude_command_tracking_stability_repair_v4",
+            str(repair.checkpoint.resume_from),
+        )
+        self.assertEqual(repair.run.total_control_steps, 12_582_912)
+        self.assertEqual(repair.checkpoint.keep_last, 8)
+        self.assertEqual(
+            repair.command_source.hold_duration_range_s,
+            (8.0, 12.0),
+        )
+        self.assertEqual(repair.sac.actor_update_interval, 32)
+        self.assertEqual(repair.sac.actor_learning_rate, 0.0000025)
+        self.assertEqual(repair.sac.policy_anchor_weight, 30.0)
+        self.assertEqual(repair.sac.policy_anchor_max_action_deviation, 0.010)
+        self.assertEqual(params["motor_movement_weight"], 0.0)
+        self.assertEqual(params["servo_common_movement_weight"], 0.0)
+        self.assertEqual(params["servo_cyclic_movement_weight"], 0.010)
+        self.assertEqual(
+            params["servo_cyclic_movement_gate_roll_pitch_scale_rad"],
+            repair.task.curriculum_max_roll_pitch_rmse_rad,
+        )
+        self.assertEqual(
+            params["servo_cyclic_movement_gate_yaw_rate_scale_rad_s"],
+            repair.task.curriculum_max_yaw_rate_rmse_rad_s,
+        )
+        self.assertEqual(
+            params["servo_cyclic_movement_gate_minimum"],
+            0.15,
         )
 
     def test_rebatch_continuation_keeps_learning_state_and_resets_batch_state(self):
@@ -1831,11 +2154,455 @@ class TensorTrainingTests(unittest.TestCase):
         self.assertGreater(float(roll_pitch.grad[2].abs().sum()), 0.0)
         self.assertEqual(float(yaw_rate.grad[2].abs().sum()), 0.0)
 
+    def test_joint_tracking_mean_auxiliary_preserves_worst_axis_and_both_gradients(self):
+        calculator = AttitudeRewardCalculator(
+            {
+                "roll_pitch_weight": 0.0,
+                "tilt_weight": 0.0,
+                "yaw_rate_weight": 0.0,
+                "joint_tracking_weight": 0.8,
+                "joint_tracking_mean_weight": 0.2,
+                "joint_roll_pitch_scale_rad": 1.0,
+                "joint_yaw_rate_scale_rad_s": 1.0,
+                "joint_tracking_huber_delta": 1.0,
+                "angular_rate_weight": 0.0,
+                "action_rate_weight": 0.0,
+                "saturation_weight": 0.0,
+                "alive_bonus": 0.0,
+                "tilt_barrier_weight": 0.0,
+                "rate_barrier_weight": 0.0,
+            }
+        )
+        roll_pitch = torch.tensor(
+            [[0.5, 0.0], [1.0, 0.0]],
+            requires_grad=True,
+        )
+        yaw_rate = torch.tensor(
+            [[2.0], [1.0]],
+            requires_grad=True,
+        )
+        context = TensorDict(
+            {
+                "roll_pitch_error_rad": roll_pitch,
+                "yaw_rate_error_rad_s": yaw_rate,
+                "tilt_rad": torch.zeros(2, 1),
+                "angular_velocity_b": torch.zeros(2, 3),
+                "action": torch.zeros(2, 4),
+                "previous_action": torch.zeros(2, 4),
+                "terminated": torch.zeros(2, 1, dtype=torch.bool),
+                "tilt_ratio": torch.zeros(2, 1),
+                "rate_ratio": torch.zeros(2, 1),
+                "episode_age_fraction": torch.zeros(2, 1),
+            },
+            batch_size=[2],
+        )
+        output = calculator(context)
+        torch.testing.assert_close(
+            output.terms["reward.joint_tracking_worst"][:, 0],
+            torch.tensor([-2.4, -0.8]),
+        )
+        torch.testing.assert_close(
+            output.terms["reward.joint_tracking_mean"][:, 0],
+            torch.tensor([-0.325, -0.2]),
+        )
+        torch.testing.assert_close(
+            output.terms["reward.joint_tracking"][:, 0],
+            torch.tensor([-2.725, -1.0]),
+        )
+        output.reward.sum().backward()
+        # yaw 是第一项的最差轴，但均值辅助项仍给较好的 RP 非零梯度。
+        self.assertGreater(float(roll_pitch.grad[0].abs().sum()), 0.0)
+        self.assertGreater(float(yaw_rate.grad[0].abs().sum()), 0.0)
+
+    def test_servo_cyclic_reward_ignores_common_mode_and_penalizes_differential(self):
+        calculator = AttitudeRewardCalculator(
+            {
+                "roll_pitch_weight": 0.0,
+                "tilt_weight": 0.0,
+                "yaw_rate_weight": 0.0,
+                "joint_tracking_weight": 0.0,
+                "angular_rate_weight": 0.0,
+                "action_rate_weight": 0.0,
+                "servo_cyclic_weight": 2.0,
+                "saturation_weight": 0.0,
+                "alive_bonus": 0.0,
+                "tilt_barrier_weight": 0.0,
+                "rate_barrier_weight": 0.0,
+            }
+        )
+        action = torch.tensor(
+            [
+                [0.7, -0.3, -0.3, -0.3],
+                [0.7, 1.0, -0.5, -0.5],
+            ],
+            requires_grad=True,
+        )
+        context = TensorDict(
+            {
+                "roll_pitch_error_rad": torch.zeros(2, 2),
+                "yaw_rate_error_rad_s": torch.zeros(2, 1),
+                "tilt_rad": torch.zeros(2, 1),
+                "angular_velocity_b": torch.zeros(2, 3),
+                "action": action,
+                "previous_action": action.detach().clone(),
+                "terminated": torch.zeros(2, 1, dtype=torch.bool),
+                "tilt_ratio": torch.zeros(2, 1),
+                "rate_ratio": torch.zeros(2, 1),
+                "episode_age_fraction": torch.zeros(2, 1),
+            },
+            batch_size=[2],
+        )
+        output = calculator(context)
+        torch.testing.assert_close(
+            output.terms["reward.servo_cyclic"][:, 0],
+            torch.tensor([0.0, -3.0]),
+        )
+        output.reward.sum().backward()
+        self.assertEqual(float(action.grad[0].abs().sum()), 0.0)
+        self.assertEqual(float(action.grad[1, 0]), 0.0)
+        self.assertGreater(float(action.grad[1, 1:].abs().sum()), 0.0)
+
+    def test_control_movement_charges_changes_not_held_deflection(self):
+        calculator = AttitudeRewardCalculator(
+            {
+                "roll_pitch_weight": 0.0,
+                "tilt_weight": 0.0,
+                "yaw_rate_weight": 0.0,
+                "joint_tracking_weight": 0.0,
+                "angular_rate_weight": 0.0,
+                "action_rate_weight": 0.0,
+                "servo_cyclic_weight": 0.0,
+                "motor_movement_weight": 2.0,
+                "servo_common_movement_weight": 3.0,
+                "servo_cyclic_movement_weight": 5.0,
+                "saturation_weight": 0.0,
+                "alive_bonus": 0.0,
+                "tilt_barrier_weight": 0.0,
+                "rate_barrier_weight": 0.0,
+            }
+        )
+        previous_action = torch.tensor(
+            [
+                [0.3, 1.0, -0.5, -0.5],
+                [0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0],
+            ]
+        )
+        action = torch.tensor(
+            [
+                # 非零舵面保持不动：不再持续收费。
+                [0.3, 1.0, -0.5, -0.5],
+                # 只改变下电机。
+                [0.3, 0.0, 0.0, 0.0],
+                # 三舵机共同移动，只计共同模态。
+                [0.0, 0.2, 0.2, 0.2],
+                # 零均值 cyclic 移动，只计 cyclic 模态。
+                [0.0, 1.0, -0.5, -0.5],
+            ]
+        )
+        context = TensorDict(
+            {
+                "roll_pitch_error_rad": torch.zeros(4, 2),
+                "yaw_rate_error_rad_s": torch.zeros(4, 1),
+                "tilt_rad": torch.zeros(4, 1),
+                "angular_velocity_b": torch.zeros(4, 3),
+                "action": action,
+                "previous_action": previous_action,
+                "terminated": torch.zeros(4, 1, dtype=torch.bool),
+                "tilt_ratio": torch.zeros(4, 1),
+                "rate_ratio": torch.zeros(4, 1),
+                "episode_age_fraction": torch.zeros(4, 1),
+            },
+            batch_size=[4],
+        )
+        output = calculator(context)
+        torch.testing.assert_close(
+            output.diagnostics["actuator_energy_proxy"][:, 0],
+            torch.tensor([0.0, 0.3, 0.2, 2.0]),
+        )
+        torch.testing.assert_close(
+            output.terms["reward.motor_movement"][:, 0],
+            torch.tensor([0.0, -0.6, 0.0, 0.0]),
+        )
+        torch.testing.assert_close(
+            output.terms["reward.servo_common_movement"][:, 0],
+            torch.tensor([0.0, 0.0, -0.6, 0.0]),
+        )
+        torch.testing.assert_close(
+            output.terms["reward.servo_cyclic_movement"][:, 0],
+            torch.tensor([0.0, 0.0, 0.0, -10.0]),
+        )
+        torch.testing.assert_close(
+            output.terms["reward.control_movement"][:, 0],
+            torch.tensor([0.0, -0.6, -0.6, -10.0]),
+        )
+
+    def test_control_effort_continuously_charges_held_deflection(self):
+        calculator = AttitudeRewardCalculator(
+            {
+                "roll_pitch_weight": 0.0,
+                "tilt_weight": 0.0,
+                "yaw_rate_weight": 0.0,
+                "joint_tracking_weight": 0.0,
+                "angular_rate_weight": 0.0,
+                "action_rate_weight": 0.0,
+                "servo_cyclic_weight": 0.0,
+                "motor_effort_weight": 2.0,
+                "servo_common_effort_weight": 3.0,
+                "servo_cyclic_effort_weight": 5.0,
+                "saturation_weight": 0.0,
+                "alive_bonus": 0.0,
+                "tilt_barrier_weight": 0.0,
+                "rate_barrier_weight": 0.0,
+            }
+        )
+        action = torch.tensor(
+            [
+                [0.0, 0.0, 0.0, 0.0],
+                [0.5, 0.0, 0.0, 0.0],
+                [0.0, 0.2, 0.2, 0.2],
+                [0.0, 1.0, -0.5, -0.5],
+            ]
+        )
+        context = TensorDict(
+            {
+                "roll_pitch_error_rad": torch.zeros(4, 2),
+                "yaw_rate_error_rad_s": torch.zeros(4, 1),
+                "tilt_rad": torch.zeros(4, 1),
+                "angular_velocity_b": torch.zeros(4, 3),
+                "action": action,
+                "previous_action": action.clone(),
+                "terminated": torch.zeros(4, 1, dtype=torch.bool),
+                "tilt_ratio": torch.zeros(4, 1),
+                "rate_ratio": torch.zeros(4, 1),
+                "episode_age_fraction": torch.zeros(4, 1),
+            },
+            batch_size=[4],
+        )
+        output = calculator(context)
+        torch.testing.assert_close(
+            output.diagnostics["actuator_effort_proxy"][:, 0],
+            torch.tensor([0.0, 0.25, 0.04, 1.5]),
+        )
+        torch.testing.assert_close(
+            output.terms["reward.motor_effort"][:, 0],
+            torch.tensor([0.0, -0.5, 0.0, 0.0]),
+        )
+        torch.testing.assert_close(
+            output.terms["reward.servo_common_effort"][:, 0],
+            torch.tensor([0.0, 0.0, -0.12, 0.0]),
+        )
+        torch.testing.assert_close(
+            output.terms["reward.servo_cyclic_effort"][:, 0],
+            torch.tensor([0.0, 0.0, 0.0, -7.5]),
+        )
+        torch.testing.assert_close(
+            output.terms["reward.control_effort"][:, 0],
+            torch.tensor([0.0, -0.5, -0.12, -7.5]),
+        )
+
+    def test_physical_servo_common_effort_uses_simulator_command(self):
+        calculator = AttitudeRewardCalculator(
+            {
+                "roll_pitch_weight": 0.0,
+                "tilt_weight": 0.0,
+                "yaw_rate_weight": 0.0,
+                "joint_tracking_weight": 0.0,
+                "angular_rate_weight": 0.0,
+                "action_rate_weight": 0.0,
+                "physical_servo_common_effort_weight": 4.0,
+                "saturation_weight": 0.0,
+                "alive_bonus": 0.0,
+                "tilt_barrier_weight": 0.0,
+                "rate_barrier_weight": 0.0,
+            }
+        )
+        action = torch.zeros(3, 4)
+        simulator_command = torch.tensor(
+            [
+                [0.6, 0.5, 0.0, 0.0, 0.0],
+                [0.6, 0.5, 0.5, 0.5, 0.5],
+                [0.6, 0.5, 1.0, -0.5, -0.5],
+            ]
+        )
+        context = TensorDict(
+            {
+                "roll_pitch_error_rad": torch.zeros(3, 2),
+                "yaw_rate_error_rad_s": torch.zeros(3, 1),
+                "tilt_rad": torch.zeros(3, 1),
+                "angular_velocity_b": torch.zeros(3, 3),
+                "action": action,
+                "previous_action": action.clone(),
+                "simulator_command": simulator_command,
+                "terminated": torch.zeros(3, 1, dtype=torch.bool),
+                "tilt_ratio": torch.zeros(3, 1),
+                "rate_ratio": torch.zeros(3, 1),
+                "episode_age_fraction": torch.zeros(3, 1),
+            },
+            batch_size=[3],
+        )
+        output = calculator(context)
+        torch.testing.assert_close(
+            output.diagnostics["physical_servo_common_effort_proxy"][:, 0],
+            torch.tensor([0.0, 0.25, 0.0]),
+        )
+        torch.testing.assert_close(
+            output.terms["reward.physical_servo_common_effort"][:, 0],
+            torch.tensor([0.0, -1.0, 0.0]),
+        )
+        torch.testing.assert_close(
+            output.terms["reward.control_effort"][:, 0],
+            torch.tensor([0.0, -1.0, 0.0]),
+        )
+
+        missing = context.exclude("simulator_command")
+        with self.assertRaisesRegex(ValueError, "requires simulator_command"):
+            calculator(missing)
+
+    def test_control_movement_accumulates_on_repeated_servo_reversals(self):
+        calculator = AttitudeRewardCalculator(
+            {
+                "roll_pitch_weight": 0.0,
+                "tilt_weight": 0.0,
+                "yaw_rate_weight": 0.0,
+                "joint_tracking_weight": 0.0,
+                "angular_rate_weight": 0.0,
+                "action_rate_weight": 0.0,
+                "servo_cyclic_weight": 0.0,
+                "servo_cyclic_movement_weight": 1.0,
+                "saturation_weight": 0.0,
+                "alive_bonus": 0.0,
+                "tilt_barrier_weight": 0.0,
+                "rate_barrier_weight": 0.0,
+            }
+        )
+
+        def movement(previous, action):
+            context = TensorDict(
+                {
+                    "roll_pitch_error_rad": torch.zeros(1, 2),
+                    "yaw_rate_error_rad_s": torch.zeros(1, 1),
+                    "tilt_rad": torch.zeros(1, 1),
+                    "angular_velocity_b": torch.zeros(1, 3),
+                    "action": torch.tensor([action]),
+                    "previous_action": torch.tensor([previous]),
+                    "terminated": torch.zeros(1, 1, dtype=torch.bool),
+                    "tilt_ratio": torch.zeros(1, 1),
+                    "rate_ratio": torch.zeros(1, 1),
+                    "episode_age_fraction": torch.zeros(1, 1),
+                },
+                batch_size=[1],
+            )
+            return -calculator(context).terms[
+                "reward.servo_cyclic_movement"
+            ].item()
+
+        zero = [0.0, 0.0, 0.0, 0.0]
+        positive = [0.0, 1.0, -0.5, -0.5]
+        negative = [0.0, -1.0, 0.5, 0.5]
+        self.assertEqual(movement(positive, positive), 0.0)
+        self.assertEqual(movement(zero, positive), 2.0)
+        self.assertEqual(movement(positive, negative), 4.0)
+        self.assertEqual(movement(negative, positive), 4.0)
+
+    def test_cyclic_movement_gate_preserves_tracking_authority(self):
+        calculator = AttitudeRewardCalculator(
+            {
+                "roll_pitch_weight": 0.0,
+                "tilt_weight": 0.0,
+                "yaw_rate_weight": 0.0,
+                "joint_tracking_weight": 0.0,
+                "angular_rate_weight": 0.0,
+                "action_rate_weight": 0.0,
+                "servo_cyclic_movement_weight": 2.0,
+                "servo_cyclic_movement_gate_roll_pitch_scale_rad": 0.1,
+                "servo_cyclic_movement_gate_yaw_rate_scale_rad_s": 0.2,
+                "servo_cyclic_movement_gate_minimum": 0.1,
+                "saturation_weight": 0.0,
+                "alive_bonus": 0.0,
+                "tilt_barrier_weight": 0.0,
+                "rate_barrier_weight": 0.0,
+            }
+        )
+        action = torch.tensor(
+            [
+                [0.0, 1.0, -0.5, -0.5],
+                [0.0, 1.0, -0.5, -0.5],
+                [0.0, 1.0, -0.5, -0.5],
+                [0.0, 1.0, -0.5, -0.5],
+            ]
+        )
+        context = TensorDict(
+            {
+                "roll_pitch_error_rad": torch.tensor(
+                    [[0.0, 0.0], [0.1, 0.0], [0.0, 0.0], [0.1, 0.0]]
+                ),
+                "yaw_rate_error_rad_s": torch.tensor(
+                    [[0.0], [0.0], [0.2], [0.2]]
+                ),
+                "tilt_rad": torch.zeros(4, 1),
+                "angular_velocity_b": torch.zeros(4, 3),
+                "action": action,
+                "previous_action": torch.zeros_like(action),
+                "terminated": torch.zeros(4, 1, dtype=torch.bool),
+                "tilt_ratio": torch.zeros(4, 1),
+                "rate_ratio": torch.zeros(4, 1),
+                "episode_age_fraction": torch.zeros(4, 1),
+            },
+            batch_size=[4],
+        )
+        output = calculator(context)
+        expected_gate = 0.1 + 0.9 * torch.exp(
+            -0.5 * torch.tensor([[0.0], [1.0], [1.0], [2.0]])
+        )
+        torch.testing.assert_close(
+            output.diagnostics["servo_cyclic_movement_gate"],
+            expected_gate,
+        )
+        # The cyclic L1 movement cost is 2, multiplied by reward weight 2.
+        torch.testing.assert_close(
+            output.terms["reward.servo_cyclic_movement"],
+            -4.0 * expected_gate,
+        )
+
+    def test_cyclic_movement_gate_requires_valid_paired_scales(self):
+        with self.assertRaisesRegex(ValueError, "configured together"):
+            AttitudeRewardCalculator(
+                {
+                    "servo_cyclic_movement_gate_roll_pitch_scale_rad": 0.1,
+                }
+            )
+        with self.assertRaisesRegex(ValueError, "finite and positive"):
+            AttitudeRewardCalculator(
+                {
+                    "servo_cyclic_movement_gate_roll_pitch_scale_rad": 0.0,
+                    "servo_cyclic_movement_gate_yaw_rate_scale_rad_s": 0.2,
+                }
+            )
+        with self.assertRaisesRegex(ValueError, "between 0 and 1"):
+            AttitudeRewardCalculator(
+                {
+                    "servo_cyclic_movement_gate_roll_pitch_scale_rad": 0.1,
+                    "servo_cyclic_movement_gate_yaw_rate_scale_rad_s": 0.2,
+                    "servo_cyclic_movement_gate_minimum": 1.1,
+                }
+            )
+
     def test_joint_tracking_rejects_legacy_linear_axis_rewards(self):
         with self.assertRaisesRegex(ValueError, "mutually exclusive"):
             AttitudeRewardCalculator(
                 {
                     "joint_tracking_weight": 0.01,
+                    "roll_pitch_weight": 0.1,
+                    "tilt_weight": 0.0,
+                    "yaw_rate_weight": 0.0,
+                }
+            )
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            AttitudeRewardCalculator(
+                {
+                    "joint_tracking_mean_weight": 0.001,
                     "roll_pitch_weight": 0.1,
                     "tilt_weight": 0.0,
                     "yaw_rate_weight": 0.0,

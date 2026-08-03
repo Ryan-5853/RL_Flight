@@ -45,6 +45,15 @@ class RewardCalculatorConfig:
 
 
 @dataclass(frozen=True)
+class AttitudePidConfig:
+    proportional_gain: tuple[float, float, float]
+    integral_gain: tuple[float, float, float]
+    derivative_gain: tuple[float, float, float]
+    integral_limit_rad_s: tuple[float, float, float]
+    max_angular_acceleration_rad_s2: tuple[float, float, float]
+
+
+@dataclass(frozen=True)
 class TaskConfig:
     episode_duration_s: float
     terminate_tilt_rad: float
@@ -59,6 +68,7 @@ class TaskConfig:
     curriculum_max_roll_pitch_rmse_rad: float | None = None
     curriculum_max_yaw_rate_rmse_rad_s: float | None = None
     curriculum_max_angular_rate_rms_rad_s: float | None = None
+    outer_loop_pid: AttitudePidConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -92,6 +102,8 @@ class VirtualPilotConfig:
 class ControlContractConfig:
     version: str
     observation_profile: str
+    action_transform_type: str
+    lower_motor_upper_ratio: float
     observation_history_mode: str
     observation_history_frames: int
     observation_history_stride_steps: int
@@ -105,14 +117,49 @@ class ControlContractConfig:
     policy_action_residual_scale: tuple[float, ...]
 
     @property
+    def action_dim(self) -> int:
+        return len(self.policy_action_fields)
+
+    @property
+    def base_observation_dim(self) -> int:
+        if self.observation_profile == "attitude_self_stabilize_21d_v3":
+            return 21
+        if self.observation_profile == "angular_acceleration_inner_loop_22d_v1":
+            return 22
+        if (
+            self.observation_profile
+            == "angular_acceleration_allocated_inner_loop_21d_v2"
+        ):
+            return 21
+        raise RuntimeError(
+            f"unsupported observation profile {self.observation_profile!r}"
+        )
+
+    @property
+    def physical_response_dim(self) -> int:
+        if self.observation_profile == "attitude_self_stabilize_21d_v3":
+            return 11
+        if self.observation_profile == "angular_acceleration_inner_loop_22d_v1":
+            return 14
+        if (
+            self.observation_profile
+            == "angular_acceleration_allocated_inner_loop_21d_v2"
+        ):
+            return 14
+        raise RuntimeError(
+            f"unsupported observation profile {self.observation_profile!r}"
+        )
+
+    @property
     def observation_dim(self) -> int:
         if self.observation_history_mode == "uniform":
-            return 21 * self.observation_history_frames
+            return self.base_observation_dim * self.observation_history_frames
         if self.observation_history_mode == "multirate_actuator":
             return (
-                21
-                + 4 * self.observation_history_dense_action_steps
-                + 11 * self.observation_history_sparse_physical_frames
+                self.base_observation_dim
+                + self.action_dim * self.observation_history_dense_action_steps
+                + self.physical_response_dim
+                * self.observation_history_sparse_physical_frames
             )
         raise RuntimeError(
             f"unsupported observation history mode "
@@ -139,7 +186,9 @@ class ControlContractConfig:
     @property
     def current_observation_offset(self) -> int:
         if self.observation_history_mode == "uniform":
-            return (self.observation_history_frames - 1) * 21
+            return (
+                self.observation_history_frames - 1
+            ) * self.base_observation_dim
         if self.observation_history_mode == "multirate_actuator":
             return 0
         raise RuntimeError(
@@ -374,7 +423,12 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
     task_node = _map(raw, "task")
     _keys(
         task_node,
-        {"episode_duration_s", "termination", "episode_curriculum"},
+        {
+            "episode_duration_s",
+            "termination",
+            "episode_curriculum",
+            "outer_loop",
+        },
         "task",
     )
     termination = _map(task_node, "termination")
@@ -395,6 +449,53 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
         attitude_source=str(environment.get("observation_source", "sensor")),
         terminate_angular_rate_axes=angular_rate_axes,
     )
+    outer_loop_node = task_node.get("outer_loop")
+    if outer_loop_node is not None:
+        if not isinstance(outer_loop_node, Mapping):
+            raise ConfigError("task.outer_loop must be a mapping")
+        _keys(
+            outer_loop_node,
+            {
+                "type",
+                "proportional_gain",
+                "integral_gain",
+                "derivative_gain",
+                "integral_limit_rad_s",
+                "max_angular_acceleration_rad_s2",
+            },
+            "task.outer_loop",
+        )
+        if str(outer_loop_node.get("type", "")) != "attitude_pid":
+            raise ConfigError("task.outer_loop.type must be attitude_pid")
+
+        def pid_vector(name: str, *, positive: bool) -> tuple[float, float, float]:
+            raw_values = _sequence(outer_loop_node, name)
+            if len(raw_values) != 3:
+                raise ConfigError(f"task.outer_loop.{name} must contain 3 values")
+            values = tuple(
+                _positive_float_value(value, f"task.outer_loop.{name}")
+                if positive
+                else _finite_float_value(value, f"task.outer_loop.{name}")
+                for value in raw_values
+            )
+            if not positive and any(value < 0.0 for value in values):
+                raise ConfigError(f"task.outer_loop.{name} must be nonnegative")
+            return values  # type: ignore[return-value]
+
+        task = replace(
+            task,
+            outer_loop_pid=AttitudePidConfig(
+                proportional_gain=pid_vector("proportional_gain", positive=False),
+                integral_gain=pid_vector("integral_gain", positive=False),
+                derivative_gain=pid_vector("derivative_gain", positive=False),
+                integral_limit_rad_s=pid_vector(
+                    "integral_limit_rad_s", positive=True
+                ),
+                max_angular_acceleration_rad_s2=pid_vector(
+                    "max_angular_acceleration_rad_s2", positive=True
+                ),
+            ),
+        )
     curriculum_node = task_node.get("episode_curriculum")
     if curriculum_node is not None:
         if not isinstance(curriculum_node, Mapping):
@@ -502,6 +603,15 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
     if command_source.seed in {static.seed, dynamic.seed}:
         raise ConfigError("command_source.seed must differ from static/dynamic randomization seeds")
     control_contract = _control_contract(_map(raw, "control_contract"))
+    acceleration_profile = control_contract.observation_profile in {
+        "angular_acceleration_inner_loop_22d_v1",
+        "angular_acceleration_allocated_inner_loop_21d_v2",
+    }
+    if acceleration_profile != (task.outer_loop_pid is not None):
+        raise ConfigError(
+            "angular_acceleration_inner_loop profiles and task.outer_loop must "
+            "be configured together"
+        )
     checkpoint = _checkpoint_config(_map(raw, "checkpoint"), source)
     evaluation = _evaluation_config(_map(raw, "evaluation"), source)
     if evaluation.enabled:
@@ -603,10 +713,11 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
                 len(model.sac_initial_action_std)
                 == len(model.sac_minimum_action_std)
                 == len(model.sac_maximum_action_std)
-                == 4
+                == control_contract.action_dim
             ):
                 raise ConfigError(
-                    "SAC policy distribution std lists must each contain 4 actions"
+                    "SAC policy distribution std lists must each match the "
+                    "control contract action dimension"
                 )
             if any(
                 not minimum < initial < maximum
@@ -669,10 +780,11 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
                 len(model.sac_initial_action_std)
                 == len(model.sac_minimum_action_std)
                 == len(model.sac_maximum_action_std)
-                == 4
+                == control_contract.action_dim
             ):
                 raise ConfigError(
-                    "SAC policy distribution std lists must each contain 4 actions"
+                    "SAC policy distribution std lists must each match the "
+                    "control contract action dimension"
                 )
             if any(
                 not minimum < initial < maximum
@@ -1303,14 +1415,27 @@ def _control_contract(node: Mapping[str, Any]) -> ControlContractConfig:
     policy = tuple(str(v) for v in _sequence(_map(node, "policy_action"), "fields"))
     external = tuple(str(v) for v in _sequence(_map(node, "external_action"), "fields"))
     simulator = tuple(str(v) for v in _sequence(_map(node, "simulator_command"), "fields"))
-    expected_policy = ("lower_motor", "servo_1", "servo_2", "servo_3")
     expected_external = ("upper_motor",)
-    expected_simulator = ("upper_motor", *expected_policy)
-    if policy != expected_policy or external != expected_external or simulator != expected_simulator:
-        raise ConfigError("control_contract fields must match self_stabilize_v1 ownership and order")
+    expected_simulator = (
+        "upper_motor",
+        "lower_motor",
+        "servo_1",
+        "servo_2",
+        "servo_3",
+    )
+    if external != expected_external or simulator != expected_simulator:
+        raise ConfigError(
+            "control_contract external/simulator fields must match "
+            "self_stabilize_v1 ownership and order"
+        )
     version = str(node.get("version", ""))
     profile = str(node.get("observation_profile", ""))
-    if version != "self_stabilize_v1" or profile != "attitude_self_stabilize_21d_v3":
+    supported_profiles = {
+        "attitude_self_stabilize_21d_v3",
+        "angular_acceleration_inner_loop_22d_v1",
+        "angular_acceleration_allocated_inner_loop_21d_v2",
+    }
+    if version != "self_stabilize_v1" or profile not in supported_profiles:
         raise ConfigError("unsupported self-stabilize control/observation contract")
     history_raw = node.get("observation_history", {})
     if not isinstance(history_raw, Mapping):
@@ -1384,12 +1509,22 @@ def _control_contract(node: Mapping[str, Any]) -> ControlContractConfig:
     transform = _map(node, "action_transform")
     _keys(
         transform,
-        {"type", "trim_command", "residual_scale"},
+        {
+            "type",
+            "trim_command",
+            "residual_scale",
+            "lower_motor_upper_ratio",
+        },
         "control_contract.action_transform",
     )
-    if str(transform.get("type")) != "residual_around_trim":
+    transform_type = str(transform.get("type"))
+    if transform_type not in {
+        "residual_around_trim",
+        "coaxial_differential_cyclic",
+    }:
         raise ConfigError(
-            "control_contract.action_transform.type must be residual_around_trim"
+            "control_contract.action_transform.type must be "
+            "residual_around_trim or coaxial_differential_cyclic"
         )
     trim = tuple(
         float(value) for value in _sequence(transform, "trim_command")
@@ -1400,24 +1535,87 @@ def _control_contract(node: Mapping[str, Any]) -> ControlContractConfig:
         )
         for value in _sequence(transform, "residual_scale")
     )
-    if len(trim) != 4 or len(scale) != 4:
-        raise ConfigError("trim_command and residual_scale must each contain 4 values")
-    lower = (0.0, -1.0, -1.0, -1.0)
-    upper = (1.0, 1.0, 1.0, 1.0)
-    if any(
-        not math.isfinite(center)
-        or center - radius < low
-        or center + radius > high
-        for center, radius, low, high in zip(
-            trim, scale, lower, upper, strict=True
+    if len(trim) != 4:
+        raise ConfigError("trim_command must contain 4 physical actuator values")
+    if transform_type == "coaxial_differential_cyclic":
+        expected_policy = (
+            "lower_motor_differential",
+            "servo_cyclic_a",
+            "servo_cyclic_b",
         )
-    ):
-        raise ConfigError(
-            "trim_command ± residual_scale must stay inside simulator action bounds"
+        if policy != expected_policy:
+            raise ConfigError(
+                "coaxial differential/cyclic policy fields must be "
+                "lower_motor_differential, servo_cyclic_a, servo_cyclic_b"
+            )
+        if (
+            profile
+            != "angular_acceleration_allocated_inner_loop_21d_v2"
+        ):
+            raise ConfigError(
+                "coaxial differential/cyclic transform requires the allocated "
+                "21d angular-acceleration observation profile"
+            )
+        if len(scale) != 3:
+            raise ConfigError(
+                "coaxial differential/cyclic residual_scale must contain "
+                "motor, cyclic_a, cyclic_b scales"
+            )
+        lower_motor_upper_ratio = _positive_float(
+            transform, "lower_motor_upper_ratio"
         )
+        if lower_motor_upper_ratio > 1.0:
+            raise ConfigError(
+                "coaxial lower_motor_upper_ratio must not exceed 1"
+            )
+        if any(abs(value) > 1e-12 for value in trim[1:]):
+            raise ConfigError(
+                "coaxial differential/cyclic transform requires zero servo trim"
+            )
+        maximum_servo_command = max(
+            scale[1],
+            0.5 * scale[1] + 0.5 * math.sqrt(3.0) * scale[2],
+        )
+        if maximum_servo_command > 1.0:
+            raise ConfigError(
+                "coaxial cyclic scales can exceed the servo command bounds"
+            )
+    else:
+        expected_policy = ("lower_motor", "servo_1", "servo_2", "servo_3")
+        if policy != expected_policy:
+            raise ConfigError(
+                "residual-around-trim policy fields must be lower_motor and "
+                "servo_1..3"
+            )
+        if len(scale) != 4:
+            raise ConfigError(
+                "residual-around-trim residual_scale must contain 4 values"
+            )
+        lower = (0.0, -1.0, -1.0, -1.0)
+        upper = (1.0, 1.0, 1.0, 1.0)
+        if any(
+            not math.isfinite(center)
+            or center - radius < low
+            or center + radius > high
+            for center, radius, low, high in zip(
+                trim, scale, lower, upper, strict=True
+            )
+        ):
+            raise ConfigError(
+                "trim_command ± residual_scale must stay inside simulator "
+                "action bounds"
+            )
+        if "lower_motor_upper_ratio" in transform:
+            raise ConfigError(
+                "lower_motor_upper_ratio is only valid for the coaxial "
+                "differential/cyclic transform"
+            )
+        lower_motor_upper_ratio = 1.0
     return ControlContractConfig(
         version=version,
         observation_profile=profile,
+        action_transform_type=transform_type,
+        lower_motor_upper_ratio=lower_motor_upper_ratio,
         observation_history_mode=history_mode,
         observation_history_frames=history_frames,
         observation_history_stride_steps=history_stride_steps,

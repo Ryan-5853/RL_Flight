@@ -34,9 +34,12 @@ class InferencePackageMetadata:
             expected_actions = 4
         elif self.output_mode == "physical_5":
             expected_actions = 5
+        elif self.output_mode == "coaxial_differential_cyclic_3":
+            expected_actions = 3
         else:
             raise ValueError(
-                "inference output_mode must be residual_4 or physical_5"
+                "inference output_mode must be residual_4, physical_5, or "
+                "coaxial_differential_cyclic_3"
             )
         if self.action_dim != expected_actions:
             raise ValueError(
@@ -178,6 +181,10 @@ class InferenceModelAdapter:
                 dim=1,
             )
         return method(policy_action, external_action)
+
+    def control_diagnostics(self) -> Mapping[str, torch.Tensor]:
+        method = getattr(self.package, "control_diagnostics", None)
+        return {} if method is None else method()
 
 
 class FlightDeployInferencePackage:
@@ -474,6 +481,396 @@ class FlightDeployInferencePackage:
         return result / result.norm(dim=-1, keepdim=True).clamp_min(1e-8)
 
 
+class AngularAccelerationCascadePackage:
+    """Stateful attitude-PID wrapper around the exported 3-D inner policy."""
+
+    def __init__(
+        self,
+        path: Path,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
+        if dtype != torch.float32:
+            raise ValueError("flight_deploy bundles currently require float32")
+        from flight_deploy import PolicyRuntime
+        from flight_deploy.history import UniformHistoryBuffer
+
+        self.path = path
+        self.runtime = PolicyRuntime.load(path, device=device)
+        if self.runtime.stateful:
+            raise ValueError("angular-acceleration cascade requires a stateless MLP")
+        contract = self.runtime.bundle.manifest.get("contract")
+        if not isinstance(contract, Mapping):
+            raise ValueError("flight_deploy bundle has no control contract")
+        if (
+            contract.get("version") != "angular_acceleration_cascade_v1"
+            or contract.get("observation_profile")
+            != "angular_acceleration_allocated_inner_loop_21d_v2"
+        ):
+            raise ValueError("bundle is not an angular-acceleration cascade")
+        history = self._mapping(contract, "observation_history")
+        if history.get("mode") != "uniform":
+            raise ValueError("angular-acceleration cascade requires uniform history")
+        frames = int(history.get("frames", 0))
+        stride_steps = int(history.get("stride_steps", 0))
+        if frames <= 0 or stride_steps <= 0:
+            raise ValueError("invalid uniform observation history dimensions")
+        if self.runtime.input_dim != 21 * frames or self.runtime.output_dim != 3:
+            raise ValueError("bundle network dimensions do not match cascade ABI")
+
+        normalization = self._mapping(contract, "normalization")
+        self.command_scale = self._tensor3(
+            normalization,
+            "desired_angular_acceleration_rad_s2",
+            device,
+            dtype,
+        )
+        actual_scale = self._tensor3(
+            normalization,
+            "actual_angular_acceleration_rad_s2",
+            device,
+            dtype,
+        )
+        if not torch.equal(self.command_scale, actual_scale):
+            raise ValueError("desired and actual angular-acceleration scales differ")
+        self.angular_velocity_scale = self._positive(
+            normalization, "angular_velocity_rad_s"
+        )
+        self.acceleration_scale = self._positive(
+            normalization, "acceleration_m_s2"
+        )
+        self.motor_speed_scale = self._positive(
+            normalization, "motor_speed_rad_s"
+        )
+        self.servo_angle_scale = self._positive(
+            normalization, "servo_angle_rad"
+        )
+
+        controller = self._mapping(contract, "controller")
+        if controller.get("type") != "attitude_pid_angular_acceleration_cascade":
+            raise ValueError("unsupported cascade controller type")
+        self.required_control_hz = int(controller.get("control_hz", 0))
+        if self.required_control_hz <= 0:
+            raise ValueError("cascade control_hz must be positive")
+        self.control_dt = 1.0 / float(self.required_control_hz)
+        compatibility = contract.get("simulator_compatibility")
+        self.required_simulator_fingerprint = None
+        if compatibility is not None:
+            if not isinstance(compatibility, Mapping):
+                raise ValueError("simulator compatibility contract must be a mapping")
+            if int(compatibility.get("fingerprint_version", 0)) != 1:
+                raise ValueError("unsupported simulator compatibility fingerprint")
+            fingerprint = str(compatibility.get("sha256", ""))
+            if len(fingerprint) != 64:
+                raise ValueError("invalid simulator compatibility fingerprint")
+            self.required_simulator_fingerprint = fingerprint
+        outer = self._mapping(controller, "outer_loop")
+        self.proportional_gain = self._tensor3(
+            outer, "proportional_gain", device, dtype, nonnegative=True
+        )
+        self.integral_gain = self._tensor3(
+            outer, "integral_gain", device, dtype, nonnegative=True
+        )
+        self.derivative_gain = self._tensor3(
+            outer, "derivative_gain", device, dtype, nonnegative=True
+        )
+        self.integral_limit = self._tensor3(
+            outer, "integral_limit_rad_s", device, dtype
+        )
+        command_limit = self._tensor3(
+            outer, "max_angular_acceleration_rad_s2", device, dtype
+        )
+        if not torch.equal(command_limit, self.command_scale):
+            raise ValueError("outer-loop limit does not match observation scale")
+
+        transform = self._mapping(contract, "action_transform")
+        if transform.get("type") != "coaxial_differential_cyclic":
+            raise ValueError("cascade requires coaxial differential/cyclic allocation")
+        self.lower_motor_upper_ratio = self._positive(
+            transform, "lower_motor_upper_ratio"
+        )
+        if self.lower_motor_upper_ratio > 1.0:
+            raise ValueError("lower_motor_upper_ratio must not exceed one")
+        trim = tuple(float(value) for value in transform.get("trim_command", ()))
+        scale = tuple(float(value) for value in transform.get("residual_scale", ()))
+        if len(trim) != 4 or len(scale) != 3 or min(scale) <= 0:
+            raise ValueError("cascade action trim/scale dimensions are invalid")
+        self.action_trim = torch.tensor(trim, device=device, dtype=dtype)
+        self.action_scale = torch.tensor(scale, device=device, dtype=dtype)
+
+        self.history = UniformHistoryBuffer(
+            1,
+            21,
+            frames,
+            stride_steps=stride_steps,
+            device=device,
+            dtype=dtype,
+        )
+        self.history_frames = frames
+        self.history_stride_steps = stride_steps
+        self.integral_error = torch.zeros((1, 3), device=device, dtype=dtype)
+        self.previous_angular_velocity = torch.zeros_like(self.integral_error)
+        self.estimator_initialized = torch.zeros(1, device=device, dtype=torch.bool)
+        self.last_desired_angular_acceleration = torch.zeros_like(
+            self.integral_error
+        )
+        self.last_actual_angular_acceleration = torch.zeros_like(
+            self.integral_error
+        )
+        self.metadata = InferencePackageMetadata(
+            format_version=1,
+            package_id=path.name,
+            observation_dim=21,
+            action_dim=3,
+            output_mode="coaxial_differential_cyclic_3",
+            recurrent=False,
+        )
+        self.metadata.validate()
+
+    def infer(
+        self,
+        observation: torch.Tensor,
+        recurrent_state: Any | None,
+        is_init: torch.Tensor,
+    ) -> tuple[torch.Tensor, Any | None]:
+        del recurrent_state
+        if observation.shape != (1, 21):
+            raise ValueError("cascade base observation must have shape [1,21]")
+        reset = bool(is_init.reshape(-1)[0].item())
+        if reset or not bool(self.history.initialized.all()):
+            self.history.reset(observation)
+            runtime_observation = self.history.observation()
+        else:
+            runtime_observation = self.history.append(observation)
+        return self.runtime.infer(runtime_observation), None
+
+    def infer_control(
+        self,
+        state: Any,
+        reference: Any,
+        previous_action: torch.Tensor,
+        recurrent_state: Any | None,
+        is_init: torch.Tensor,
+    ) -> tuple[torch.Tensor, Any | None]:
+        if previous_action.shape != (1, 3):
+            raise ValueError("cascade previous action must have shape [1,3]")
+        reset = bool(is_init.reshape(-1)[0].item())
+        angular_velocity = state.angular_velocity_b
+        if reset or not bool(self.estimator_initialized[0].item()):
+            self.integral_error.zero_()
+            actual_angular_acceleration = torch.zeros_like(angular_velocity)
+            self.estimator_initialized.fill_(True)
+        else:
+            actual_angular_acceleration = (
+                angular_velocity - self.previous_angular_velocity
+            ) / self.control_dt
+        self.previous_angular_velocity.copy_(angular_velocity)
+
+        attitude_error = self._attitude_error_rotation_vector(
+            state.attitude_q_wb,
+            reference.target_attitude_q_wb,
+        )
+        candidate_integral = torch.clamp(
+            self.integral_error + attitude_error * self.control_dt,
+            min=-self.integral_limit,
+            max=self.integral_limit,
+        )
+        self.integral_error.copy_(candidate_integral)
+        rate_error = reference.target_angular_velocity_b - angular_velocity
+        desired_angular_acceleration = torch.clamp(
+            self.proportional_gain * attitude_error
+            + self.integral_gain * self.integral_error
+            + self.derivative_gain * rate_error,
+            min=-self.command_scale,
+            max=self.command_scale,
+        )
+        self.last_desired_angular_acceleration.copy_(
+            desired_angular_acceleration
+        )
+        self.last_actual_angular_acceleration.copy_(actual_angular_acceleration)
+        frame = torch.cat(
+            (
+                desired_angular_acceleration / self.command_scale,
+                actual_angular_acceleration / self.command_scale,
+                angular_velocity / self.angular_velocity_scale,
+                state.linear_acceleration_n / self.acceleration_scale,
+                state.motor_speed / self.motor_speed_scale,
+                state.servo_angle / self.servo_angle_scale,
+                reference.collective_command * 2.0 - 1.0,
+                previous_action,
+            ),
+            dim=1,
+        )
+        return self.infer(frame, recurrent_state, is_init)
+
+    def action_to_command(
+        self,
+        policy_action: torch.Tensor,
+        external_action: torch.Tensor,
+    ) -> torch.Tensor:
+        if policy_action.shape != (1, 3):
+            raise ValueError("cascade policy action must have shape [1,3]")
+        bounded = policy_action.clamp(-1.0, 1.0)
+        lower = torch.clamp(
+            self.lower_motor_upper_ratio * external_action
+            + self.action_scale[:1] * bounded[:, :1],
+            0.0,
+            1.0,
+        )
+        cyclic_a = self.action_scale[1] * bounded[:, 1:2]
+        cyclic_b = self.action_scale[2] * bounded[:, 2:3]
+        root_three = 3.0**0.5
+        servos = torch.cat(
+            (
+                cyclic_a,
+                -0.5 * cyclic_a + 0.5 * root_three * cyclic_b,
+                -0.5 * cyclic_a - 0.5 * root_three * cyclic_b,
+            ),
+            dim=1,
+        )
+        servos = torch.clamp(servos + self.action_trim[1:], -1.0, 1.0)
+        return torch.cat(
+            (external_action.clamp(0.0, 1.0), lower, servos), dim=1
+        )
+
+    def control_diagnostics(self) -> Mapping[str, torch.Tensor]:
+        return {
+            "controller.desired_angular_acceleration_b": (
+                self.last_desired_angular_acceleration
+            ),
+            "controller.actual_angular_acceleration_b": (
+                self.last_actual_angular_acceleration
+            ),
+            "controller.angular_acceleration_error_b": (
+                self.last_actual_angular_acceleration
+                - self.last_desired_angular_acceleration
+            ),
+            "controller.attitude_pid_integral_error": self.integral_error,
+        }
+
+    def reset(self) -> None:
+        self.history.values.zero_()
+        self.history.index = self.history.capacity - 1
+        self.history.initialized.zero_()
+        self.integral_error.zero_()
+        self.previous_angular_velocity.zero_()
+        self.estimator_initialized.zero_()
+        self.last_desired_angular_acceleration.zero_()
+        self.last_actual_angular_acceleration.zero_()
+
+    def warmup(self, observation: torch.Tensor) -> None:
+        is_init = torch.ones((1, 1), device=observation.device, dtype=torch.bool)
+        for index in range(10):
+            self.infer(
+                observation,
+                None,
+                is_init if index == 0 else torch.zeros_like(is_init),
+            )
+        if observation.device.type == "cuda":
+            torch.cuda.synchronize(observation.device)
+        self.reset()
+
+    def close(self) -> None:
+        return None
+
+    def describe(self) -> Mapping[str, Any]:
+        return {
+            "package_id": self.metadata.package_id,
+            "backend": self.runtime.backend,
+            "controller": "attitude_pid_angular_acceleration_cascade",
+            "input_dim": self.runtime.input_dim,
+            "output_dim": self.runtime.output_dim,
+            "base_observation_dim": 21,
+            "history_mode": "uniform",
+            "history_frames": self.history_frames,
+            "history_stride_steps": self.history_stride_steps,
+            "required_control_hz": self.required_control_hz,
+            "required_simulator_fingerprint": (
+                self.required_simulator_fingerprint
+            ),
+            "outer_loop": {
+                "proportional_gain": self.proportional_gain.tolist(),
+                "integral_gain": self.integral_gain.tolist(),
+                "derivative_gain": self.derivative_gain.tolist(),
+                "integral_limit_rad_s": self.integral_limit.tolist(),
+                "max_angular_acceleration_rad_s2": self.command_scale.tolist(),
+            },
+            "bundle_path": str(self.path),
+        }
+
+    @staticmethod
+    def _mapping(parent: Mapping[str, Any], name: str) -> Mapping[str, Any]:
+        value = parent.get(name)
+        if not isinstance(value, Mapping):
+            raise ValueError(f"cascade contract {name} must be a mapping")
+        return value
+
+    @staticmethod
+    def _positive(parent: Mapping[str, Any], name: str) -> float:
+        value = float(parent[name])
+        if value <= 0:
+            raise ValueError(f"cascade contract {name} must be positive")
+        return value
+
+    @staticmethod
+    def _tensor3(
+        parent: Mapping[str, Any],
+        name: str,
+        device: torch.device,
+        dtype: torch.dtype,
+        *,
+        nonnegative: bool = False,
+    ) -> torch.Tensor:
+        raw = parent.get(name)
+        if not isinstance(raw, (list, tuple)) or len(raw) != 3:
+            raise ValueError(f"cascade contract {name} must have length three")
+        value = torch.tensor(raw, device=device, dtype=dtype)
+        valid = value >= 0 if nonnegative else value > 0
+        if not bool(valid.all()):
+            qualifier = "nonnegative" if nonnegative else "positive"
+            raise ValueError(f"cascade contract {name} must be {qualifier}")
+        return value
+
+    @staticmethod
+    def _quaternion_multiply(
+        left: torch.Tensor, right: torch.Tensor
+    ) -> torch.Tensor:
+        lw, lx, ly, lz = left.unbind(dim=-1)
+        rw, rx, ry, rz = right.unbind(dim=-1)
+        return torch.stack(
+            (
+                lw * rw - lx * rx - ly * ry - lz * rz,
+                lw * rx + lx * rw + ly * rz - lz * ry,
+                lw * ry - lx * rz + ly * rw + lz * rx,
+                lw * rz + lx * ry - ly * rx + lz * rw,
+            ),
+            dim=-1,
+        )
+
+    @classmethod
+    def _attitude_error_rotation_vector(
+        cls, current: torch.Tensor, target: torch.Tensor
+    ) -> torch.Tensor:
+        current = current / current.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        target = target / target.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        conjugate = current.clone()
+        conjugate[..., 1:] = -conjugate[..., 1:]
+        error = cls._quaternion_multiply(conjugate, target)
+        error = error / error.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        error = torch.where(error[..., :1] < 0, -error, error)
+        vector = error[..., 1:]
+        vector_norm = vector.norm(dim=-1, keepdim=True)
+        angle = 2.0 * torch.atan2(
+            vector_norm, error[..., :1].clamp_min(0.0)
+        )
+        scale = torch.where(
+            vector_norm > 1e-8,
+            angle / vector_norm.clamp_min(1e-8),
+            torch.full_like(vector_norm, 2.0),
+        )
+        return vector * scale
+
+
 def load_flight_deploy_package(
     path: Path,
     device: torch.device,
@@ -481,4 +878,13 @@ def load_flight_deploy_package(
 ) -> RealtimeInferencePackage:
     """Default WebUI loader for a verified ``flight_deploy`` bundle."""
 
+    from flight_deploy import DeploymentBundle
+
+    bundle = DeploymentBundle.load(path)
+    contract = bundle.manifest.get("contract")
+    if (
+        isinstance(contract, Mapping)
+        and contract.get("version") == "angular_acceleration_cascade_v1"
+    ):
+        return AngularAccelerationCascadePackage(path, device, dtype)
     return FlightDeployInferencePackage(path, device, dtype)

@@ -173,6 +173,69 @@ class ControllerTests(unittest.TestCase):
             output.command[:, 0], torch.full((2,), 0.7, dtype=torch.float64)
         )
 
+    def test_three_axis_deployment_model_owns_coaxial_allocation(self) -> None:
+        class AllocatedModel:
+            def forward_control(
+                model_self,
+                state,
+                reference,
+                previous_action,
+                recurrent_state,
+                is_init,
+            ):
+                del state, reference, recurrent_state, is_init
+                self.assertEqual(previous_action.shape, (2, 3))
+                return torch.tensor(
+                    [[0.25, 0.5, -0.25], [0.25, 0.5, -0.25]],
+                    dtype=torch.float64,
+                ), None
+
+            def action_to_command(model_self, action, collective):
+                del model_self
+                lower = 0.95 * collective + 0.1 * action[:, :1]
+                servos = torch.cat(
+                    (action[:, 1:2], action[:, 2:3], -action[:, 1:].sum(1, keepdim=True)),
+                    dim=1,
+                )
+                return torch.cat((collective, lower, servos), dim=1)
+
+        controller = create_controller(
+            {
+                "type": "neural",
+                "params": {
+                    "output_mode": "coaxial_differential_cyclic_3"
+                },
+            },
+            self.context,
+            neural_model=AllocatedModel(),
+        )
+        trim_controller = create_controller(
+            {"type": "pid", "params": {"collective_mode": "hover"}},
+            self.context,
+        )
+        output = controller.step(
+            self.state_at_trim(trim_controller),
+            ControllerReference(
+                **{
+                    **self.reference().__dict__,
+                    "collective_command": torch.full(
+                        (2, 1), 0.7, dtype=torch.float64
+                    ),
+                }
+            ),
+        )
+        self.assertEqual(output.command.shape, (2, 5))
+        torch.testing.assert_close(
+            output.command[:, 2:].sum(1), torch.zeros(2, dtype=torch.float64)
+        )
+        torch.testing.assert_close(
+            controller.previous_action,
+            torch.tensor(
+                [[0.25, 0.5, -0.25], [0.25, 0.5, -0.25]],
+                dtype=torch.float64,
+            ),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

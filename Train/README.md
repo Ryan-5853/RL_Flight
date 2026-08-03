@@ -16,7 +16,7 @@ rollout、PPO 更新以及 MLP-SAC 的 GPU 经验回放。reward、动作变换�
 
 - SimEnv `create / observe / advance / masked reset` 适配；
 - 自稳模式 VirtualPilot：高度真值增量式 PI 油门、三轴随机摇杆、一阶惯性和 masked reset；
-- 21 维观测、4 维策略动作，以及“外部上桨油门＋策略动作”到 5 维 SimEnv 命令的合成；
+- 版本化 21/22 维观测、4 维策略动作，以及“外部上桨油门＋策略动作”到 5 维 SimEnv 命令的合成；
 - TorchRL `GRUModule`、`ProbabilisticActor`、`ValueOperator`；
 - GPU 驻留的 `[B,T]` rollout；
 - TorchRL `GAE`、`ClipPPOLoss`、`SACLoss`、双 Q 目标网络和 GPU replay；
@@ -256,6 +256,18 @@ flight-train run --config configs/experiments/mlp_ppo_smoke.json \
 上桨油门 1、上一策略动作 4。角速度除以任务终止阈值，加速度除以
 `9.80665 m/s²`，电机转速除以 `1800 rad/s`，舵角除以 `π/2`。该版本 profile 为
 `attitude_self_stabilize_21d_v3`；v2 checkpoint 的输入语义不同，不能续训或评测。
+
+级联角加速度内环使用 `angular_acceleration_inner_loop_22d_v1`：PID 外环从目标姿态、
+当前姿态和角速度生成三轴期望角加速度；策略输入不再包含目标姿态或姿态误差，而是包含
+期望/实际角加速度。该契约改变了输入维度和语义，不能加载 21 维姿态直控 checkpoint。
+可直接运行的配置为
+`configs/experiments/mlp_sac_pid_angular_acceleration_tracking_v1.yaml`。
+
+分配约束版本使用 `angular_acceleration_allocated_inner_loop_21d_v2` 和 3 维策略动作：
+下旋翼差速、cyclic-a、cyclic-b。下旋翼以 `upper_motor * 0.947558738884` 作为反扭矩
+前馈基准，策略只学习差速残差；两个 cyclic 分量通过固定的 120 度控制分配矩阵映射为
+三个和严格为零的舵面命令，因此 yaw 不能借用舵面共模。对应实验配置为
+`configs/experiments/mlp_sac_pid_angular_acceleration_tracking_v3.yaml`。
 
 `control_contract.observation_history` 支持两种 MLP 历史输入。`uniform` 模式
 按固定控制步间隔抽取 21 维整帧，并按 oldest→current 展平。更适合执行器低通

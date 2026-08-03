@@ -1,0 +1,40 @@
+schema_version: 1
+
+simulator_config: ../../SimEnv/configs/example.yaml
+controller_config: ../../Controller/configs/lqr_identification_nominal.yaml
+
+run:
+  seed: 20260803
+  device: cpu
+  dtype: float32
+  parallel_count: 256
+  output_directory: ../datasets/lqr_zero_attitude_yaw_rate_sensor_v1
+
+observation:
+  # Gyro and motor speed use SimEnv noise, bias, sampling and delay. SimEnv has
+  # no attitude estimator yet, so attitude remains an explicitly marked truth
+  # tilt proxy rather than pretending it is a deployable measurement.
+  measurement_mode: simulated_sensors
+
+sampling:
+  parameter_groups: 4096
+  initial_conditions_per_group: 16
+  episode_duration_s: 4.0
+  log10_effectiveness_range: [-1.0, 1.0]
+
+initial_state:
+  minimum_tilt_rad: 0.0523599
+  maximum_tilt_rad: 0.2617994
+  maximum_angular_rate_rad_s: [0.3, 0.3, 0.3]
+
+convergence:
+  maximum_roll_pitch_error_rad: 0.0349066
+  maximum_angular_rate_rad_s: 0.10
+  hold_s: 0.5
+  safety_tilt_rad: 1.0471976
+  safety_angular_rate_rad_s: 8.0
+
+window:
+  length_s: 1.0
+  stride_s: 1.0
+  split_fractions: [0.70, 0.15, 0.15]

@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-from .rewards import AttitudeRewardCalculator
+from .rewards import (
+    AngularAccelerationTrackingRewardCalculator,
+    AttitudeRewardCalculator,
+)
 from .commands import VirtualPilotCommandSource
 
 
@@ -11,6 +14,9 @@ class ComponentRegistry:
 
     _reward_types = {
         "flight_train.rewards.attitude:AttitudeRewardCalculator": AttitudeRewardCalculator,
+        "flight_train.rewards.angular_acceleration:AngularAccelerationTrackingRewardCalculator": (
+            AngularAccelerationTrackingRewardCalculator
+        ),
     }
     _command_source_types = {
         "flight_train.commands:VirtualPilotCommandSource": VirtualPilotCommandSource,

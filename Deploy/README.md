@@ -10,6 +10,13 @@ bundle，并提供一个不依赖 TorchRL/TensorDict 的低延迟推理组件。
 - 任意 MLP 隐藏层数量和规模，结构从权重 shape 推导，不写死 `256×256`；
 - 单帧或历史拼接输入，输入宽度从 actor 权重和 checkpoint 控制契约交叉确定。
 
+`angular_acceleration_allocated_inner_loop_21d_v2` checkpoint 会由更高优先级的
+`flight-train-angular-acceleration-cascade-v1` 专用适配器处理。除了确定性 MLP，
+bundle contract 还会固化姿态 PID、角加速度估计、21 维字段表、61 帧历史、500 Hz
+时基以及共轴差速/cyclic 的 3→5 动作分配。WebUI 可以据此重建完整级联控制器，
+不需要读取 Train 配置或训练 checkpoint。专用 contract 同时携带规范化 SimEnv
+兼容指纹，用于拒绝动力学、执行器或传感器语义不匹配的 WebUI session。
+
 核心框架并不把 MLP 当作唯一网络。新的训练框架、Transformer、CNN、GRU 或其他
 有状态网络通过 `CheckpointAdapter` 注册；bundle schema 已预留显式 state
 input/output。首版 TorchScript 后端只接受无状态策略，遇到尚未支持的有状态网络会
@@ -45,6 +52,10 @@ flight-deploy export \
   /path/to/checkpoints/best_total_evaluation.pt \
   artifacts/attitude_v4_best_total
 ```
+
+角加速度级联模型使用同一个命令，适配器会根据 checkpoint 契约自动选择。也可以用
+`--adapter flight-train-angular-acceleration-cascade-v1` 强制要求专用契约；checkpoint
+不匹配时导出会直接失败。
 
 产物结构：
 

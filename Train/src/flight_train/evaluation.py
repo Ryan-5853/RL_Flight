@@ -491,13 +491,14 @@ def run_fixed_evaluation(
     # 先用一个短生命周期环境确定观测/动作契约；每个科目再创建全新环境，
     # 防止前一科目的动力学、传感器历史或高度 PI 状态泄漏。
     observation_dim = config.control_contract.observation_dim
+    action_dim = config.control_contract.action_dim
     model = (
         build_sac_actor_critic(
-            observation_dim, 4, config.model, device, config.torch_dtype
+            observation_dim, action_dim, config.model, device, config.torch_dtype
         )
         if config.algorithm_name == "sac"
         else build_actor_critic(
-            observation_dim, 4, config.model, device, config.torch_dtype
+            observation_dim, action_dim, config.model, device, config.torch_dtype
         )
     )
     model.actor.load_state_dict(state["actor"], strict=True)
@@ -710,6 +711,14 @@ def _repeat_packed_scenario_initial_state(
         dtype=torch.bool,
         device=env.spec.device,
     )
+    if env.outer_loop is not None:
+        attitude, angular_velocity = env._truth_attitude_and_rate()
+        env.previous_truth_angular_velocity.copy_(angular_velocity)
+        env.actual_angular_acceleration.zero_()
+        env.outer_loop.reset(initial_mask)
+        env._update_outer_loop_command(
+            attitude, angular_velocity, initial_mask
+        )
     base_observation, _attitude, _rate, _height = (
         env._base_observation()
     )
@@ -803,7 +812,7 @@ def _run_packed_scenarios(
         "action": torch.empty(
             maximum_steps,
             env.spec.parallel_count,
-            4,
+            env.spec.action_dim,
             dtype=env.spec.dtype,
             device=env.spec.device,
         ),
@@ -834,7 +843,38 @@ def _run_packed_scenarios(
             dtype=env.spec.dtype,
             device=env.spec.device,
         ),
+        "lower_motor_differential_pwm": torch.empty(
+            maximum_steps,
+            env.spec.parallel_count,
+            dtype=env.spec.dtype,
+            device=env.spec.device,
+        ),
+        "servo_common_command": torch.empty(
+            maximum_steps,
+            env.spec.parallel_count,
+            dtype=env.spec.dtype,
+            device=env.spec.device,
+        ),
+        "servo_cyclic_command_norm": torch.empty(
+            maximum_steps,
+            env.spec.parallel_count,
+            dtype=env.spec.dtype,
+            device=env.spec.device,
+        ),
     }
+    if env.outer_loop is not None:
+        for name in (
+            "desired_angular_acceleration_b",
+            "actual_angular_acceleration_b",
+            "angular_acceleration_error_b",
+        ):
+            packed_trace[name] = torch.empty(
+                maximum_steps,
+                env.spec.parallel_count,
+                3,
+                dtype=env.spec.dtype,
+                device=env.spec.device,
+            )
 
     horizon_steps = torch.tensor(
         [
@@ -884,7 +924,7 @@ def _run_packed_scenarios(
             else:
                 group_action = torch.zeros(
                     group_size,
-                    4,
+                    env.spec.action_dim,
                     device=env.spec.device,
                     dtype=env.spec.dtype,
                 )
@@ -917,6 +957,27 @@ def _run_packed_scenarios(
         packed_trace["yaw_rate_error_rad_s"][step].copy_(
             transition[("info", "yaw_rate_error_rad_s")].squeeze(-1)
         )
+        simulator_command = transition[("info", "action.command")]
+        servo_command = simulator_command[:, 2:5]
+        servo_common = servo_command.mean(dim=-1)
+        packed_trace["lower_motor_differential_pwm"][step].copy_(
+            simulator_command[:, 1]
+            - env.control_contract_config.lower_motor_upper_ratio
+            * simulator_command[:, 0]
+        )
+        packed_trace["servo_common_command"][step].copy_(servo_common)
+        packed_trace["servo_cyclic_command_norm"][step].copy_(
+            torch.linalg.vector_norm(
+                servo_command - servo_common[:, None], dim=-1
+            )
+        )
+        if env.outer_loop is not None:
+            for name in (
+                "desired_angular_acceleration_b",
+                "actual_angular_acceleration_b",
+                "angular_acceleration_error_b",
+            ):
+                packed_trace[name][step].copy_(transition[("info", name)])
         alive = sample_alive
         observation = transition["observation"]
         is_init = transition["is_init"]
@@ -1029,9 +1090,17 @@ def _run_scenario(
             "time_s", "alive", "action", "position_n", "velocity_n",
             "attitude_q_wb", "target_position_n", "target_velocity_n",
             "target_attitude_q_wb", "target_euler_rad", "actual_euler_rad",
-            "yaw_rate_error_rad_s",
+            "yaw_rate_error_rad_s", "lower_motor_differential_pwm",
+            "servo_common_command", "servo_cyclic_command_norm",
         )
     }
+    if env.outer_loop is not None:
+        for name in (
+            "desired_angular_acceleration_b",
+            "actual_angular_acceleration_b",
+            "angular_acceleration_error_b",
+        ):
+            traces[name] = []
 
     for step in range(steps):
         time_s = torch.full((batch,), step / env.spec.control_hz, device=device, dtype=dtype)
@@ -1056,6 +1125,9 @@ def _run_scenario(
         )
         sample_alive = alive & ~done
         actual_euler = _quaternion_to_euler(truth["attitude_q_wb"])
+        simulator_command = transition[("info", "action.command")]
+        servo_command = simulator_command[:, 2:5]
+        servo_common = servo_command.mean(dim=-1)
         values = {
             "time_s": time_s,
             "alive": sample_alive,
@@ -1071,7 +1143,23 @@ def _run_scenario(
             "yaw_rate_error_rad_s": transition[
                 ("info", "yaw_rate_error_rad_s")
             ].squeeze(-1),
+            "lower_motor_differential_pwm": (
+                simulator_command[:, 1]
+                - env.control_contract_config.lower_motor_upper_ratio
+                * simulator_command[:, 0]
+            ),
+            "servo_common_command": servo_common,
+            "servo_cyclic_command_norm": torch.linalg.vector_norm(
+                servo_command - servo_common[:, None], dim=-1
+            ),
         }
+        if env.outer_loop is not None:
+            for name in (
+                "desired_angular_acceleration_b",
+                "actual_angular_acceleration_b",
+                "angular_acceleration_error_b",
+            ):
+                values[name] = transition[("info", name)]
         for name, value in values.items():
             traces[name].append(value.detach().clone())
         alive = sample_alive
@@ -1136,13 +1224,23 @@ def _score_trajectory(
     velocity_error = torch.linalg.vector_norm(
         trajectory["velocity_n"] - trajectory["target_velocity_n"], dim=-1
     )
-    action_norm = torch.linalg.vector_norm(trajectory["action"], dim=-1) / math.sqrt(4.0)
+    action_dim = trajectory["action"].shape[-1]
+    action_norm = (
+        torch.linalg.vector_norm(trajectory["action"], dim=-1)
+        / math.sqrt(float(action_dim))
+    )
     saturation = (trajectory["action"].abs() >= 0.95).to(torch.float32).mean(dim=-1)
     action_delta = torch.zeros_like(action_norm)
     if action_delta.shape[0] > 1:
         action_delta[1:] = torch.linalg.vector_norm(
             trajectory["action"][1:] - trajectory["action"][:-1], dim=-1
-        ) / math.sqrt(4.0)
+        ) / math.sqrt(float(action_dim))
+    control_quality = _control_quality_metrics(
+        trajectory,
+        alive,
+        roll_pitch_error_rad,
+        control_hz,
+    )
     attitude_rmse = _masked_rmse(attitude_error_deg, alive)
     attitude_p95 = _masked_quantile(attitude_error_deg, alive, 0.95)
     roll_pitch_rmse = _masked_rmse(roll_pitch_error_deg, alive)
@@ -1251,8 +1349,34 @@ def _score_trajectory(
         "action_peak_abs": action_peak,
         "action_delta_rms": action_delta_rms,
         "action_saturation_fraction": saturation_fraction,
+        **control_quality,
         "response_time_s": response_s,
     }
+    for source, metric in (
+        (
+            "lower_motor_differential_pwm",
+            "lower_motor_differential_pwm_rms",
+        ),
+        ("servo_common_command", "servo_common_command_rms"),
+        ("servo_cyclic_command_norm", "servo_cyclic_command_rms"),
+    ):
+        value = trajectory.get(source)
+        if value is not None:
+            raw[metric] = _masked_rmse(value, alive)
+    angular_acceleration_error = trajectory.get(
+        "angular_acceleration_error_b"
+    )
+    if angular_acceleration_error is not None:
+        vector_error = torch.linalg.vector_norm(
+            angular_acceleration_error, dim=-1
+        )
+        raw["angular_acceleration_vector_rmse_rad_s2"] = _masked_rmse(
+            vector_error, alive
+        )
+        for axis_index, axis in enumerate("xyz"):
+            raw[f"angular_acceleration_{axis}_rmse_rad_s2"] = _masked_rmse(
+                angular_acceleration_error[..., axis_index], alive
+            )
     scores = {
         "survival": survival_score,
         "tracking": tracking_score,
@@ -1266,6 +1390,116 @@ def _score_trajectory(
         "metrics": {name: _summarize(value) for name, value in raw.items()},
         "scores": {name: _summarize(value) for name, value in scores.items()},
         "total_score": float(total_score.mean().item()),
+    }
+
+
+def _control_quality_metrics(
+    trajectory: Mapping[str, torch.Tensor],
+    alive: torch.Tensor,
+    roll_pitch_error_rad: torch.Tensor,
+    control_hz: int,
+) -> dict[str, torch.Tensor]:
+    """Measure deterministic control motion and the low-frequency RP limit cycle.
+
+    Total variation uses the same motor/common/cyclic decomposition as the
+    movement reward.  Dividing by live duration makes results comparable across
+    scenarios and early terminations.  The frequency-domain metric reconstructs
+    only the 0.5--2 Hz roll/pitch error before taking a vector RMS.
+    """
+
+    action = trajectory["action"]
+    batch_size = action.shape[1]
+    dtype = action.dtype
+    zero = torch.zeros(batch_size, dtype=dtype)
+    if action.shape[0] <= 1:
+        return {
+            "motor_total_variation_per_s": zero.clone(),
+            "servo_common_total_variation_per_s": zero.clone(),
+            "servo_cyclic_total_variation_per_s": zero.clone(),
+            "actuator_energy_proxy_per_s": zero.clone(),
+            "motor_effort_mean": zero.clone(),
+            "servo_common_effort_mean": zero.clone(),
+            "servo_cyclic_effort_mean": zero.clone(),
+            "actuator_effort_proxy_mean": zero.clone(),
+            "roll_pitch_error_band_0_5_2_hz_rms_deg": zero.clone(),
+        }
+
+    delta = action[1:] - action[:-1]
+    transition_alive = alive[1:] & alive[:-1]
+    live_duration_s = transition_alive.sum(dim=0).to(dtype) / float(control_hz)
+
+    def variation_per_s(value: torch.Tensor) -> torch.Tensor:
+        total = torch.where(
+            transition_alive,
+            value,
+            torch.zeros_like(value),
+        ).sum(dim=0)
+        return torch.where(
+            live_duration_s > 0,
+            total / live_duration_s.clamp_min(1.0 / float(control_hz)),
+            torch.zeros_like(total),
+        )
+
+    motor_tv = variation_per_s(delta[..., 0].abs())
+    servo_delta = delta[..., 1:4]
+    servo_common_delta = servo_delta.mean(dim=-1)
+    servo_cyclic_delta = servo_delta - servo_common_delta.unsqueeze(-1)
+    common_tv = variation_per_s(servo_common_delta.abs())
+    cyclic_tv = variation_per_s(servo_cyclic_delta.abs().sum(dim=-1))
+
+    live_count = alive.sum(dim=0).to(dtype).clamp_min(1.0)
+
+    def live_mean(value: torch.Tensor) -> torch.Tensor:
+        total = torch.where(alive, value, torch.zeros_like(value)).sum(dim=0)
+        return total / live_count
+
+    motor_effort = live_mean(action[..., 0].square())
+    servo_action = action[..., 1:4]
+    servo_common = servo_action.mean(dim=-1)
+    servo_cyclic = servo_action - servo_common.unsqueeze(-1)
+    common_effort = live_mean(servo_common.square())
+    cyclic_effort = live_mean(servo_cyclic.square().sum(dim=-1))
+
+    band_rms = torch.zeros(batch_size, dtype=dtype)
+    warmup_steps = round(2.0 * control_hz)
+    for batch_index in range(batch_size):
+        live_indices = torch.nonzero(
+            alive[:, batch_index], as_tuple=False
+        ).flatten()
+        if live_indices.numel() <= warmup_steps + 1:
+            continue
+        # Episodes are alive from reset until their first termination, so the
+        # live prefix is contiguous.  Skip the reset transient before the FFT.
+        sample_count = int(live_indices[-1].item()) + 1
+        signal = roll_pitch_error_rad[
+            warmup_steps:sample_count, batch_index, :
+        ].to(torch.float64)
+        if signal.shape[0] < 2:
+            continue
+        signal = signal - signal.mean(dim=0, keepdim=True)
+        spectrum = torch.fft.rfft(signal, dim=0)
+        frequency_hz = torch.fft.rfftfreq(
+            signal.shape[0], d=1.0 / float(control_hz)
+        )
+        keep = (frequency_hz >= 0.5) & (frequency_hz <= 2.0)
+        spectrum[~keep] = 0
+        filtered = torch.fft.irfft(spectrum, n=signal.shape[0], dim=0)
+        band_rms[batch_index] = torch.rad2deg(
+            filtered.square().sum(dim=-1).mean().sqrt()
+        ).to(dtype)
+
+    return {
+        "motor_total_variation_per_s": motor_tv,
+        "servo_common_total_variation_per_s": common_tv,
+        "servo_cyclic_total_variation_per_s": cyclic_tv,
+        "actuator_energy_proxy_per_s": motor_tv + common_tv + cyclic_tv,
+        "motor_effort_mean": motor_effort,
+        "servo_common_effort_mean": common_effort,
+        "servo_cyclic_effort_mean": cyclic_effort,
+        "actuator_effort_proxy_mean": (
+            motor_effort + common_effort + cyclic_effort
+        ),
+        "roll_pitch_error_band_0_5_2_hz_rms_deg": band_rms,
     }
 
 

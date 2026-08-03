@@ -18,7 +18,7 @@ python -m flight_train run --config configs/experiments/gru_ppo.yaml
 - 仿真接口：`SimulationEnvironment.create / observe / advance`；批量维始终为第一维，控制周期为一次 `advance`，单实例故障不得影响其他实例。
 - 固定时基：物理仿真、控制与网络推理统一为 500 Hz；一次 `advance` 对应一个
   2 ms 仿真/控制步，不存在隐藏物理子步。
-- 当前单帧策略输入：目标相对当前姿态四元数 4、角速度 3、加速度 3、电机转速 2、舵机实际角 3、目标偏航角速度 1、当前上桨油门 1、上次策略动作 4，共 21 维；MLP 可等间隔堆叠整帧，也可拼接当前完整帧、连续动作历史和稀疏物理响应历史。
+- 姿态直控实验的单帧策略输入为 21 维；级联实验另有版本化的 22 维内环输入：期望角加速度 3、上一控制周期实际角加速度 3、角速度 3、线加速度 3、电机转速 2、舵机实际角 3、当前上桨油门 1、上次策略动作 4。两者都可按控制契约生成 MLP 历史输入。
 - 当前策略输出：下桨电机及三个舵机，共 4 维标准动作；SimEnv 仍接收由飞手油门和策略动作合成的 5 维执行器命令。
 
 四维标准动作统一解释为残差：
@@ -31,7 +31,7 @@ physical_policy_command = trim_command + residual_scale * policy_action
 fingerprint 和部署接口，不能隐藏在环境源码中；改变任一数值都必须拒绝旧
 checkpoint 精确续训。
 
-> 21 维输入是首版实验约定，不是写死在模型中的常量。最终维度必须由观测配置和环境元数据推导并在启动时校验。
+> 21/22 维输入均是版本化实验约定，不是写死在模型中的常量。最终维度必须由观测配置和环境元数据推导并在启动时校验。
 
 ## 2. 设计原则
 
@@ -231,7 +231,7 @@ class BatchedControlEnv(Protocol):
 3. 调用 `SimulationEnvironment.advance(command)` 一次。
 4. 按任务配置分别读取 `truth`、`sensor`；不得通过 `info` 偷渡未声明真值给 student。
 5. 由 `Task` 计算结束标志，生成奖励上下文后调用注入的 `RewardCalculator`。
-6. VirtualPilot 生成下一周期命令，保存 `previous_policy_action`，构造下一帧 21 维基础观测，再按控制契约生成策略历史输入。
+6. VirtualPilot 生成下一周期命令；级联实验随后由姿态 PID 更新下一拍期望角加速度。适配器保存 `previous_policy_action`，按所选 21/22 维契约构造下一帧基础观测，再生成策略历史输入。
 
 当前仿真实现已提供 `reset(reset_mask, config_path)`，适配器应直接使用该 GPU bool mask 独立重置完成、截断或失效的实例。重置属于稀疏 episode 边界；控制步热路径中的观测、动作、reward、RNN state 和 rollout 不得为判断单实例状态而转到 CPU。
 
@@ -1027,7 +1027,7 @@ Teacher、student 和蒸馏属于不同 run，不在一个运行目录中覆盖�
 
 - 配置加载/schema、运行目录、manifest 和 seed 管理；
 - 训练入口/组件注册、两级随机化 schema、StaticRandomizer 和 SimEnv 动态规格注入；
-- 仿真适配器、姿态跟踪任务、可注入 RewardCalculator、21 维 student 观测和动作变换；
+- 仿真适配器、姿态跟踪任务、可注入 RewardCalculator、版本化 21/22 维 student 观测和动作变换；
 - MLP/GRU policy、recurrent PPO、MLP-SAC GPU replay、同步批次 episode；
 - 控制级/物理级完整记录、确定性评估和 checkpoint；
 - shape、失效隔离、RNN reset、短跑复现测试。

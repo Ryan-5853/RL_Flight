@@ -1,0 +1,42 @@
+schema_version: 1
+
+simulator_config: ../../SimEnv/configs/example.yaml
+controller_config: ../../Controller/configs/lqr_identification_nominal.yaml
+
+run:
+  seed: 20260804
+  device: cuda:0
+  dtype: float32
+  parallel_count: 2048
+  output_directory: ../datasets/lqr_wide_adaptation_v1
+
+observation:
+  measurement_mode: simulated_sensors
+
+sampling:
+  # Raw physical scales span 10^-2 through 10^2. The deployment target is the
+  # 11-dimensional identifiable LQR latent reconstructed from these scales.
+  parameter_groups: 8192
+  initial_conditions_per_group: 4
+  episode_duration_s: 1.0
+  log10_effectiveness_range: [-2.0, 2.0]
+
+initial_state:
+  minimum_tilt_rad: 0.0523599
+  maximum_tilt_rad: 0.2617994
+  maximum_angular_rate_rad_s: [0.3, 0.3, 0.3]
+
+convergence:
+  # Final convergence is recorded but does not gate adaptation/ samples. A
+  # prefix enters adaptation only if it stays below the safety limits for 1 s.
+  maximum_roll_pitch_error_rad: 0.0349066
+  maximum_angular_rate_rad_s: 0.10
+  hold_s: 0.5
+  safety_tilt_rad: 1.0471976
+  safety_angular_rate_rad_s: 8.0
+
+window:
+  length_s: 1.0
+  stride_s: 1.0
+  maximum_start_s: 0.0
+  split_fractions: [0.70, 0.15, 0.15]

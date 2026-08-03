@@ -24,10 +24,21 @@ class NeuralNetworkController(FlightController):
         self.model = model
         self.maximum_angular_rate = float(self.config.get("maximum_angular_rate_rad_s", 20.0))
         self.output_mode = str(self.config.get("output_mode", "residual_4"))
-        if self.output_mode not in {"residual_4", "physical_5"}:
-            raise ValueError("neural output_mode must be residual_4 or physical_5")
+        action_dimensions = {
+            "residual_4": 4,
+            "physical_5": 5,
+            "coaxial_differential_cyclic_3": 3,
+        }
+        if self.output_mode not in action_dimensions:
+            raise ValueError(
+                "neural output_mode must be residual_4, physical_5, or "
+                "coaxial_differential_cyclic_3"
+            )
         self.previous_action = torch.zeros(
-            context.batch_size, 4, device=context.device, dtype=context.dtype
+            context.batch_size,
+            action_dimensions[self.output_mode],
+            device=context.device,
+            dtype=context.dtype,
         )
         self.is_init = torch.ones(
             context.batch_size, 1, device=context.device, dtype=torch.bool
@@ -97,7 +108,7 @@ class NeuralNetworkController(FlightController):
                 (action[:, :2].clamp(0.0, 1.0), action[:, 2:].clamp(-1.0, 1.0)),
                 dim=1,
             )
-        else:
+        elif self.output_mode == "residual_4":
             if action.shape != (self.context.batch_size, 4):
                 raise ValueError("residual_4 neural controller must output [B,4]")
             command = torch.cat(
@@ -108,18 +119,24 @@ class NeuralNetworkController(FlightController):
                 ),
                 dim=1,
             )
+        else:
+            raise ValueError(
+                "coaxial_differential_cyclic_3 requires a deployment model "
+                "with action_to_command"
+            )
         command = torch.where(
             active[:, None],
             command,
             command,
         )
-        if self.output_mode == "residual_4":
+        if self.output_mode in {
+            "residual_4",
+            "coaxial_differential_cyclic_3",
+        }:
             self.previous_action.copy_(
                 torch.where(active[:, None], action, self.previous_action)
             )
-        return ControllerOutput.create(
-            command,
-            {
+        diagnostics = {
                 "controller.mode_code": torch.full(
                     (self.context.batch_size,),
                     4.0,
@@ -128,5 +145,8 @@ class NeuralNetworkController(FlightController):
                 ),
                 "controller.policy_action": action,
                 "controller.command": command,
-            },
-        )
+            }
+        control_diagnostics = getattr(self.model, "control_diagnostics", None)
+        if control_diagnostics is not None:
+            diagnostics.update(dict(control_diagnostics()))
+        return ControllerOutput.create(command, diagnostics)

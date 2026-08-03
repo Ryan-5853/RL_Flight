@@ -1,0 +1,126 @@
+{
+  "schema_version": 1,
+  "created_utc": "2026-08-03T03:33:13.805003+00:00",
+  "adapter": "flight-train-mlp-v1",
+  "source": {
+    "checkpoint_sha256": "c74b026b02560e34e2c1712383e8e2d7507d1f8a41ba890e2064a031ad89df64",
+    "checkpoint_checksum_verified": true,
+    "checkpoint_size_bytes": 5498015215,
+    "checkpoint_schema_version": 5,
+    "algorithm": "sac",
+    "run_id": "96715085-3c20-4460-b424-27283410e3c6",
+    "global_control_steps": 48234496
+  },
+  "interface": {
+    "input": {
+      "name": "observation",
+      "shape": [
+        "batch",
+        1281
+      ],
+      "dtype": "float32"
+    },
+    "output": {
+      "name": "policy_action",
+      "shape": [
+        "batch",
+        4
+      ],
+      "dtype": "float32"
+    },
+    "stateful": false,
+    "state_inputs": [],
+    "state_outputs": []
+  },
+  "architecture": {
+    "family": "feedforward_mlp",
+    "dimensions": [
+      1281,
+      256,
+      256,
+      4
+    ],
+    "hidden_activation": "silu",
+    "output_activation": "tanh",
+    "source_distribution_head_removed": true
+  },
+  "contract": {
+    "version": "self_stabilize_v1",
+    "observation_profile": "attitude_self_stabilize_21d_v3",
+    "observation_history": {
+      "mode": "uniform",
+      "frames": 61,
+      "stride_steps": 1
+    },
+    "action_transform": {
+      "type": "residual_around_trim",
+      "trim_command": [
+        0.53523,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "residual_scale": [
+        0.3,
+        1.0,
+        1.0,
+        1.0
+      ]
+    },
+    "policy_action": {
+      "fields": [
+        "lower_motor",
+        "servo_1",
+        "servo_2",
+        "servo_3"
+      ]
+    },
+    "external_action": {
+      "fields": [
+        "upper_motor"
+      ]
+    },
+    "simulator_command": {
+      "fields": [
+        "upper_motor",
+        "lower_motor",
+        "servo_1",
+        "servo_2",
+        "servo_3"
+      ]
+    },
+    "input_dim": 1281,
+    "output_dim": 4,
+    "normalization": {
+      "angular_velocity_rad_s": 8.0,
+      "acceleration_m_s2": 9.80665,
+      "motor_speed_rad_s": 1800.0,
+      "servo_angle_rad": 1.5707963267948966,
+      "desired_yaw_rate_rad_s": 0.35,
+      "upper_throttle": "2*x-1"
+    }
+  },
+  "artifacts": {
+    "model.pt2": {
+      "kind": "torch_export",
+      "sha256": "dab8199d8e6e594363c40f9164915731ab5e3b274b74a24c0c991cfda95d958a",
+      "size_bytes": 1608745
+    },
+    "model.ts": {
+      "kind": "torchscript",
+      "sha256": "5802137df8e6853d7ff4c29f5dededd31ceb5a7c8c39684de82ccd2b8afebc96",
+      "size_bytes": 1584181,
+      "conversion_max_abs_error": 0.0
+    },
+    "weights.pt": {
+      "kind": "pytorch_state_dict",
+      "sha256": "17edf8ea2031924abb2b5018e8cd635f3793ee77bcb3010dba83e21601fc25bf",
+      "size_bytes": 1582869
+    },
+    "golden_vectors.pt": {
+      "kind": "golden_vectors",
+      "sha256": "4d1506d6c7bdf244445a03b488db8dac9b893b6460eef3be56259cb0080fffbc",
+      "size_bytes": 166493
+    }
+  }
+}

@@ -49,6 +49,27 @@ def relative_quaternion(current: torch.Tensor, target: torch.Tensor) -> torch.Te
     return normalize_quaternion(quaternion_multiply(target, conjugate))
 
 
+def attitude_error_rotation_vector(
+    current: torch.Tensor, target: torch.Tensor, eps: float = 1e-8
+) -> torch.Tensor:
+    """Return the shortest current-to-target rotation vector in body coordinates."""
+
+    current = normalize_quaternion(current)
+    target = normalize_quaternion(target)
+    conjugate = current.clone()
+    conjugate[..., 1:] = -conjugate[..., 1:]
+    error = normalize_quaternion(quaternion_multiply(conjugate, target))
+    vector = error[..., 1:]
+    vector_norm = vector.norm(dim=-1, keepdim=True)
+    angle = 2.0 * torch.atan2(vector_norm, error[..., :1].clamp_min(0.0))
+    scale = torch.where(
+        vector_norm > eps,
+        angle / vector_norm.clamp_min(eps),
+        torch.full_like(vector_norm, 2.0),
+    )
+    return vector * scale
+
+
 def euler_to_quaternion(roll: torch.Tensor, pitch: torch.Tensor, yaw: torch.Tensor) -> torch.Tensor:
     """将同批次的滚转、俯仰、偏航角转换为 Hamilton 四元数 ``[w,x,y,z]``。"""
 

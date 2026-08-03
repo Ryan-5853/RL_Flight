@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rl-flight-identification"
+version = "0.1.0"
+description = "Closed-loop LQR system-identification dataset experiments"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "torch>=2.2,<3.0",
+    "PyYAML>=6.0,<7.0",
+]
+
+[project.scripts]
+flight-identification = "flight_identification.cli:main"
+flight-identification-train = "flight_identification.training:main"
+flight-identification-control-eval = "flight_identification.control_evaluation:main"
+flight-identification-ensemble = "flight_identification.ensemble:main"
+flight-identification-ensemble-control-eval = "flight_identification.ensemble_control_evaluation:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

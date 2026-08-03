@@ -4,7 +4,12 @@ import unittest
 
 import torch
 
-from flight_deploy.adapters import AdapterRegistry, FlightTrainMLPAdapter
+from flight_deploy.adapters import (
+    AdapterRegistry,
+    FlightTrainAngularAccelerationCascadeAdapter,
+    FlightTrainMLPAdapter,
+    default_registry,
+)
 from flight_deploy.errors import UnsupportedCheckpointError
 
 
@@ -135,3 +140,79 @@ class FlightTrainAdapterTests(unittest.TestCase):
         self.assertEqual(registry.names(), ("flight-train-mlp-v1",))
         with self.assertRaises(UnsupportedCheckpointError):
             registry.select({"unknown": True})
+
+    def test_allocated_angular_acceleration_uses_dedicated_adapter(self) -> None:
+        checkpoint = flight_checkpoint((63, 16, 6), output_dim=3)
+        checkpoint["config"]["task"] = {
+            "outer_loop": {
+                "type": "attitude_pid",
+                "proportional_gain": [18.0, 18.0, 8.0],
+                "integral_gain": [1.5, 1.5, 0.75],
+                "derivative_gain": [7.0, 7.0, 4.0],
+                "integral_limit_rad_s": [0.15, 0.15, 0.2],
+                "max_angular_acceleration_rad_s2": [6.0, 6.0, 3.0],
+            },
+            "termination": {"max_angular_rate_rad_s": 6.0},
+        }
+        contract = checkpoint["config"]["control_contract"]
+        contract.update(
+            {
+                "observation_profile": (
+                    "angular_acceleration_allocated_inner_loop_21d_v2"
+                ),
+                "observation_history": {
+                    "mode": "uniform",
+                    "frames": 3,
+                    "stride_steps": 1,
+                },
+                "action_transform": {
+                    "type": "coaxial_differential_cyclic",
+                    "lower_motor_upper_ratio": 0.947558738884,
+                    "trim_command": [0.53537068747, 0.0, 0.0, 0.0],
+                    "residual_scale": [0.12, 0.4, 0.4],
+                },
+                "policy_action": {
+                    "fields": [
+                        "lower_motor_differential",
+                        "servo_cyclic_a",
+                        "servo_cyclic_b",
+                    ]
+                },
+                "external_action": {"fields": ["upper_motor"]},
+                "simulator_command": {
+                    "fields": [
+                        "upper_motor",
+                        "lower_motor",
+                        "servo_1",
+                        "servo_2",
+                        "servo_3",
+                    ]
+                },
+            }
+        )
+
+        adapter = default_registry().select(checkpoint)
+        self.assertIsInstance(
+            adapter, FlightTrainAngularAccelerationCascadeAdapter
+        )
+        converted = adapter.convert(
+            checkpoint, source_path=None  # type: ignore[arg-type]
+        )
+        self.assertEqual(converted.input_dim, 63)
+        self.assertEqual(converted.output_dim, 3)
+        self.assertEqual(
+            converted.contract["version"],
+            "angular_acceleration_cascade_v1",
+        )
+        self.assertEqual(
+            converted.contract["controller"]["outer_loop"][
+                "proportional_gain"
+            ],
+            [18.0, 18.0, 8.0],
+        )
+        self.assertEqual(
+            converted.contract["normalization"][
+                "desired_angular_acceleration_rad_s2"
+            ],
+            [6.0, 6.0, 3.0],
+        )

@@ -49,6 +49,8 @@ compile_commands.json
 
 # Training, simulation, and experiment outputs
 /Train/runs/
+/Identification/datasets/
+/Identification/artifacts/
 /WebUI/runtime-runs/
 logs/
 wandb/

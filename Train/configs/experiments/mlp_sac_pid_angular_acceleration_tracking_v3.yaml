@@ -1,0 +1,206 @@
+# 级联姿态控制实验 v3：PID 外环给出角加速度指令，MLP-SAC 内环跟踪。
+#
+# 控制分配：
+#   yaw       -> 上下旋翼差速（策略控制下旋翼相对上旋翼反扭矩配平的残差）
+#   roll/pitch -> 三舵面零共模 cyclic 子空间
+# 三个舵面动作在进入 SimEnv 前强制去均值，不能产生共模舵面命令。
+#
+# 奖励仍然只包含期望/实际三轴角加速度跟踪误差。
+#
+# 启动：
+#   flight-train run \
+#     --config configs/experiments/mlp_sac_pid_angular_acceleration_tracking_v3.yaml
+
+schema_version: 2
+
+experiment:
+  name: mlp_sac_pid_angular_acceleration_tracking_v3
+  entrypoint:
+    type: "flight_train.runner:run_experiment"
+    version: "train-framework-v1"
+
+seed:
+  base: 20260805
+  deterministic_algorithms: true
+  cudnn_benchmark: false
+
+run:
+  device: cuda:0
+  dtype: float32
+  parallel_count: 512
+  total_control_steps: 16777216
+  output_root: ../../runs
+  allow_unimplemented_simulator: false
+
+environment:
+  factory: "simenv:SimulationEnvironment"
+  config_path: ../environment/gru_sac_upright_height_only_small_tip.yaml
+  observation_source: truth
+
+command_source:
+  type: "flight_train.commands:VirtualPilotCommandSource"
+  version: "2"
+  seed: 52040
+  params:
+    throttle:
+      minimum: 0.20
+      maximum: 0.85
+      spool:
+        duration_s: 0.10
+        target_range: [0.54, 0.58]
+      height_controller:
+        observation_source: truth
+        target_m: 0.0
+        initial_throttle_range: [0.55, 0.58]
+        proportional_gain: 0.08
+        integral_gain: 0.04
+        error_limit_m: 5.0
+      slew_rate:
+        rise_per_s: 4.0
+        fall_per_s: 0.35
+    sticks:
+      roll:  {mode: angle, limit_rad: 0.10, time_constant_s: 0.20}
+      pitch: {mode: angle, limit_rad: 0.10, time_constant_s: 0.20}
+      yaw:   {mode: rate, limit_rad_s: 0.35, time_constant_s: 0.30}
+      target_sampling:
+        distribution: centered
+        center_exponent: 2.0
+        hold_duration_s:
+          range: [2.0, 4.0]
+      reset:
+        filtered_stick: zero
+        initial_target_scale: 0.0
+
+control_contract:
+  version: self_stabilize_v1
+  observation_profile: angular_acceleration_allocated_inner_loop_21d_v2
+  observation_history:
+    mode: uniform
+    frames: 61
+    stride_steps: 1
+  action_transform:
+    type: coaxial_differential_cyclic
+    # sqrt(upper torque coefficient / lower torque coefficient)
+    lower_motor_upper_ratio: 0.947558738884
+    # lower_motor 值仅作为清单中的标称参考；运行时基准随 upper_motor 动态变化。
+    trim_command: [0.535370687470, 0.0, 0.0, 0.0]
+    residual_scale: [0.12, 0.40, 0.40]
+  policy_action:
+    fields: [lower_motor_differential, servo_cyclic_a, servo_cyclic_b]
+  external_action:
+    fields: [upper_motor]
+  simulator_command:
+    fields: [upper_motor, lower_motor, servo_1, servo_2, servo_3]
+
+randomization:
+  static:
+    seed: 32040
+    scope: episode
+    parameters: {}
+  dynamic:
+    seed: 42040
+    scope: simulator
+    parameters: {}
+
+task:
+  episode_duration_s: 30.0
+  outer_loop:
+    type: attitude_pid
+    proportional_gain: [18.0, 18.0, 8.0]
+    integral_gain: [1.5, 1.5, 0.75]
+    derivative_gain: [7.0, 7.0, 4.0]
+    integral_limit_rad_s: [0.15, 0.15, 0.20]
+    max_angular_acceleration_rad_s2: [6.0, 6.0, 3.0]
+  episode_curriculum:
+    durations_s:   [2.0, 5.0, 10.0, 20.0, 30.0]
+    target_scales: [0.0, 0.10, 0.25, 0.50, 1.00]
+    success_fraction: 0.80
+    evaluation_episodes_per_env: 1.0
+    consecutive_passes: 2
+    quality_gate:
+      max_roll_pitch_rmse_rad: 0.08726646259971647
+      max_yaw_rate_rmse_rad_s: 0.20
+  termination:
+    max_tilt_rad: 1.0
+    max_angular_rate_rad_s: 6.0
+    angular_rate_axes: all
+
+reward:
+  calculator:
+    type: "flight_train.rewards.angular_acceleration:AngularAccelerationTrackingRewardCalculator"
+    version: "1"
+    params:
+      weight: 1.0
+      error_scale_rad_s2: [6.0, 6.0, 3.0]
+      huber_delta: 1.0
+      reward_form: positive_exponential
+      aggregation: worst_axis
+  context:
+    fields:
+      - {name: desired_angular_acceleration_b, source: task}
+      - {name: actual_angular_acceleration_b, source: task}
+
+model:
+  type: mlp_actor_critic
+  hidden_sizes: [256, 256]
+  policy_distribution:
+    learnable_action_std: true
+    initial_action_std: [0.15, 0.10, 0.10]
+    minimum_action_std: [0.03, 0.02, 0.02]
+    maximum_action_std: [0.30, 0.20, 0.20]
+
+algorithm:
+  name: sac
+  gamma: 0.99
+  n_step_return: 8
+  replay:
+    capacity_transitions: 524288
+    warmup_transitions: 131072
+    batch_size: 4096
+  critic_pretraining_updates: 256
+  actor_update_interval: 8
+  policy_anchor:
+    weight: 0.0
+    max_action_deviation: 0.0
+  updates_per_collection: 64
+  target_update:
+    tau: 0.0025
+    interval_updates: 1
+  entropy:
+    automatic: true
+    initial_alpha: 0.0005
+    target_entropy: -3.0
+    min_alpha: 0.00005
+    max_alpha: 0.002
+  actor_max_grad_norm: 1.0
+  critic_max_grad_norm: 2.5
+  optimizer:
+    type: adam
+    actor_learning_rate: 0.000015
+    critic_learning_rate: 0.0001
+    alpha_learning_rate: 0.0001
+
+collector:
+  control_steps_per_rollout: 256
+
+evaluation:
+  enabled: true
+  interval_control_steps: 1048576
+  suite_path: ../evaluation/fixed_small_command_tracking_v1.yaml
+  execution:
+    mode: subprocess
+    max_in_flight: 1
+    pending_policy: latest
+    pin_checkpoint: hardlink
+    wait_for_final: true
+    failure_policy: continue_training
+
+checkpoint:
+  minimum_free_space_bytes: 8589934592
+  resume:
+    from: null
+    mode: exact
+  interval_control_steps: 524288
+  keep_last: 8
+
+recording: {}

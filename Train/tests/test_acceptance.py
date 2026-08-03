@@ -460,6 +460,7 @@ class FrameworkAcceptanceTests(unittest.TestCase):
                 "completed_episode_length_mean_steps",
                 "completed_episode_survival_mean_s",
                 "reward.joint_tracking_mean",
+                "reward.servo_cyclic_mean",
                 "joint_roll_pitch_cost_mean",
                 "joint_yaw_rate_cost_mean",
                 "joint_roll_pitch_dominant_fraction",

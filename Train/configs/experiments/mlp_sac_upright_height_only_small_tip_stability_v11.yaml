@@ -1,0 +1,236 @@
+# 256x256 MLP-SAC: fresh v8-style training with effort and movement costs.
+#
+# Relative to stability_v10:
+#   1. Keep the 512-env x 256-step high-throughput topology and all task,
+#      observation, network, replay, and optimizer settings;
+#   2. Add quadratic effort costs for held motor, servo common-mode, and servo
+#      cyclic commands. A large fixed command now remains costly even when its
+#      per-step movement is zero;
+#   3. Keep actuator total-variation costs active from step zero, but reduce the
+#      cyclic price smoothly toward a 10% floor while tracking errors are large.
+#      Near the stage-0 quality target the full anti-oscillation price returns;
+#   4. Reduce stochastic action std and entropy-alpha limits, and update the
+#      actor half as often, so early critic errors are less likely to drive the
+#      mean policy into a saturated local optimum;
+#   5. Start completely fresh. Do not resume the behaviorally collapsed v10.
+#
+# Launch:
+#   flight-train run \
+#     --config configs/experiments/mlp_sac_upright_height_only_small_tip_stability_v11.yaml
+
+schema_version: 2
+
+experiment:
+  name: mlp_sac_upright_height_only_small_tip_stability_v11
+  entrypoint:
+    type: "flight_train.runner:run_experiment"
+    version: "train-framework-v1"
+
+seed:
+  base: 20260803
+  deterministic_algorithms: true
+  cudnn_benchmark: false
+
+run:
+  device: cuda:0
+  dtype: float32
+  parallel_count: 512
+  total_control_steps: 33554432
+  output_root: ../../runs
+  allow_unimplemented_simulator: false
+
+environment:
+  factory: "simenv:SimulationEnvironment"
+  config_path: ../environment/gru_sac_upright_height_only_small_tip.yaml
+  observation_source: truth
+
+command_source:
+  type: "flight_train.commands:VirtualPilotCommandSource"
+  version: "2"
+  seed: 52030
+  params:
+    throttle:
+      minimum: 0.20
+      maximum: 0.85
+      spool:
+        duration_s: 0.10
+        target_range: [0.54, 0.58]
+      height_controller:
+        observation_source: truth
+        target_m: 0.0
+        initial_throttle_range: [0.55, 0.58]
+        proportional_gain: 0.08
+        integral_gain: 0.04
+        error_limit_m: 5.0
+      slew_rate:
+        rise_per_s: 4.0
+        fall_per_s: 0.35
+    sticks:
+      roll:  {mode: angle, limit_rad: 0.0, time_constant_s: 0.20}
+      pitch: {mode: angle, limit_rad: 0.0, time_constant_s: 0.20}
+      yaw:   {mode: rate, limit_rad_s: 0.0, time_constant_s: 0.30}
+      target_sampling:
+        distribution: centered
+        center_exponent: 2.0
+        hold_duration_s:
+          range: [2.0, 4.0]
+      reset:
+        filtered_stick: zero
+        initial_target_scale: 0.0
+
+control_contract:
+  version: self_stabilize_v1
+  observation_profile: attitude_self_stabilize_21d_v3
+  observation_history:
+    mode: uniform
+    frames: 61
+    stride_steps: 1
+  action_transform:
+    type: residual_around_trim
+    trim_command: [0.53523, 0.0, 0.0, 0.0]
+    residual_scale: [0.30, 1.0, 1.0, 1.0]
+  policy_action:
+    fields: [lower_motor, servo_1, servo_2, servo_3]
+  external_action:
+    fields: [upper_motor]
+  simulator_command:
+    fields: [upper_motor, lower_motor, servo_1, servo_2, servo_3]
+
+randomization:
+  static:
+    seed: 32030
+    scope: episode
+    parameters: {}
+  dynamic:
+    seed: 42030
+    scope: simulator
+    parameters: {}
+
+task:
+  episode_duration_s: 30.0
+  episode_curriculum:
+    durations_s:   [2.5, 3.5, 5.0, 10.0, 30.0]
+    target_scales: [0.0, 0.0, 0.0,  0.0,  0.0]
+    success_fraction: 0.80
+    evaluation_episodes_per_env: 1.0
+    consecutive_passes: 2
+    quality_gate:
+      max_roll_pitch_rmse_rad: 0.17453292519943295
+      max_yaw_rate_rmse_rad_s: 1.0
+  termination:
+    max_tilt_rad: 1.0
+    max_angular_rate_rad_s: 8.0
+    angular_rate_axes: roll_pitch
+
+reward:
+  calculator:
+    type: "flight_train.rewards.attitude:AttitudeRewardCalculator"
+    version: "3"
+    params:
+      roll_pitch_weight: 0.0
+      tilt_weight: 0.0
+      yaw_rate_weight: 0.0
+
+      joint_tracking_weight: 0.01
+      joint_roll_pitch_scale_rad: 0.17453292519943295
+      joint_yaw_rate_scale_rad_s: 1.0
+      joint_tracking_huber_delta: 1.0
+
+      angular_rate_weight: 0.00015625
+      action_rate_weight: 0.001
+      servo_cyclic_weight: 0.0
+
+      # Continuous normalized control effort. These quadratic terms close the
+      # v10 loophole where a large held command paid no movement cost.
+      motor_effort_weight: 0.0005
+      servo_common_effort_weight: 0.001
+      servo_cyclic_effort_weight: 0.0015
+
+      # Total variation remains active from the first transition. Cyclic
+      # movement is cheap enough for recovery while far from the target, then
+      # rises smoothly to full price in the stable region.
+      motor_movement_weight: 0.00025
+      servo_common_movement_weight: 0.00075
+      servo_cyclic_movement_weight: 0.005
+      servo_cyclic_movement_gate_roll_pitch_scale_rad: 0.17453292519943295
+      servo_cyclic_movement_gate_yaw_rate_scale_rad_s: 1.0
+      servo_cyclic_movement_gate_minimum: 0.10
+
+      saturation_weight: 0.02
+      alive_bonus: 0.02
+      survival_progress_weight: 0.0
+
+      tilt_barrier_weight: 0.01
+      rate_barrier_weight: 0.001
+      barrier_start_fraction: 0.50
+      barrier_exponent: 2.0
+
+      termination_penalty: 10.0
+      early_termination_penalty: 10.0
+  context:
+    fields:
+      - {name: attitude_geodesic_rad, source: task}
+      - {name: angular_velocity_b, source: truth}
+      - {name: static_domain, source: train_randomizer, visibility: reward_only}
+
+model:
+  type: mlp_actor_critic
+  hidden_sizes: [256, 256]
+  policy_distribution:
+    learnable_action_std: true
+    initial_action_std: [0.05, 0.05, 0.05, 0.05]
+    minimum_action_std: [0.015, 0.015, 0.015, 0.015]
+    maximum_action_std: [0.10, 0.10, 0.10, 0.10]
+
+algorithm:
+  name: sac
+  gamma: 0.999
+  n_step_return: 16
+  replay:
+    capacity_transitions: 524288
+    warmup_transitions: 131072
+    batch_size: 4096
+  critic_pretraining_updates: 2048
+  actor_update_interval: 4
+  policy_anchor:
+    weight: 0.0
+    max_action_deviation: 0.0
+  updates_per_collection: 64
+  target_update:
+    tau: 0.0025
+    interval_updates: 1
+  entropy:
+    automatic: true
+    initial_alpha: 0.005
+    target_entropy: -4.0
+    min_alpha: 0.0005
+    max_alpha: 0.01
+  actor_max_grad_norm: 1.0
+  critic_max_grad_norm: 2.5
+  optimizer:
+    type: adam
+    actor_learning_rate: 0.00003
+    critic_learning_rate: 0.0002
+    alpha_learning_rate: 0.0001
+
+collector:
+  control_steps_per_rollout: 256
+
+evaluation:
+  enabled: true
+  interval_control_steps: 1048576
+  suite_path: ../evaluation/fixed_self_stabilize_v2.yaml
+  execution:
+    mode: subprocess
+    max_in_flight: 4
+    pending_policy: latest
+    pin_checkpoint: hardlink
+    wait_for_final: true
+    failure_policy: continue_training
+
+checkpoint:
+  minimum_free_space_bytes: 8589934592
+  interval_control_steps: 524288
+  keep_last: 4
+
+recording: {}

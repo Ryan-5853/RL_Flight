@@ -1,0 +1,232 @@
+# 512×256 MLP-SAC：以执行器总运动代价修复低频极限环。
+#
+# 设计原则：
+#   1. policy-only 热启动 v4 全局最佳 step 48234496；新 reward 下重建双 Q、
+#      target Q、replay、优化器、alpha 和课程状态。
+#   2. 保留 worst-axis + mean 的平衡跟踪目标；删除 cyclic 舵面绝对幅值惩罚，
+#      避免持续惩罚必要的稳态配平。
+#   3. 对下电机、三舵机共同模态和 cyclic 模态的每步绝对变化量分别计价。
+#      舵面移动到位只收费一次，保持不动不收费，反复换向会持续累计代价。
+#   4. 恢复 v4 的小角速度权重；不再用全局强阻尼压制正常动态响应。
+#   5. 使用 10%→25%→50% 修复课程、强 policy anchor 和慢 actor 更新，
+#      防止新 critic 解锁后迅速改写已有控制规律。
+#
+# 启动：
+#   flight-train run \
+#     --config configs/experiments/mlp_sac_attitude_command_tracking_stability_repair_v2.yaml
+
+schema_version: 2
+
+experiment:
+  name: mlp_sac_attitude_command_tracking_stability_repair_v2
+  entrypoint:
+    type: "flight_train.runner:run_experiment"
+    version: "train-framework-v1"
+
+seed:
+  base: 20260804
+  deterministic_algorithms: true
+  cudnn_benchmark: false
+
+run:
+  device: cuda:0
+  dtype: float32
+  parallel_count: 512
+  # 192 个 512×256 rollout；先验证控制经济性方向，再决定是否扩展到更高课程。
+  total_control_steps: 25165824
+  output_root: ../../runs
+  allow_unimplemented_simulator: false
+
+environment:
+  factory: "simenv:SimulationEnvironment"
+  config_path: ../environment/gru_sac_upright_height_only_small_tip.yaml
+  observation_source: truth
+
+command_source:
+  type: "flight_train.commands:VirtualPilotCommandSource"
+  version: "2"
+  seed: 52034
+  params:
+    throttle:
+      minimum: 0.20
+      maximum: 0.85
+      spool:
+        duration_s: 0.10
+        target_range: [0.54, 0.58]
+      height_controller:
+        observation_source: truth
+        target_m: 0.0
+        initial_throttle_range: [0.55, 0.58]
+        proportional_gain: 0.08
+        integral_gain: 0.04
+        error_limit_m: 5.0
+      slew_rate:
+        rise_per_s: 4.0
+        fall_per_s: 0.35
+    sticks:
+      roll:  {mode: angle, limit_rad: 0.10, time_constant_s: 0.20}
+      pitch: {mode: angle, limit_rad: 0.10, time_constant_s: 0.20}
+      yaw:   {mode: rate, limit_rad_s: 0.35, time_constant_s: 0.30}
+      target_sampling:
+        distribution: centered
+        center_exponent: 2.0
+        # 长保持段让持续换向的总代价充分累积，同时保留多个目标切换样本。
+        hold_duration_s:
+          range: [6.0, 10.0]
+      reset:
+        filtered_stick: zero
+        initial_target_scale: 0.0
+
+control_contract:
+  version: self_stabilize_v1
+  observation_profile: attitude_self_stabilize_21d_v3
+  observation_history:
+    mode: uniform
+    frames: 61
+    stride_steps: 1
+  action_transform:
+    type: residual_around_trim
+    trim_command: [0.53523, 0.0, 0.0, 0.0]
+    residual_scale: [0.30, 1.0, 1.0, 1.0]
+  policy_action:
+    fields: [lower_motor, servo_1, servo_2, servo_3]
+  external_action:
+    fields: [upper_motor]
+  simulator_command:
+    fields: [upper_motor, lower_motor, servo_1, servo_2, servo_3]
+
+randomization:
+  static:
+    seed: 32034
+    scope: episode
+    parameters: {}
+  dynamic:
+    seed: 42034
+    scope: simulator
+    parameters: {}
+
+task:
+  episode_duration_s: 30.0
+  episode_curriculum:
+    durations_s:   [10.0, 20.0, 30.0]
+    target_scales: [0.10, 0.25, 0.50]
+    success_fraction: 0.80
+    evaluation_episodes_per_env: 1.0
+    consecutive_passes: 2
+    quality_gate:
+      max_roll_pitch_rmse_rad: 0.04363323129985824
+      max_yaw_rate_rmse_rad_s: 0.12
+      max_angular_rate_rms_rad_s: 0.20
+  termination:
+    max_tilt_rad: 1.0
+    max_angular_rate_rad_s: 8.0
+    angular_rate_axes: roll_pitch
+
+reward:
+  calculator:
+    type: "flight_train.rewards.attitude:AttitudeRewardCalculator"
+    version: "3"
+    params:
+      roll_pitch_weight: 0.0
+      tilt_weight: 0.0
+      yaw_rate_weight: 0.0
+
+      # 两轴都到课程门槛时总 tracking penalty=-0.005，与 alive bonus 对齐。
+      joint_tracking_weight: 0.004
+      joint_tracking_mean_weight: 0.001
+      joint_roll_pitch_scale_rad: 0.04363323129985824
+      joint_yaw_rate_scale_rad_s: 0.12
+      joint_tracking_huber_delta: 1.0
+
+      # 保留很小的物理角速度与安全成本，不用全局强阻尼替代跟踪目标。
+      angular_rate_weight: 0.00015625
+      action_rate_weight: 0.0
+      servo_cyclic_weight: 0.0
+
+      # L1 total variation：cyclic 主要对应 roll/pitch，共同模态保留更多 yaw
+      # 自由度；下电机变化只给很小代价，避免干扰高度控制。
+      motor_movement_weight: 0.0005
+      servo_common_movement_weight: 0.0015
+      servo_cyclic_movement_weight: 0.005
+
+      saturation_weight: 0.01
+      alive_bonus: 0.005
+      survival_progress_weight: 0.0
+
+      tilt_barrier_weight: 0.01
+      rate_barrier_weight: 0.001
+      barrier_start_fraction: 0.50
+      barrier_exponent: 2.0
+
+      termination_penalty: 10.0
+      early_termination_penalty: 10.0
+  context:
+    fields:
+      - {name: attitude_geodesic_rad, source: task}
+      - {name: angular_velocity_b, source: truth}
+      - {name: static_domain, source: train_randomizer, visibility: reward_only}
+
+model:
+  type: mlp_actor_critic
+  hidden_sizes: [256, 256]
+  policy_distribution:
+    learnable_action_std: true
+    initial_action_std: [0.020, 0.030, 0.030, 0.030]
+    minimum_action_std: [0.005, 0.008, 0.008, 0.008]
+    maximum_action_std: [0.035, 0.045, 0.045, 0.045]
+
+algorithm:
+  name: sac
+  gamma: 0.999
+  n_step_return: 16
+  replay:
+    capacity_transitions: 524288
+    warmup_transitions: 131072
+    batch_size: 4096
+  critic_pretraining_updates: 2048
+  actor_update_interval: 16
+  policy_anchor:
+    weight: 20.0
+    max_action_deviation: 0.02
+  updates_per_collection: 64
+  target_update:
+    tau: 0.0025
+    interval_updates: 1
+  entropy:
+    automatic: true
+    initial_alpha: 0.0008
+    target_entropy: -4.0
+    min_alpha: 0.0001
+    max_alpha: 0.003
+  actor_max_grad_norm: 1.0
+  critic_max_grad_norm: 2.5
+  optimizer:
+    type: adam
+    actor_learning_rate: 0.000005
+    critic_learning_rate: 0.0002
+    alpha_learning_rate: 0.0001
+
+collector:
+  control_steps_per_rollout: 256
+
+evaluation:
+  enabled: true
+  interval_control_steps: 1048576
+  suite_path: ../evaluation/fixed_small_command_tracking_v1.yaml
+  execution:
+    mode: subprocess
+    max_in_flight: 1
+    pending_policy: latest
+    pin_checkpoint: hardlink
+    wait_for_final: true
+    failure_policy: continue_training
+
+checkpoint:
+  minimum_free_space_bytes: 8589934592
+  resume:
+    from: ../../runs/mlp_sac_attitude_command_tracking_v4/20260731T072003Z_27b0f360c757_96715085/checkpoints/step_48234496.pt
+    mode: policy
+  interval_control_steps: 1048576
+  keep_last: 4
+
+recording: {}

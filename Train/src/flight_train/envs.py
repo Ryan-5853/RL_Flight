@@ -13,7 +13,7 @@ from .math import euler_to_quaternion, quaternion_to_euler
 from .randomization import StaticRandomizer
 from .rewards import RewardCalculator
 from .registry import ComponentRegistry
-from .tasks import AttitudeTrackingTask
+from .tasks import AttitudePidOuterLoop, AttitudeTrackingTask
 
 
 class SimEnvAdapter:
@@ -73,6 +73,36 @@ class SimEnvAdapter:
         self.dtype = dtype
         self.batch_size = simulator.parallel_count
         physics_hz, control_hz = _load_timing(self.simulator_config)
+        self.angular_acceleration_inner_loop = (
+            control_contract_config.observation_profile
+            in {
+                "angular_acceleration_inner_loop_22d_v1",
+                "angular_acceleration_allocated_inner_loop_21d_v2",
+            }
+        )
+        self.previous_action_dim = control_contract_config.action_dim
+        if self.angular_acceleration_inner_loop:
+            self.observation_fields = (
+                "desired_angular_acceleration_b",
+                "actual_angular_acceleration_b",
+                "angular_velocity_b",
+                "acceleration_b",
+                "motor_speed",
+                "servo_angle",
+                "upper_throttle_command",
+                "previous_policy_action",
+            )
+            self.base_observation_dim = control_contract_config.base_observation_dim
+            self.previous_action_start = 18
+            self.physical_response_start = 3
+            self.physical_response_dim = 14
+            self.physical_response_fields = (
+                "actual_angular_acceleration_b",
+                "angular_velocity_b",
+                "acceleration_b",
+                "motor_speed",
+                "servo_angle",
+            )
         self.observation_history_mode = (
             control_contract_config.observation_history_mode
         )
@@ -167,7 +197,7 @@ class SimEnvAdapter:
         self._spec = EnvSpec(
             parallel_count=self.batch_size,
             observation_dim=control_contract_config.observation_dim,
-            action_dim=4,
+            action_dim=control_contract_config.action_dim,
             device=self.device,
             dtype=self.dtype,
             physics_hz=physics_hz,
@@ -189,6 +219,24 @@ class SimEnvAdapter:
             self.dtype,
             control_hz,
         )
+        self.outer_loop = (
+            AttitudePidOuterLoop(
+                task_config.outer_loop_pid,
+                self.batch_size,
+                self.device,
+                self.dtype,
+                control_hz,
+            )
+            if task_config.outer_loop_pid is not None
+            else None
+        )
+        self.control_dt = 1.0 / float(control_hz)
+        self.previous_truth_angular_velocity = torch.zeros(
+            self.batch_size, 3, device=self.device, dtype=self.dtype
+        )
+        self.actual_angular_acceleration = torch.zeros_like(
+            self.previous_truth_angular_velocity
+        )
         self.control_contract_config = control_contract_config
         self.curriculum_stage = 0
         self.curriculum_successes = 0
@@ -205,7 +253,11 @@ class SimEnvAdapter:
         self.current_static_parameters = TensorDict(
             {}, batch_size=[self.batch_size], device=self.device
         )
-        self.previous_action = torch.zeros((self.batch_size, 4), device=self.device, dtype=self.dtype)
+        self.previous_action = torch.zeros(
+            (self.batch_size, self._spec.action_dim),
+            device=self.device,
+            dtype=self.dtype,
+        )
         self.episode_id = torch.zeros(self.batch_size, device=self.device, dtype=torch.int64)
         self.episode_step = torch.zeros(self.batch_size, device=self.device, dtype=torch.int64)
         self.episode_roll_pitch_squared_sum = torch.zeros(
@@ -414,6 +466,20 @@ class SimEnvAdapter:
                 expanded = mask.reshape(self.batch_size, *([1] * (replacement.ndim - 1)))
                 self.current_static_parameters[key] = torch.where(expanded, replacement, current)
         self.command_source.reset(mask)
+        if self.outer_loop is not None:
+            self.outer_loop.reset(mask)
+            attitude, angular_velocity = self._truth_attitude_and_rate()
+            self.previous_truth_angular_velocity = torch.where(
+                mask[:, None],
+                angular_velocity,
+                self.previous_truth_angular_velocity,
+            )
+            self.actual_angular_acceleration = torch.where(
+                mask[:, None],
+                torch.zeros_like(self.actual_angular_acceleration),
+                self.actual_angular_acceleration,
+            )
+            self._update_outer_loop_command(attitude, angular_velocity, mask)
         self.previous_action = torch.where(mask[:, None], torch.zeros_like(self.previous_action), self.previous_action)
         self.episode_step = torch.where(mask, torch.zeros_like(self.episode_step), self.episode_step)
         self.episode_roll_pitch_squared_sum = torch.where(
@@ -455,7 +521,7 @@ class SimEnvAdapter:
     def step(self, standard_action: torch.Tensor) -> TensorDict:
         """推进一个控制周期并返回 TorchRL 风格的下一状态字段。
 
-        输入策略动作域统一为 ``[-1,1]^4``。终止、超时或仿真无效的环境会立即
+        输入策略动作域统一为 ``[-1,1]^action_dim``。终止、超时或仿真无效的环境会立即
         稀疏重置，返回的 observation 已是新 episode 首帧，同时 ``is_init``
         标记出需要重置循环状态的位置。
         """
@@ -464,7 +530,7 @@ class SimEnvAdapter:
             standard_action,
             device=self.device,
             dtype=self.dtype,
-            shape=(self.batch_size, 4),
+            shape=(self.batch_size, self._spec.action_dim),
             name="standard_action",
         )
         pilot = self.command_source.snapshot()
@@ -474,8 +540,25 @@ class SimEnvAdapter:
             pilot.upper_throttle,
             self.control_contract_config.policy_action_trim,
             self.control_contract_config.policy_action_residual_scale,
+            self.control_contract_config.action_transform_type,
+            self.control_contract_config.lower_motor_upper_ratio,
         )
         result = self.simulator.advance(command)
+        desired_angular_acceleration = (
+            self.outer_loop.desired_angular_acceleration.clone()
+            if self.outer_loop is not None
+            else None
+        )
+        actual_angular_acceleration = None
+        if self.outer_loop is not None:
+            _truth_attitude, truth_angular_velocity = (
+                self._truth_attitude_and_rate()
+            )
+            self.actual_angular_acceleration = (
+                truth_angular_velocity - self.previous_truth_angular_velocity
+            ) / self.control_dt
+            self.previous_truth_angular_velocity.copy_(truth_angular_velocity)
+            actual_angular_acceleration = self.actual_angular_acceleration.clone()
         (
             _observation_before_reset,
             attitude,
@@ -492,6 +575,9 @@ class SimEnvAdapter:
             max_episode_steps=self.max_episode_steps,
             env_context=self._reward_environment_context(),
             desired_yaw_rate=self.command_source.desired_yaw_rate,
+            desired_angular_acceleration=desired_angular_acceleration,
+            actual_angular_acceleration=actual_angular_acceleration,
+            simulator_command=command,
         )
         roll_pitch_error = transition.info["roll_pitch_error_rad"]
         yaw_rate_error = transition.info["yaw_rate_error_rad_s"].squeeze(-1)
@@ -555,6 +641,24 @@ class SimEnvAdapter:
             )
         self.command_source.step(height, active_mask=~reset_mask)
         self.command_source.reset(reset_mask)
+        if self.outer_loop is not None:
+            self.outer_loop.reset(reset_mask)
+            next_attitude, next_angular_velocity = self._truth_attitude_and_rate()
+            self.previous_truth_angular_velocity = torch.where(
+                reset_mask[:, None],
+                next_angular_velocity,
+                self.previous_truth_angular_velocity,
+            )
+            self.actual_angular_acceleration = torch.where(
+                reset_mask[:, None],
+                torch.zeros_like(self.actual_angular_acceleration),
+                self.actual_angular_acceleration,
+            )
+            self._update_outer_loop_command(
+                next_attitude,
+                next_angular_velocity,
+                torch.ones_like(reset_mask),
+            )
         self.episode_id = self.episode_id + reset_mask.to(torch.int64)
         self.episode_step = torch.where(reset_mask, torch.zeros_like(self.episode_step), self.episode_step)
         self.episode_roll_pitch_squared_sum = torch.where(
@@ -631,7 +735,7 @@ class SimEnvAdapter:
             standard_action,
             device=self.device,
             dtype=self.dtype,
-            shape=(self.batch_size, 4),
+            shape=(self.batch_size, self._spec.action_dim),
             name="standard_action",
         )
         assert_tensor_on(
@@ -647,8 +751,34 @@ class SimEnvAdapter:
             pilot.upper_throttle,
             self.control_contract_config.policy_action_trim,
             self.control_contract_config.policy_action_residual_scale,
+            self.control_contract_config.action_transform_type,
+            self.control_contract_config.lower_motor_upper_ratio,
         )
         result = self.simulator.advance(command, active_mask=active_mask)
+        desired_angular_acceleration = (
+            self.outer_loop.desired_angular_acceleration.clone()
+            if self.outer_loop is not None
+            else None
+        )
+        actual_angular_acceleration = None
+        if self.outer_loop is not None:
+            _truth_attitude, truth_angular_velocity = (
+                self._truth_attitude_and_rate()
+            )
+            candidate_acceleration = (
+                truth_angular_velocity - self.previous_truth_angular_velocity
+            ) / self.control_dt
+            self.actual_angular_acceleration = torch.where(
+                active_mask[:, None],
+                candidate_acceleration,
+                self.actual_angular_acceleration,
+            )
+            self.previous_truth_angular_velocity = torch.where(
+                active_mask[:, None],
+                truth_angular_velocity,
+                self.previous_truth_angular_velocity,
+            )
+            actual_angular_acceleration = self.actual_angular_acceleration.clone()
         base_observation, attitude, angular_velocity, height = (
             self._base_observation()
         )
@@ -662,6 +792,9 @@ class SimEnvAdapter:
             max_episode_steps=self.max_episode_steps,
             env_context=self._reward_environment_context(),
             desired_yaw_rate=self.command_source.desired_yaw_rate,
+            desired_angular_acceleration=desired_angular_acceleration,
+            actual_angular_acceleration=actual_angular_acceleration,
+            simulator_command=command,
         )
         valid = result.valid[:, None] & transition.valid
         terminated = active_mask[:, None] & (
@@ -677,6 +810,13 @@ class SimEnvAdapter:
             height,
             active_mask=active_mask & ~terminated.squeeze(-1),
         )
+        if self.outer_loop is not None:
+            next_attitude, next_angular_velocity = self._truth_attitude_and_rate()
+            self._update_outer_loop_command(
+                next_attitude,
+                next_angular_velocity,
+                active_mask & ~terminated.squeeze(-1),
+            )
         no_reset = torch.zeros_like(active_mask)
         # 与训练 step 保持相同的观测时序：飞手命令和 previous_action 更新后，
         # 再构造交给下一控制周期的观测。上面的 base_observation 只属于本次
@@ -691,6 +831,7 @@ class SimEnvAdapter:
             ("position_n", "velocity_n", "attitude_q_wb"),
         ).values
         info = dict(transition.info)
+        info["action.command"] = command
         info["truth.position_n"] = truth["position_n"]
         info["truth.velocity_n"] = truth["velocity_n"]
         info["truth.attitude_q_wb"] = truth["attitude_q_wb"]
@@ -777,8 +918,8 @@ class SimEnvAdapter:
         normalized_desired_yaw_rate = (
             self.command_source.desired_yaw_rate / yaw_scale
         )
-        observation = torch.cat(
-            (
+        if self.outer_loop is None:
+            observation_parts = (
                 relative_attitude,
                 normalized_angular_velocity,
                 normalized_acceleration,
@@ -787,9 +928,22 @@ class SimEnvAdapter:
                 normalized_desired_yaw_rate,
                 self.command_source.upper_throttle * 2.0 - 1.0,
                 self.previous_action,
-            ),
-            dim=-1,
-        )
+            )
+        else:
+            command_scale = self.outer_loop.command_limit
+            truth_angular_velocity = truth.values["angular_velocity_b"]
+            observation_parts = (
+                self.outer_loop.desired_angular_acceleration / command_scale,
+                self.actual_angular_acceleration / command_scale,
+                truth_angular_velocity
+                / self.task_config.terminate_angular_rate_rad_s,
+                normalized_acceleration,
+                normalized_motor_speed,
+                normalized_servo_angle,
+                self.command_source.upper_throttle * 2.0 - 1.0,
+                self.previous_action,
+            )
+        observation = torch.cat(observation_parts, dim=-1)
         expected = (self.batch_size, self.base_observation_dim)
         if observation.shape != expected:
             raise RuntimeError(
@@ -797,6 +951,30 @@ class SimEnvAdapter:
                 f"expected {expected}"
             )
         return observation, attitude, angular_velocity, height
+
+    def _truth_attitude_and_rate(self) -> tuple[torch.Tensor, torch.Tensor]:
+        truth = self.simulator.observe(
+            "truth", ("attitude_q_wb", "angular_velocity_b")
+        ).values
+        return truth["attitude_q_wb"], truth["angular_velocity_b"]
+
+    def _update_outer_loop_command(
+        self,
+        attitude: torch.Tensor,
+        angular_velocity: torch.Tensor,
+        active_mask: torch.Tensor,
+    ) -> None:
+        if self.outer_loop is None:
+            return
+        target_angular_velocity = torch.zeros_like(angular_velocity)
+        target_angular_velocity[:, 2:3] = self.command_source.desired_yaw_rate
+        self.outer_loop.update(
+            attitude,
+            self.command_source.target_attitude,
+            angular_velocity,
+            target_angular_velocity,
+            active_mask,
+        )
 
     def _reset_observation_history(
         self,
@@ -901,6 +1079,7 @@ class SimEnvAdapter:
         task_fields = {
             "attitude_geodesic_rad", "attitude_q_wb", "target_attitude_q_wb",
             "angular_velocity_b", "action", "previous_action", "terminated",
+            "desired_angular_acceleration_b", "actual_angular_acceleration_b",
         }
         for field in self.reward_context_fields:
             name = str(field["name"])
@@ -929,18 +1108,41 @@ class SimEnvAdapter:
         upper_throttle: torch.Tensor,
         trim_command: tuple[float, ...] = (0.5, 0.0, 0.0, 0.0),
         residual_scale: tuple[float, ...] = (0.5, 1.0, 1.0, 1.0),
+        transform_type: str = "residual_around_trim",
+        lower_motor_upper_ratio: float = 1.0,
     ) -> torch.Tensor:
         """把 4 维策略动作和外部油门合成为 SimEnv 5 维命令。
 
-        上桨 PWM 完全来自 VirtualPilot；策略四维均表示相对配平命令的残差，
-        依次映射到下桨 PWM 和三个舵面。该所有权边界防止 PPO 学习高度油门。
+        上桨 PWM 完全来自 VirtualPilot。传统变换将策略四维映射为固定配平点
+        附近的下桨和三舵面残差；共轴分配变换使用一个差速电机自由度和两个
+        cyclic 自由度。该所有权边界防止策略学习高度油门。
         """
 
         trim = standard_action.new_tensor(trim_command)
         scale = standard_action.new_tensor(residual_scale)
-        physical = trim + scale * standard_action.clamp(-1.0, 1.0)
-        physical_lower = physical[..., :1].clamp(0.0, 1.0)
-        physical_servos = physical[..., 1:4].clamp(-1.0, 1.0)
+        bounded_action = standard_action.clamp(-1.0, 1.0)
+        if transform_type == "coaxial_differential_cyclic":
+            physical_lower = (
+                lower_motor_upper_ratio * upper_throttle
+                + scale[:1] * bounded_action[..., :1]
+            ).clamp(0.0, 1.0)
+            cyclic_a = scale[1] * bounded_action[..., 1:2]
+            cyclic_b = scale[2] * bounded_action[..., 2:3]
+            servo_cyclic = torch.cat(
+                (
+                    cyclic_a,
+                    -0.5 * cyclic_a + 0.5 * (3.0**0.5) * cyclic_b,
+                    -0.5 * cyclic_a - 0.5 * (3.0**0.5) * cyclic_b,
+                ),
+                dim=-1,
+            )
+            physical_servos = (trim[1:4] + servo_cyclic).clamp(-1.0, 1.0)
+        elif transform_type == "residual_around_trim":
+            physical = trim + scale * bounded_action
+            physical_lower = physical[..., :1].clamp(0.0, 1.0)
+            physical_servos = physical[..., 1:4].clamp(-1.0, 1.0)
+        else:
+            raise ValueError(f"unsupported action transform {transform_type!r}")
         return torch.cat(
             (
                 upper_throttle.clamp(0.0, 1.0),

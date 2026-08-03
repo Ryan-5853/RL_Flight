@@ -1,12 +1,12 @@
 # 512×256 MLP-SAC：精确续训新 reward v4。
 #
 # 本次续训：
-#   1. 从 33554432 步的最终 checkpoint exact resume，完整保留 actor、双 Q、
+#   1. 从 50331648 步的最终 checkpoint exact resume，完整保留 actor、双 Q、
 #      target Q、replay、优化器、alpha、随机数和课程状态。
 #   2. 保持 512×256 高吞吐拓扑，每轮采集 131072 transitions。
-#   3. 总预算提高到 50331648，即追加 2^24=16777216 个 control steps。
-#   4. 追加预算足够在 50% target scale 下完成至少两轮完整课程评估；
-#      满足质量门槛时可继续晋级到 75%。
+#   3. 总预算提高到 67108864，即追加 2^24=16777216 个 control steps。
+#   4. 追加预算足够在 75% target scale 下完成至少两轮完整课程评估；
+#      满足质量门槛时可继续晋级到 100%。
 #
 # 启动：
 #   flight-train run \
@@ -29,7 +29,7 @@ run:
   device: cuda:0
   dtype: float32
   parallel_count: 512
-  total_control_steps: 50331648
+  total_control_steps: 67108864
   output_root: ../../runs
   allow_unimplemented_simulator: false
 
@@ -209,7 +209,7 @@ evaluation:
 checkpoint:
   minimum_free_space_bytes: 8589934592
   resume:
-    from: ../../runs/mlp_sac_attitude_command_tracking_v4/20260731T062124Z_e48f3e436834_a507a252/checkpoints/step_33554432.pt
+    from: ../../runs/mlp_sac_attitude_command_tracking_v4/20260731T072003Z_27b0f360c757_96715085/checkpoints/step_50331648.pt
     mode: exact
   interval_control_steps: 2097152
   keep_last: 4

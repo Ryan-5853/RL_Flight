@@ -1,12 +1,20 @@
 from importlib.metadata import entry_points
 
+from .angular_acceleration_cascade import (
+    FlightTrainAngularAccelerationCascadeAdapter,
+)
 from .base import CheckpointAdapter
 from .flight_train import FlightTrainMLPAdapter
 from .registry import AdapterRegistry
 
 
 def default_registry() -> AdapterRegistry:
-    registry = AdapterRegistry((FlightTrainMLPAdapter(),))
+    registry = AdapterRegistry(
+        (
+            FlightTrainAngularAccelerationCascadeAdapter(),
+            FlightTrainMLPAdapter(),
+        )
+    )
     # Third-party training stacks can contribute adapters without modifying
     # this package. An entry point may expose an adapter instance or class.
     for entry_point in entry_points(group="flight_deploy.adapters"):
@@ -23,6 +31,7 @@ def default_registry() -> AdapterRegistry:
 __all__ = [
     "AdapterRegistry",
     "CheckpointAdapter",
+    "FlightTrainAngularAccelerationCascadeAdapter",
     "FlightTrainMLPAdapter",
     "default_registry",
 ]

@@ -30,6 +30,9 @@ class LiveTrainingProgress:
         self.batch_size = config.run.parallel_count
         self.rollout_steps = config.run.rollout_steps
         self.algorithm_name = config.algorithm_name.upper()
+        self.action_dim = getattr(
+            getattr(config, "control_contract", None), "action_dim", 4
+        )
         self.total_rollouts = math.ceil(
             self.total_steps / (self.batch_size * self.rollout_steps)
         )
@@ -122,6 +125,16 @@ class LiveTrainingProgress:
             f"动作饱和={100.0 * _metric(metrics, 'action_saturation_fraction'):.2f}%",
         ]
         sampling_rate = _metric(metrics, "sampling_steps_per_second")
+        actuator_energy_proxy = _metric(metrics, "actuator_energy_proxy_mean")
+        if math.isfinite(actuator_energy_proxy):
+            fields.append(
+                f"执行器能耗代理={actuator_energy_proxy:.5f}/step"
+            )
+        actuator_effort_proxy = _metric(metrics, "actuator_effort_proxy_mean")
+        if math.isfinite(actuator_effort_proxy):
+            fields.append(
+                f"执行器持续负载={actuator_effort_proxy:.5f}"
+            )
         if math.isfinite(sampling_rate):
             fields.append(f"采样={sampling_rate:,.0f} sample/s")
         if self._rolling_end_to_end_rate > 0.0:
@@ -131,7 +144,7 @@ class LiveTrainingProgress:
         if self.algorithm_name == "SAC":
             std_values = "/".join(
                 f"{_metric(metrics, f'exploration_std_action_{index}'):.3f}"
-                for index in range(4)
+                for index in range(self.action_dim)
             )
             if _metric(metrics, "sac_warmup") > 0.5:
                 sac_phase = "warmup"

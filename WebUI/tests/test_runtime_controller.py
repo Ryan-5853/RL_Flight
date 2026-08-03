@@ -12,6 +12,7 @@ from runtime import (
     CpuRuntimeSession,
     RuntimeConfigurationError,
     RuntimeRegistry,
+    _simulator_compatibility_fingerprint,
     parse_runtime_options,
 )
 
@@ -21,6 +22,32 @@ SIM_CONFIG = ROOT / "SimEnv" / "configs" / "example.yaml"
 
 
 class RuntimeOptionsTests(unittest.TestCase):
+    def test_simulator_fingerprint_ignores_reset_and_logging_only(self) -> None:
+        baseline = {
+            "seed": 1,
+            "initial_state": {"position_n": {"value": [0, 0, 0]}},
+            "body": {"mass": {"value": 1}},
+            "logging": {"directory": "first"},
+        }
+        equivalent = {
+            **baseline,
+            "seed": 2,
+            "initial_state": {"position_n": {"value": [1, 2, 3]}},
+            "logging": {"directory": "second"},
+        }
+        incompatible = {
+            **equivalent,
+            "body": {"mass": {"value": 2.0}},
+        }
+        self.assertEqual(
+            _simulator_compatibility_fingerprint(baseline),
+            _simulator_compatibility_fingerprint(equivalent),
+        )
+        self.assertNotEqual(
+            _simulator_compatibility_fingerprint(baseline),
+            _simulator_compatibility_fingerprint(incompatible),
+        )
+
     def test_realtime_backend_defaults_to_compiled_500_hz_execution(self) -> None:
         options = parse_runtime_options({})
 
