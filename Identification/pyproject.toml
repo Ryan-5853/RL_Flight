@@ -18,6 +18,9 @@ flight-identification-train = "flight_identification.training:main"
 flight-identification-control-eval = "flight_identification.control_evaluation:main"
 flight-identification-ensemble = "flight_identification.ensemble:main"
 flight-identification-ensemble-control-eval = "flight_identification.ensemble_control_evaluation:main"
+flight-identification-gain-train = "flight_identification.gain_training:main"
+flight-identification-gain-control-eval = "flight_identification.gain_control_evaluation:main"
+flight-identification-nonlinear-eval = "flight_identification.nonlinear_evaluation:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

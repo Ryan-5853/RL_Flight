@@ -1,0 +1,20 @@
+schema_version: 1
+
+artifact: ../artifacts/lqr_wide_effective_deployment_v2/deployment.pt
+history:
+  duration_s: 1.0
+  raw_sample_hz: 500
+  inference_interval_s: 1.0
+
+gain_update:
+  require_artifact_gate_enabled: true
+  interpolation_duration_s: 2.0
+  maximum_updates_per_s: 1.0
+  return_to_nominal_on_rejection: true
+
+freeze_conditions:
+  maximum_tilt_rad: 0.7853982
+  maximum_angular_rate_rad_s: 6.0
+  maximum_window_saturation_fraction: 0.25
+  require_finite_sensor_history: true
+  require_valid_simulator_or_estimator_state: true

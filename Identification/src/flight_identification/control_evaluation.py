@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
-from scipy.linalg import expm, solve_discrete_are, solve_discrete_lyapunov
+from scipy.linalg import solve_discrete_are, solve_discrete_lyapunov
 import torch
 
 from .training import (
@@ -105,27 +105,47 @@ def _discrete_model(
     time_constants: np.ndarray,
     dt: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    continuous_a = np.zeros((10, 10), dtype=np.float64)
-    continuous_b = np.zeros((10, 5), dtype=np.float64)
-    continuous_a[0, 2] = 1.0
-    continuous_a[1, 3] = 1.0
-    continuous_a[2:5, 5:10] = effectiveness
-    continuous_a[5:10, 5:10] = -np.diag(1.0 / time_constants)
-    continuous_b[5:10] = np.diag(command_slopes / time_constants)
-    augmented = np.block(
-        [
-            [continuous_a, continuous_b],
-            [np.zeros((5, 15), dtype=np.float64)],
-        ]
+    # Exact zero-order-hold discretization for the rigid-body integrator chain
+    # driven by five independent first-order actuator states.
+    decay = np.exp(-dt / time_constants)
+    actuator_state_integral = time_constants * (1.0 - decay)
+    actuator_input_integral = command_slopes * (
+        dt - actuator_state_integral
     )
-    discrete = expm(augmented * dt)
-    return discrete[:10, :10], discrete[:10, 10:]
+    actuator_state_double_integral = (
+        dt * time_constants
+        - time_constants**2 * (1.0 - decay)
+    )
+    actuator_input_double_integral = command_slopes * (
+        0.5 * dt * dt - actuator_state_double_integral
+    )
+
+    discrete_a = np.eye(10, dtype=np.float64)
+    discrete_b = np.zeros((10, 5), dtype=np.float64)
+    discrete_a[0, 2] = dt
+    discrete_a[1, 3] = dt
+    discrete_a[0:2, 5:10] = (
+        effectiveness[0:2] * actuator_state_double_integral[None]
+    )
+    discrete_a[2:5, 5:10] = (
+        effectiveness * actuator_state_integral[None]
+    )
+    discrete_a[5:10, 5:10] = np.diag(decay)
+    discrete_b[0:2] = (
+        effectiveness[0:2] * actuator_input_double_integral[None]
+    )
+    discrete_b[2:5] = effectiveness * actuator_input_integral[None]
+    discrete_b[5:10] = np.diag(command_slopes * (1.0 - decay))
+    return discrete_a, discrete_b
 
 
 def _lqr_gain(
     a: np.ndarray, b: np.ndarray, q: np.ndarray, r: np.ndarray
 ) -> np.ndarray:
-    solution = solve_discrete_are(a, b, q, r)
+    try:
+        solution = solve_discrete_are(a, b, q, r)
+    except (np.linalg.LinAlgError, ValueError):
+        solution = solve_discrete_are(a, b, q, r, balanced=False)
     return np.linalg.solve(r + b.T @ solution @ b, b.T @ solution @ a)
 
 

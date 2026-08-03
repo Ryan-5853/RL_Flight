@@ -197,10 +197,18 @@ class FlightTrainAngularAccelerationCascadeAdapter(FlightTrainMLPAdapter):
         if not isinstance(simulator_config, Mapping):
             raise CheckpointError("source simulator configuration is not a mapping")
         return {
-            "fingerprint_version": 1,
+            "fingerprint_version": 2,
             "sha256": cls._simulator_fingerprint(simulator_config),
             "source_sha256": run_manifest.get("simulator_config_sha256"),
-            "excluded_top_level_fields": ["seed", "initial_state", "logging"],
+            "comparison": "effective_single_instance_dynamics",
+            "excluded_top_level_fields": [
+                "schema_version",
+                "seed",
+                "parallel",
+                "initial_state",
+                "logging",
+            ],
+            "configuration": dict(simulator_config),
         }
 
     @classmethod
@@ -208,7 +216,14 @@ class FlightTrainAngularAccelerationCascadeAdapter(FlightTrainMLPAdapter):
         relevant = {
             key: value
             for key, value in config.items()
-            if key not in {"seed", "initial_state", "logging"}
+            if key
+            not in {
+                "schema_version",
+                "seed",
+                "parallel",
+                "initial_state",
+                "logging",
+            }
         }
         canonical = json.dumps(
             cls._canonical_value(relevant),
@@ -221,7 +236,22 @@ class FlightTrainAngularAccelerationCascadeAdapter(FlightTrainMLPAdapter):
     @classmethod
     def _canonical_value(cls, value: Any) -> Any:
         if isinstance(value, Mapping):
-            return {str(key): cls._canonical_value(item) for key, item in value.items()}
+            zero_delay = cls._parameter_value(value.get("delay")) == 0.0
+            result = {}
+            for key, item in value.items():
+                key = str(key)
+                if key == "name":
+                    continue
+                if (
+                    key == "randomization"
+                    and isinstance(item, Mapping)
+                    and item.get("distribution", "none") == "none"
+                ):
+                    continue
+                if key == "interpolation" and zero_delay:
+                    continue
+                result[key] = cls._canonical_value(item)
+            return result
         if isinstance(value, (list, tuple)):
             return [cls._canonical_value(item) for item in value]
         if isinstance(value, bool) or value is None or isinstance(value, str):
@@ -231,3 +261,11 @@ class FlightTrainAngularAccelerationCascadeAdapter(FlightTrainMLPAdapter):
         raise CheckpointError(
             f"unsupported simulator contract value {type(value).__name__}"
         )
+
+    @staticmethod
+    def _parameter_value(value: Any) -> float | None:
+        if isinstance(value, Mapping):
+            value = value.get("value")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return float(value)

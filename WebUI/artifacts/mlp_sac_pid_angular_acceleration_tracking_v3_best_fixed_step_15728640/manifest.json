@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "created_utc": "2026-08-03T10:03:57.504525+00:00",
+  "created_utc": "2026-08-03T10:26:33.644025+00:00",
   "adapter": "flight-train-angular-acceleration-cascade-v1",
   "source": {
     "checkpoint_sha256": "333c03cdc9d68979a9c1d27a99704395e87d77dc3236f0b5ba40eeb2f1b17bf1",
@@ -247,14 +247,541 @@
       }
     },
     "simulator_compatibility": {
-      "fingerprint_version": 1,
-      "sha256": "60d4073219b71a7fbc2f1e9b4217ba8972b538212e6283d769a21c3ca98c4948",
+      "fingerprint_version": 2,
+      "sha256": "fc7370a12fe055b63b4c7d04ce1dd17797f62496a922bd542c3c9aa61ad31054",
       "source_sha256": "633f9073acb54154a4fa5b747b8ad78b28c775440ce5f4cedec89ebfde40d46b",
+      "comparison": "effective_single_instance_dynamics",
       "excluded_top_level_fields": [
+        "schema_version",
         "seed",
+        "parallel",
         "initial_state",
         "logging"
-      ]
+      ],
+      "configuration": {
+        "schema_version": 1,
+        "seed": 20260725,
+        "parallel": {
+          "independent_rng": true
+        },
+        "timing": {
+          "physics_hz": {
+            "value": 500
+          },
+          "control_hz": {
+            "value": 500
+          }
+        },
+        "initial_state": {
+          "position_n": {
+            "value": [
+              0.0,
+              0.0,
+              0.0
+            ]
+          },
+          "velocity_n": {
+            "value": [
+              0.0,
+              0.0,
+              0.0
+            ]
+          },
+          "attitude_q_wb": {
+            "value": [
+              0.9997620357787237,
+              0.0174509112472846,
+              -0.013087601962538,
+              0.0002284449420108
+            ]
+          },
+          "angular_velocity_b": {
+            "value": [
+              0.03,
+              -0.02,
+              0.0
+            ],
+            "randomization": {
+              "distribution": "uniform",
+              "mode": "absolute",
+              "min": [
+                -0.01,
+                -0.01,
+                -0.005
+              ],
+              "max": [
+                0.01,
+                0.01,
+                0.005
+              ]
+            }
+          }
+        },
+        "body": {
+          "mass": {
+            "value": 1.0
+          },
+          "center_of_mass_b": {
+            "value": [
+              0.0,
+              0.0,
+              0.05
+            ]
+          },
+          "inertia_diagonal_b": {
+            "value": [
+              0.01,
+              0.01,
+              0.02
+            ]
+          }
+        },
+        "motors": [
+          {
+            "name": "upper",
+            "pwm_deadzone": {
+              "value": 0.08
+            },
+            "pwm_to_rpm_table": {
+              "value": [
+                [
+                  0.0,
+                  0.0
+                ],
+                [
+                  0.08,
+                  0.0
+                ],
+                [
+                  0.5,
+                  900.0
+                ],
+                [
+                  1.0,
+                  1800.0
+                ]
+              ]
+            },
+            "time_constant": {
+              "value": 0.03
+            },
+            "torque_coefficient": {
+              "value": 9.8765432e-08
+            },
+            "noise": {
+              "distribution": "normal",
+              "stddev": {
+                "value": 0.0
+              }
+            }
+          },
+          {
+            "name": "lower",
+            "pwm_deadzone": {
+              "value": 0.08
+            },
+            "pwm_to_rpm_table": {
+              "value": [
+                [
+                  0.0,
+                  0.0
+                ],
+                [
+                  0.08,
+                  0.0
+                ],
+                [
+                  0.5,
+                  900.0
+                ],
+                [
+                  1.0,
+                  1800.0
+                ]
+              ]
+            },
+            "time_constant": {
+              "value": 0.05
+            },
+            "torque_coefficient": {
+              "value": 1.1e-07
+            },
+            "noise": {
+              "distribution": "normal",
+              "stddev": {
+                "value": 0.0
+              }
+            }
+          }
+        ],
+        "servos": [
+          {
+            "name": "servo_1",
+            "pwm_angle_table": {
+              "value": [
+                [
+                  -1.0,
+                  -0.35
+                ],
+                [
+                  0.0,
+                  0.0
+                ],
+                [
+                  1.0,
+                  0.35
+                ]
+              ]
+            },
+            "tau": {
+              "value": 0.02
+            },
+            "max_speed": {
+              "value": 8.0
+            },
+            "backlash": {
+              "value": 0.01
+            },
+            "deadzone": {
+              "value": 0.015
+            }
+          },
+          {
+            "name": "servo_2",
+            "pwm_angle_table": {
+              "value": [
+                [
+                  -1.0,
+                  -0.35
+                ],
+                [
+                  0.0,
+                  0.0
+                ],
+                [
+                  1.0,
+                  0.35
+                ]
+              ]
+            },
+            "tau": {
+              "value": 0.02
+            },
+            "max_speed": {
+              "value": 8.0
+            },
+            "backlash": {
+              "value": 0.01
+            },
+            "deadzone": {
+              "value": 0.015
+            }
+          },
+          {
+            "name": "servo_3",
+            "pwm_angle_table": {
+              "value": [
+                [
+                  -1.0,
+                  -0.35
+                ],
+                [
+                  0.0,
+                  0.0
+                ],
+                [
+                  1.0,
+                  0.35
+                ]
+              ]
+            },
+            "tau": {
+              "value": 0.02
+            },
+            "max_speed": {
+              "value": 8.0
+            },
+            "backlash": {
+              "value": 0.01
+            },
+            "deadzone": {
+              "value": 0.015
+            }
+          }
+        ],
+        "aerodynamics": {
+          "thrust_coefficients": {
+            "value": [
+              4e-06,
+              4e-06,
+              -2e-06
+            ]
+          },
+          "neutral_thrust_direction_b": {
+            "value": [
+              0.0,
+              0.0,
+              -1.0
+            ]
+          },
+          "direct_thrust_center_b": {
+            "value": [
+              0.0,
+              0.0,
+              0.2
+            ]
+          },
+          "thrust_partition": {
+            "direct": {
+              "value": 0.4
+            },
+            "grid_1": {
+              "value": 0.2
+            },
+            "grid_2": {
+              "value": 0.2
+            },
+            "grid_3": {
+              "value": 0.2
+            }
+          },
+          "grids": [
+            {
+              "name": "grid_1",
+              "aerodynamic_center_b": {
+                "value": [
+                  0.1,
+                  0.0,
+                  0.25
+                ]
+              },
+              "deflection_axis_b": {
+                "value": [
+                  1.0,
+                  0.0,
+                  0.0
+                ]
+              },
+              "self_attenuation_curve": {
+                "value": [
+                  [
+                    0.0,
+                    1.0
+                  ],
+                  [
+                    0.35,
+                    0.85
+                  ]
+                ]
+              },
+              "vector_deflection": {
+                "gain": {
+                  "value": 1.0
+                },
+                "offset": {
+                  "value": 0.0
+                }
+              }
+            },
+            {
+              "name": "grid_2",
+              "aerodynamic_center_b": {
+                "value": [
+                  -0.05,
+                  0.087,
+                  0.25
+                ]
+              },
+              "deflection_axis_b": {
+                "value": [
+                  -0.5,
+                  0.8660254,
+                  0.0
+                ]
+              },
+              "self_attenuation_curve": {
+                "value": [
+                  [
+                    0.0,
+                    1.0
+                  ],
+                  [
+                    0.35,
+                    0.85
+                  ]
+                ]
+              },
+              "vector_deflection": {
+                "gain": {
+                  "value": 1.0
+                },
+                "offset": {
+                  "value": 0.0
+                }
+              }
+            },
+            {
+              "name": "grid_3",
+              "aerodynamic_center_b": {
+                "value": [
+                  -0.05,
+                  -0.087,
+                  0.25
+                ]
+              },
+              "deflection_axis_b": {
+                "value": [
+                  -0.5,
+                  -0.8660254,
+                  0.0
+                ]
+              },
+              "self_attenuation_curve": {
+                "value": [
+                  [
+                    0.0,
+                    1.0
+                  ],
+                  [
+                    0.35,
+                    0.85
+                  ]
+                ]
+              },
+              "vector_deflection": {
+                "gain": {
+                  "value": 1.0
+                },
+                "offset": {
+                  "value": 0.0
+                }
+              }
+            }
+          ],
+          "coupling_attenuation": {
+            "value": [
+              [
+                0.0,
+                0.1,
+                0.1
+              ],
+              [
+                0.1,
+                0.0,
+                0.1
+              ],
+              [
+                0.1,
+                0.1,
+                0.0
+              ]
+            ]
+          }
+        },
+        "sensors": {
+          "gyro": {
+            "sample_hz": {
+              "value": 500
+            },
+            "noise": {
+              "distribution": "normal",
+              "stddev": {
+                "value": [
+                  0.0,
+                  0.0,
+                  0.0
+                ]
+              }
+            },
+            "bias": {
+              "value": [
+                0.0,
+                0.0,
+                0.0
+              ]
+            },
+            "delay": {
+              "value": 0.001
+            },
+            "interpolation": "linear"
+          },
+          "accelerometer": {
+            "sample_hz": {
+              "value": 500
+            },
+            "noise": {
+              "distribution": "normal",
+              "stddev": {
+                "value": [
+                  0.0,
+                  0.0,
+                  0.0
+                ]
+              }
+            },
+            "bias": {
+              "value": [
+                0.0,
+                0.0,
+                0.0
+              ]
+            },
+            "delay": {
+              "value": 0.001
+            },
+            "interpolation": "linear"
+          },
+          "motor_speed": {
+            "sample_hz": {
+              "value": 500
+            },
+            "noise": {
+              "distribution": "normal",
+              "stddev": {
+                "value": [
+                  0.0,
+                  0.0
+                ]
+              }
+            },
+            "bias": {
+              "value": [
+                0.0,
+                0.0
+              ]
+            },
+            "delay": {
+              "value": 0.0
+            }
+          }
+        },
+        "logging": {
+          "directory": "../logs",
+          "minimum_free_space_bytes": 8589934592,
+          "mode": "compact",
+          "physics_step_stride": 20,
+          "fields": [
+            "physics_step",
+            "control_step",
+            "sim_time_s",
+            "control",
+            "active_mask",
+            "valid",
+            "error_code",
+            "generation",
+            "event_code",
+            "truth.position_n",
+            "truth.attitude_q_wb",
+            "truth.angular_velocity_b",
+            "truth.motor_speed",
+            "truth.total_thrust",
+            "truth.servo_angle"
+          ],
+          "chunk_steps": 64,
+          "queue_chunks": 2,
+          "overflow": "block"
+        }
+      }
     }
   },
   "artifacts": {

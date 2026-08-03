@@ -8,6 +8,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 import torch
+from torch import nn
 
 from .control_evaluation import (
     _discrete_model,
@@ -43,13 +44,13 @@ def _wilson_lower(successes: int, count: int, z: float = 1.96) -> float:
     return (center - spread) / denominator
 
 
-def _load_group_predictions(
+def _load_window_predictions(
     artifact: Mapping[str, Any],
     dataset: Path,
     split_name: str,
     device: torch.device,
     batch_size: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     split = load_split(
         dataset,
         split_name,
@@ -62,14 +63,12 @@ def _load_group_predictions(
     member_windows = predict_checkpoint_members(
         artifact["members"], split["features"], device, batch_size
     )
-    member_groups, labels = _aggregate_member_predictions(
-        member_windows, split["labels"], split["group_id"]
-    )
-    uncertainty = calibrated_std(member_groups, artifact["calibration"])
+    uncertainty = calibrated_std(member_windows, artifact["calibration"])
     return (
-        member_groups.mean(dim=0).numpy(),
+        member_windows.mean(dim=0).numpy(),
         uncertainty.numpy(),
-        labels.numpy(),
+        split["labels"].numpy(),
+        split["group_id"].numpy(),
     )
 
 
@@ -101,6 +100,7 @@ def _evaluate_split(
     means: np.ndarray,
     standard_deviations: np.ndarray,
     labels: np.ndarray,
+    group_ids: np.ndarray,
     uncertainty_multipliers: Sequence[float],
     blends: Sequence[float],
     nominal_effectiveness: np.ndarray,
@@ -157,6 +157,7 @@ def _evaluate_split(
             )
         for multiplier in uncertainty_multipliers:
             worst = {blend: 0.0 for blend in blends}
+            uncertain_models = []
             for uncertain_label in _uncertainty_plants(
                 clipped_mean, standard_deviation, multiplier
             ):
@@ -166,18 +167,296 @@ def _evaluate_split(
                 uncertain_a, uncertain_b = _discrete_model(
                     effectiveness, command_slopes, tau, 1.0 / 500.0
                 )
-                for blend, gain in gains.items():
-                    worst[blend] = max(
-                        worst[blend], _pole_radius(uncertain_a, uncertain_b, gain)
-                    )
+                uncertain_models.append((uncertain_a, uncertain_b))
+            uncertain_as = np.stack([model[0] for model in uncertain_models])
+            uncertain_bs = np.stack([model[1] for model in uncertain_models])
+            for blend, gain in gains.items():
+                closed_loop = uncertain_as - uncertain_bs @ gain
+                worst[blend] = float(
+                    np.max(np.abs(np.linalg.eigvals(closed_loop)))
+                )
             for blend, radius in worst.items():
                 robust_radius[(multiplier, blend)][sample_index] = radius
     return {
+        "means": means,
+        "standard_deviations": standard_deviations,
+        "group_ids": group_ids,
         "nominal_stable": nominal_stable,
         "true_stable": true_stable,
         "robust_radius": robust_radius,
         "gain_relative_step": gain_relative_step,
     }
+
+
+def _classifier_features(
+    result: Mapping[str, Any],
+    blend: float,
+    multipliers: Sequence[float],
+) -> np.ndarray:
+    mean = np.clip(result["means"], EFFECTIVE_LOWER, EFFECTIVE_UPPER)
+    standard_deviation = result["standard_deviations"]
+    robust = np.stack(
+        [result["robust_radius"][(multiplier, blend)] for multiplier in multipliers],
+        axis=1,
+    )
+    return np.concatenate(
+        (
+            mean,
+            standard_deviation,
+            np.abs(mean),
+            robust,
+            result["gain_relative_step"][:, None],
+        ),
+        axis=1,
+    ).astype(np.float32)
+
+
+def _fit_risk_classifier(
+    features: np.ndarray,
+    labels: np.ndarray,
+    group_ids: np.ndarray,
+    seed: int,
+    calibration_fraction: float,
+    epochs: int,
+) -> tuple[dict[str, Any], np.ndarray, np.ndarray, np.ndarray]:
+    generator = np.random.default_rng(seed)
+    unique_groups = np.unique(group_ids)
+    permutation = generator.permutation(unique_groups)
+    calibration_group_count = round(len(unique_groups) * calibration_fraction)
+    calibration_groups = permutation[:calibration_group_count]
+    calibration_mask = np.isin(group_ids, calibration_groups)
+    calibration_indices = np.flatnonzero(calibration_mask)
+    fit_indices = np.flatnonzero(~calibration_mask)
+    fit_features = torch.from_numpy(features[fit_indices])
+    fit_labels = torch.from_numpy(labels[fit_indices].astype(np.float32))[:, None]
+    feature_mean = fit_features.mean(dim=0)
+    feature_std = fit_features.std(dim=0).clamp_min(1e-5)
+    torch.manual_seed(seed)
+    model = nn.Sequential(
+        nn.Linear(features.shape[1], 32),
+        nn.SiLU(),
+        nn.Linear(32, 16),
+        nn.SiLU(),
+        nn.Linear(16, 1),
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-3, weight_decay=1e-3)
+    loss_function = nn.BCEWithLogitsLoss()
+    normalized_fit = (fit_features - feature_mean) / feature_std
+    model.train()
+    for _ in range(epochs):
+        optimizer.zero_grad(set_to_none=True)
+        loss = loss_function(model(normalized_fit), fit_labels)
+        loss.backward()
+        optimizer.step()
+    model.eval()
+    with torch.no_grad():
+        probabilities = torch.sigmoid(
+            model((torch.from_numpy(features) - feature_mean) / feature_std)
+        )[:, 0].numpy()
+    checkpoint = {
+        "input_count": features.shape[1],
+        "hidden_sizes": (32, 16),
+        "feature_mean": feature_mean,
+        "feature_std": feature_std,
+        "model_state": model.state_dict(),
+        "fit_count": len(fit_indices),
+        "calibration_count": len(calibration_indices),
+    }
+    return checkpoint, probabilities, fit_indices, calibration_indices
+
+
+def _classifier_probabilities(
+    checkpoint: Mapping[str, Any], features: np.ndarray
+) -> np.ndarray:
+    model = nn.Sequential(
+        nn.Linear(int(checkpoint["input_count"]), 32),
+        nn.SiLU(),
+        nn.Linear(32, 16),
+        nn.SiLU(),
+        nn.Linear(16, 1),
+    )
+    model.load_state_dict(checkpoint["model_state"])
+    model.eval()
+    with torch.no_grad():
+        value = torch.from_numpy(features)
+        normalized = (
+            value - checkpoint["feature_mean"]
+        ) / checkpoint["feature_std"]
+        return torch.sigmoid(model(normalized))[:, 0].numpy()
+
+
+def _select_probability_threshold(
+    probabilities: np.ndarray,
+    stable: np.ndarray,
+    minimum_accept_count: int,
+    desired_precision: float,
+) -> dict[str, Any]:
+    order = np.argsort(-probabilities)
+    ordered_stable = stable[order].astype(np.int64)
+    cumulative_success = np.cumsum(ordered_stable)
+    candidates = []
+    for count in range(minimum_accept_count, len(order) + 1):
+        successes = int(cumulative_success[count - 1])
+        precision = successes / count
+        threshold = float(probabilities[order[count - 1]])
+        candidates.append(
+            {
+                "probability_threshold": threshold,
+                "accepted_count": count,
+                "coverage": count / len(order),
+                "stable_fraction_when_accepted": precision,
+                "stable_wilson_lower_95": _wilson_lower(successes, count),
+                "target_met": precision >= desired_precision,
+            }
+        )
+    eligible = [candidate for candidate in candidates if candidate["target_met"]]
+    pool = eligible if eligible else candidates
+    return max(
+        pool,
+        key=lambda candidate: (
+            candidate["coverage"]
+            if eligible
+            else candidate["stable_fraction_when_accepted"],
+            candidate["stable_wilson_lower_95"],
+        ),
+    )
+
+
+def _mask_report(
+    result: Mapping[str, Any],
+    blend: float,
+    accepted: np.ndarray,
+    population: np.ndarray | None = None,
+) -> dict[str, Any]:
+    if population is None:
+        population = np.ones(len(accepted), dtype=bool)
+    accepted = accepted & population
+    updated_stable = result["true_stable"][blend]
+    nominal_stable = result["nominal_stable"]
+    policy_stable = np.where(accepted, updated_stable, nominal_stable)
+    accepted_count = int(np.sum(accepted))
+    successes = int(np.sum(accepted & updated_stable))
+    population_count = int(np.sum(population))
+    return {
+        "count": population_count,
+        "accepted_count": accepted_count,
+        "coverage": accepted_count / population_count,
+        "stable_fraction_when_accepted": successes / accepted_count
+        if accepted_count
+        else None,
+        "stable_wilson_lower_95": _wilson_lower(successes, accepted_count),
+        "nominal_stable_fraction": float(np.mean(nominal_stable[population])),
+        "ungated_updated_stable_fraction": float(
+            np.mean(updated_stable[population])
+        ),
+        "gated_policy_stable_fraction": float(np.mean(policy_stable[population])),
+        "rescued_nominally_unstable_count": int(
+            np.sum(accepted & ~nominal_stable & updated_stable)
+        ),
+        "harmed_nominally_stable_count": int(
+            np.sum(accepted & nominal_stable & ~updated_stable)
+        ),
+    }
+
+
+def _fit_learned_gate(
+    validation: Mapping[str, Any],
+    test: Mapping[str, Any],
+    blends: Sequence[float],
+    multipliers: Sequence[float],
+    args: argparse.Namespace,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    candidates = []
+    for blend_index, blend in enumerate(blends):
+        validation_features = _classifier_features(validation, blend, multipliers)
+        checkpoint, probabilities, fit_indices, calibration_indices = (
+            _fit_risk_classifier(
+                validation_features,
+                validation["true_stable"][blend],
+                validation["group_ids"],
+                args.seed + blend_index,
+                args.gate_calibration_fraction,
+                args.gate_epochs,
+            )
+        )
+        threshold = _select_probability_threshold(
+            probabilities[calibration_indices],
+            validation["true_stable"][blend][calibration_indices],
+            args.minimum_calibration_accept_count,
+            args.desired_precision,
+        )
+        candidates.append(
+            {
+                "gain_blend": float(blend),
+                "checkpoint": checkpoint,
+                "threshold": threshold,
+                "fit": _mask_report(
+                    validation,
+                    blend,
+                    probabilities >= threshold["probability_threshold"],
+                    np.isin(np.arange(len(probabilities)), fit_indices),
+                ),
+                "calibration": _mask_report(
+                    validation,
+                    blend,
+                    probabilities >= threshold["probability_threshold"],
+                    np.isin(np.arange(len(probabilities)), calibration_indices),
+                ),
+            }
+        )
+    eligible = [
+        candidate for candidate in candidates if candidate["threshold"]["target_met"]
+    ]
+    pool = eligible if eligible else candidates
+    selected = max(
+        pool,
+        key=lambda candidate: (
+            candidate["threshold"]["coverage"]
+            if eligible
+            else candidate["threshold"]["stable_fraction_when_accepted"],
+            candidate["threshold"]["stable_wilson_lower_95"],
+        ),
+    )
+    blend = selected["gain_blend"]
+    test_features = _classifier_features(test, blend, multipliers)
+    test_probabilities = _classifier_probabilities(
+        selected["checkpoint"], test_features
+    )
+    test_accepted = (
+        test_probabilities >= selected["threshold"]["probability_threshold"]
+    )
+    report = {
+        "gain_blend": blend,
+        "probability_threshold": selected["threshold"]["probability_threshold"],
+        "validation_fit": selected["fit"],
+        "validation_calibration": selected["calibration"],
+        "calibration_target_met": selected["threshold"]["target_met"],
+        "test": _mask_report(test, blend, test_accepted),
+    }
+    checkpoint = dict(selected["checkpoint"])
+    checkpoint.update(
+        {
+            "feature_semantics": (
+                "clipped_mean, calibrated_std, absolute_clipped_mean, "
+                "robust_radius_per_uncertainty_multiplier, gain_relative_step"
+            ),
+            "uncertainty_multipliers": tuple(multipliers),
+            "gain_blend": blend,
+            "probability_threshold": selected["threshold"]["probability_threshold"],
+            "desired_precision": args.desired_precision,
+            "calibration_target_met": selected["threshold"]["target_met"],
+            "heldout_test_target_met": (
+                report["test"]["stable_fraction_when_accepted"] is not None
+                and report["test"]["stable_fraction_when_accepted"]
+                >= args.desired_precision
+            ),
+        }
+    )
+    checkpoint["enabled"] = bool(
+        checkpoint["calibration_target_met"]
+        and checkpoint["heldout_test_target_met"]
+    )
+    return checkpoint, report
 
 
 def _select_gate(
@@ -193,6 +472,7 @@ def _select_gate(
         for blend in blends:
             radii = result["robust_radius"][(multiplier, blend)]
             stable = result["true_stable"][blend]
+            non_degraded = ~(result["nominal_stable"] & ~stable)
             quantiles = np.linspace(0.02, 1.0, 50)
             thresholds = np.unique(np.quantile(radii, quantiles))
             for threshold in thresholds:
@@ -201,8 +481,11 @@ def _select_gate(
                 accepted_count = int(np.sum(accepted))
                 if accepted_count < minimum_accept_count:
                     continue
-                successes = int(np.sum(stable & accepted))
+                successes = int(np.sum(non_degraded & accepted))
                 precision = successes / accepted_count
+                rescued = int(
+                    np.sum(accepted & ~result["nominal_stable"] & stable)
+                )
                 candidates.append(
                     {
                         "uncertainty_multiplier": float(multiplier),
@@ -210,10 +493,11 @@ def _select_gate(
                         "robust_radius_threshold": threshold,
                         "accepted_count": accepted_count,
                         "coverage": accepted_count / len(stable),
-                        "stable_fraction_when_accepted": precision,
-                        "stable_wilson_lower_95": _wilson_lower(
+                        "non_degradation_fraction_when_accepted": precision,
+                        "non_degradation_wilson_lower_95": _wilson_lower(
                             successes, accepted_count
                         ),
+                        "rescued_count": rescued,
                         "target_met": precision >= desired_precision,
                     }
                 )
@@ -224,8 +508,11 @@ def _select_gate(
     return max(
         pool,
         key=lambda candidate: (
-            candidate["coverage"] if eligible else candidate["stable_fraction_when_accepted"],
-            candidate["stable_wilson_lower_95"],
+            candidate["coverage"]
+            if eligible
+            else candidate["non_degradation_fraction_when_accepted"],
+            candidate["rescued_count"],
+            candidate["non_degradation_wilson_lower_95"],
             -candidate["uncertainty_multiplier"],
         ),
     )
@@ -243,6 +530,8 @@ def _gate_report(
     policy_stable = np.where(accepted, updated_stable, nominal_stable)
     accepted_count = int(np.sum(accepted))
     accepted_successes = int(np.sum(accepted & updated_stable))
+    non_degraded = ~(nominal_stable & ~updated_stable)
+    non_degraded_count = int(np.sum(accepted & non_degraded))
     return {
         "count": len(accepted),
         "accepted_count": accepted_count,
@@ -252,6 +541,12 @@ def _gate_report(
         ),
         "stable_wilson_lower_95": _wilson_lower(
             accepted_successes, accepted_count
+        ),
+        "non_degradation_fraction_when_accepted": (
+            non_degraded_count / accepted_count if accepted_count else None
+        ),
+        "non_degradation_wilson_lower_95": _wilson_lower(
+            non_degraded_count, accepted_count
         ),
         "nominal_stable_fraction": float(np.mean(nominal_stable)),
         "ungated_updated_stable_fraction": float(np.mean(updated_stable)),
@@ -290,7 +585,7 @@ def evaluate_ensemble_control(args: argparse.Namespace) -> Mapping[str, Any]:
         raise ValueError("deployment gate currently requires lqr_effective targets")
     device = torch.device(args.device)
     predictions = {
-        split: _load_group_predictions(
+        split: _load_window_predictions(
             artifact, dataset, split, device, args.batch_size
         )
         for split in ("validation", "test")
@@ -316,11 +611,12 @@ def evaluate_ensemble_control(args: argparse.Namespace) -> Mapping[str, Any]:
     multipliers = tuple(float(value) for value in args.uncertainty_multipliers.split(","))
     blends = tuple(float(value) for value in args.gain_blends.split(","))
     results = {}
-    for split, (mean, standard_deviation, labels) in predictions.items():
+    for split, (mean, standard_deviation, labels, group_ids) in predictions.items():
         results[split] = _evaluate_split(
             mean,
             standard_deviation,
             labels,
+            group_ids,
             multipliers,
             blends,
             nominal_effectiveness,
@@ -338,6 +634,9 @@ def evaluate_ensemble_control(args: argparse.Namespace) -> Mapping[str, Any]:
         args.minimum_accept_count,
         args.maximum_robust_radius,
     )
+    learned_gate, learned_gate_report = _fit_learned_gate(
+        results["validation"], results["test"], blends, multipliers, args
+    )
     report = {
         "schema_version": 1,
         "semantics": (
@@ -348,9 +647,10 @@ def evaluate_ensemble_control(args: argparse.Namespace) -> Mapping[str, Any]:
         ),
         "ensemble": str(ensemble_path),
         "dataset": str(dataset),
-        "selected_gate": gate,
-        "validation": _gate_report(results["validation"], gate),
-        "test": _gate_report(results["test"], gate),
+        "selected_physical_gate": gate,
+        "physical_gate_validation": _gate_report(results["validation"], gate),
+        "physical_gate_test": _gate_report(results["test"], gate),
+        "learned_gate": learned_gate_report,
         "ungated_stability": {
             split: {
                 "nominal": float(np.mean(result["nominal_stable"])),
@@ -364,15 +664,33 @@ def evaluate_ensemble_control(args: argparse.Namespace) -> Mapping[str, Any]:
     }
     deployment_artifact = dict(artifact)
     deployment_artifact["artifact_type"] = "flight_identification_deployment"
-    deployment_artifact["gain_gate"] = {
+    physical_test = report["physical_gate_test"]
+    physical_gate = {
+        "gate_type": "physical_robust_radius",
         "uncertainty_multiplier": gate["uncertainty_multiplier"],
+        "uncertainty_multipliers": (gate["uncertainty_multiplier"],),
         "gain_blend": gate["gain_blend"],
         "robust_radius_threshold": gate["robust_radius_threshold"],
         "effective_lower": torch.from_numpy(EFFECTIVE_LOWER.copy()),
         "effective_upper": torch.from_numpy(EFFECTIVE_UPPER.copy()),
         "desired_validation_precision": args.desired_precision,
         "validation_target_met": gate["target_met"],
+        "heldout_test_target_met": (
+            physical_test["non_degradation_fraction_when_accepted"] is not None
+            and physical_test["non_degradation_fraction_when_accepted"]
+            >= args.desired_precision
+        ),
     }
+    physical_gate["enabled"] = bool(
+        physical_gate["validation_target_met"]
+        and physical_gate["heldout_test_target_met"]
+    )
+    deployment_artifact["physical_gain_gate"] = physical_gate
+    learned_gate["gate_type"] = "learned_stability_classifier"
+    deployment_artifact["learned_gain_gate"] = learned_gate
+    deployment_artifact["gain_gate"] = (
+        physical_gate if physical_gate["enabled"] else learned_gate
+    )
     output_directory.mkdir(parents=True, exist_ok=True)
     torch.save(deployment_artifact, output_directory / "deployment.pt")
     (output_directory / "control_gate_report.json").write_text(
@@ -395,7 +713,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gain-blends", default="0.25,0.5,0.75,1.0")
     parser.add_argument("--desired-precision", type=float, default=0.99)
     parser.add_argument("--minimum-accept-count", type=int, default=100)
+    parser.add_argument("--minimum-calibration-accept-count", type=int, default=50)
     parser.add_argument("--maximum-robust-radius", type=float, default=0.9999)
+    parser.add_argument("--gate-calibration-fraction", type=float, default=0.4)
+    parser.add_argument("--gate-epochs", type=int, default=600)
+    parser.add_argument("--seed", type=int, default=20260810)
     parser.add_argument("--simulator-config", default="SimEnv/configs/example.yaml")
     parser.add_argument(
         "--controller-config",

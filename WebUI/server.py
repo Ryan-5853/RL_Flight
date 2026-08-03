@@ -293,7 +293,7 @@ class WebUIHandler(SimpleHTTPRequestHandler):
                 if not package.is_dir() or not _is_relative_to(resolved, root):
                     continue
                 files = [path for path in package.iterdir() if path.is_file()]
-                entries.append({
+                entry = {
                     "root": root_index,
                     "path": package.relative_to(root).as_posix(),
                     "size": sum(path.stat().st_size for path in files),
@@ -302,7 +302,25 @@ class WebUIHandler(SimpleHTTPRequestHandler):
                         default=manifest.stat().st_mtime_ns,
                     ),
                     "kind": "inference_package",
-                })
+                }
+                try:
+                    package_manifest = json.loads(
+                        manifest.read_text(encoding="utf-8")
+                    )
+                    compatibility = package_manifest.get("contract", {}).get(
+                        "simulator_compatibility", {}
+                    )
+                    recommended = compatibility.get("configuration")
+                    if isinstance(recommended, Mapping):
+                        entry["recommended_simenv"] = recommended
+                except (
+                    OSError,
+                    UnicodeError,
+                    json.JSONDecodeError,
+                    AttributeError,
+                ):
+                    pass
+                entries.append(entry)
             # Retain legacy checkpoint discovery for custom loaders that still
             # consume a .pt file with a SHA-256 sidecar.
             for path in root.rglob("*.pt"):

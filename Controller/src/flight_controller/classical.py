@@ -155,6 +155,22 @@ class ClassicalControllerBase(FlightController):
             )
         return result
 
+    def schedule_lqr_gain(self, gain: torch.Tensor) -> None:
+        """Install one shared gain or one gain per parallel vehicle."""
+        if self._lqr_gain is None:
+            raise RuntimeError("LQR gain scheduling requires an LQR controller")
+        expected_shared = (5, 10)
+        expected_batched = (self.context.batch_size, 5, 10)
+        if tuple(gain.shape) not in {expected_shared, expected_batched}:
+            raise ValueError(
+                "LQR gain must have shape (5, 10) or "
+                f"{expected_batched}, received {tuple(gain.shape)}"
+            )
+        scheduled = gain.to(device=self.context.device, dtype=self.context.dtype)
+        if not bool(torch.isfinite(scheduled).all().item()):
+            raise ValueError("LQR gain must contain only finite values")
+        self._lqr_gain = scheduled.detach().clone()
+
     def _desired_actuator_equilibrium(
         self,
         state: ControllerState,
@@ -294,7 +310,12 @@ class ClassicalControllerBase(FlightController):
         )
         if self._lqr_gain is None:
             raise RuntimeError("LQR gain is unavailable for this controller")
-        delta = -(lqr_state @ self._lqr_gain.transpose(0, 1))
+        if self._lqr_gain.ndim == 2:
+            delta = -(lqr_state @ self._lqr_gain.transpose(0, 1))
+        else:
+            delta = -torch.bmm(
+                self._lqr_gain, lqr_state.unsqueeze(-1)
+            ).squeeze(-1)
         lower = delta.new_tensor([0.0, 0.0, -1.0, -1.0, -1.0])
         upper = delta.new_tensor([1.0, 1.0, 1.0, 1.0, 1.0])
         command = (base + delta).clamp(lower, upper)

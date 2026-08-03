@@ -108,6 +108,21 @@ class ControllerTests(unittest.TestCase):
         )
         self.assertLess(max(abs(controller._lqr_poles)), 1.0)
 
+    def test_lqr_supports_one_scheduled_gain_per_vehicle(self) -> None:
+        controller = create_controller(
+            {"type": "lqr", "params": {"collective_mode": "hover"}},
+            self.context,
+        )
+        state = self.state_at_trim(controller)
+        state.angular_velocity_b[:, 0] = 0.2
+        scheduled = controller._lqr_gain[None].expand(2, -1, -1).clone()
+        scheduled[0].zero_()
+        controller.schedule_lqr_gain(scheduled)
+        output = controller.step(state, self.reference())
+        delta = output.diagnostics["controller.lqr_delta_command"]
+        torch.testing.assert_close(delta[0], torch.zeros(5, dtype=torch.float64))
+        self.assertGreater(float(delta[1].abs().max()), 0.0)
+
     def test_masked_reset_only_changes_selected_hybrid_state(self) -> None:
         controller = create_controller(
             {"type": "hybrid_pid_lqr", "params": {"collective_mode": "hover"}},

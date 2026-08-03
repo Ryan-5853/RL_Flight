@@ -668,6 +668,11 @@
 
   function normalizeImportedConfig(kind, source) {
     const config = typeof structuredClone === 'function' ? structuredClone(source) : JSON.parse(JSON.stringify(source));
+    if (kind === 'simenv') {
+      const mass = config.body?.mass;
+      if (mass && !mass.randomization) mass.randomization = { distribution: 'none' };
+      return config;
+    }
     if (kind !== 'test') return config;
     const staticParameters = config.randomization?.static?.parameters;
     if (staticParameters?.['body.mass']) {

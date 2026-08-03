@@ -558,7 +558,7 @@ class AngularAccelerationCascadePackage:
         if compatibility is not None:
             if not isinstance(compatibility, Mapping):
                 raise ValueError("simulator compatibility contract must be a mapping")
-            if int(compatibility.get("fingerprint_version", 0)) != 1:
+            if int(compatibility.get("fingerprint_version", 0)) != 2:
                 raise ValueError("unsupported simulator compatibility fingerprint")
             fingerprint = str(compatibility.get("sha256", ""))
             if len(fingerprint) != 64:

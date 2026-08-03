@@ -220,12 +220,15 @@ def build_ensemble(args: argparse.Namespace) -> Mapping[str, Any]:
                 f"incompatible ensemble member {path}: {', '.join(mismatches)}"
             )
 
+    window_calibration = fit_uncertainty_calibration(
+        member_predictions["validation"], splits["validation"]["labels"]
+    )
     validation_group_prediction, validation_group_labels = _aggregate_member_predictions(
         member_predictions["validation"],
         splits["validation"]["labels"],
         splits["validation"]["group_id"],
     )
-    calibration = fit_uncertainty_calibration(
+    group_calibration = fit_uncertainty_calibration(
         validation_group_prediction, validation_group_labels
     )
     report: dict[str, Any] = {
@@ -234,7 +237,7 @@ def build_ensemble(args: argparse.Namespace) -> Mapping[str, Any]:
         "target_mode": target_mode,
         "members": [str(path) for path in member_paths],
         "member_count": len(member_paths),
-        "calibration_scope": "validation parameter-group averages only",
+        "calibration_scope": "validation one-second windows; parameter-group split is disjoint",
         "metrics": {},
     }
     for name, split in splits.items():
@@ -248,8 +251,11 @@ def build_ensemble(args: argparse.Namespace) -> Mapping[str, Any]:
         report["metrics"][name] = {
             "window": window_metrics,
             "group": regression_metrics(group_mean, group_labels, split["label_names"]),
+            "window_uncertainty_coverage": _coverage_report(
+                prediction, split["labels"], window_calibration
+            ),
             "group_uncertainty_coverage": _coverage_report(
-                group_prediction, group_labels, calibration
+                group_prediction, group_labels, group_calibration
             ),
         }
 
@@ -262,7 +268,8 @@ def build_ensemble(args: argparse.Namespace) -> Mapping[str, Any]:
         "history_steps": int(first["history_steps"]),
         "feature_count": int(first["feature_count"]),
         "downsample": int(first["downsample"]),
-        "calibration": calibration,
+        "calibration": window_calibration,
+        "group_calibration": group_calibration,
         "members": checkpoints,
     }
     output.mkdir(parents=True, exist_ok=True)

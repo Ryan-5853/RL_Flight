@@ -44,6 +44,11 @@ PID 增益。bundle 要求的 `control_hz` 与 SimEnv 不一致时会拒绝启�
 气动或传感器契约不匹配时同样拒绝启动。训练使用的环境可从服务器配置根
 `train_environment` 导入。
 
+带有 `simulator_compatibility.configuration` 的专用部署包会在 WebUI 中被选中时
+自动回填其训练 SimEnv。手工导入仍可用于检查或调整初始状态；运行时只对有效
+单实例动力学做兼容校验，不把日志、随机种子、初始状态或零延迟插值等表示差异
+误判为动力学不兼容。
+
 交互仿真默认使用 SimEnv 的 `RealtimeSimulationEnvironment`：固定单环境 CPU
 执行、编译动力学和传感器内核，并关闭 500 Hz 热路径中的持久化日志。上传配置中的
 `logging.directory` 不会被交互会话采用，session status 中
@@ -156,7 +161,9 @@ streaming body 时的兼容回退。网络请求频率不会决定 500 Hz 的 CP
 所有控制器的实时 `collective_mode: hover` 都使用统一的
 `controller.params.pid.altitude.{kp,ki,kd}` 高度 PID，并把 reset 时的位置作为高度目标。
 神经网络控制器复用同一高度 PID 和推力模型生成上电机 collective，部署包须使用
-`residual_4`，策略继续计算其余四通道。`manual` 将手柄油门映射为上桨 PWM；传统
+保留外部 collective 通道的 `residual_4` 或 `coaxial_differential_cyclic_3`；策略继续
+计算其余通道。`physical_5` 直接拥有两个电机，因此不能与 hover 高度 PID 叠加。
+`manual` 将手柄油门映射为上桨 PWM；传统
 控制器同时计算反扭矩平衡的下桨基准。`command_source.params.throttle.height_controller`
 仅供训练和离线 VirtualPilot rollout 使用。没有手柄时页面会发送零姿态虚拟
 输入，因此默认混合控制器可直接启动并观察自稳。页面默认初态故意设置为约

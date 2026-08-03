@@ -50,9 +50,31 @@ class RolloutCancelled(RuntimeError):
 
 
 def _simulator_compatibility_fingerprint(config: Mapping[str, Any]) -> str:
+    def parameter_value(value: Any) -> float | None:
+        if isinstance(value, Mapping):
+            value = value.get("value")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return float(value)
+
     def canonical(value: Any) -> Any:
         if isinstance(value, Mapping):
-            return {str(key): canonical(item) for key, item in value.items()}
+            zero_delay = parameter_value(value.get("delay")) == 0.0
+            result = {}
+            for key, item in value.items():
+                key = str(key)
+                if key == "name":
+                    continue
+                if (
+                    key == "randomization"
+                    and isinstance(item, Mapping)
+                    and item.get("distribution", "none") == "none"
+                ):
+                    continue
+                if key == "interpolation" and zero_delay:
+                    continue
+                result[key] = canonical(item)
+            return result
         if isinstance(value, (list, tuple)):
             return [canonical(item) for item in value]
         if isinstance(value, bool) or value is None or isinstance(value, str):
@@ -66,7 +88,14 @@ def _simulator_compatibility_fingerprint(config: Mapping[str, Any]) -> str:
     relevant = {
         key: value
         for key, value in config.items()
-        if key not in {"seed", "initial_state", "logging"}
+        if key
+        not in {
+            "schema_version",
+            "seed",
+            "parallel",
+            "initial_state",
+            "logging",
+        }
     }
     encoded = json.dumps(
         canonical(relevant),
@@ -730,10 +759,18 @@ class CpuRuntimeSession:
                     raise RuntimeConfigurationError(
                         "controller output_mode does not match inference package"
                     )
-                if collective_mode == "hover" and configured_output != "residual_4":
+                external_collective_modes = {
+                    "residual_4",
+                    "coaxial_differential_cyclic_3",
+                }
+                if (
+                    collective_mode == "hover"
+                    and configured_output not in external_collective_modes
+                ):
                     raise RuntimeConfigurationError(
-                        "neural hover mode requires residual_4 so the external "
-                        "height controller owns the upper motor"
+                        "neural hover mode requires an output mode with an "
+                        "external collective channel so the height controller "
+                        "owns the upper motor"
                     )
                 params["output_mode"] = configured_output
             controller_context = ControllerContext(

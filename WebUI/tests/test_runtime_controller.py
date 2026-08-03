@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import tempfile
 import time
 import unittest
@@ -128,8 +129,44 @@ class _ZeroInferencePackage:
         return {"package_id": self.metadata.package_id}
 
 
+class _ZeroCascadeInferencePackage(_ZeroInferencePackage):
+    metadata = InferencePackageMetadata(
+        format_version=1,
+        package_id="zero-cascade-policy",
+        observation_dim=21,
+        action_dim=3,
+        output_mode="coaxial_differential_cyclic_3",
+    )
+
+    def infer(self, observation, recurrent_state, is_init):
+        del recurrent_state, is_init
+        return observation.new_zeros((1, 3)), None
+
+    def infer_control(
+        self,
+        state,
+        reference,
+        previous_action,
+        recurrent_state,
+        is_init,
+    ):
+        del state, reference, recurrent_state, is_init
+        return previous_action.new_zeros((1, 3)), None
+
+    def action_to_command(self, policy_action, external_action):
+        zeros = policy_action.new_zeros((1, 3))
+        return torch.cat(
+            (
+                external_action.clamp(0.0, 1.0),
+                external_action.clamp(0.0, 1.0) * 0.947558738884,
+                zeros,
+            ),
+            dim=1,
+        )
+
+
 class RuntimeOptionsTests(unittest.TestCase):
-    def test_simulator_fingerprint_ignores_reset_and_logging_only(self) -> None:
+    def test_simulator_fingerprint_ignores_nonphysical_top_level_fields(self) -> None:
         baseline = {
             "seed": 1,
             "initial_state": {"position_n": {"value": [0, 0, 0]}},
@@ -153,6 +190,37 @@ class RuntimeOptionsTests(unittest.TestCase):
         self.assertNotEqual(
             _simulator_compatibility_fingerprint(baseline),
             _simulator_compatibility_fingerprint(incompatible),
+        )
+
+    def test_simulator_fingerprint_normalizes_webui_round_trip(self) -> None:
+        baseline = yaml.safe_load(
+            (
+                ROOT
+                / "Train"
+                / "configs"
+                / "environment"
+                / "gru_sac_upright_height_only_small_tip.yaml"
+            ).read_text(encoding="utf-8")
+        )
+        equivalent = copy.deepcopy(baseline)
+        equivalent["schema_version"] = 99
+        equivalent["parallel"] = {"independent_rng": False}
+        equivalent["motors"][0]["name"] = "display-only-name"
+        equivalent["body"]["mass"]["randomization"] = {
+            "distribution": "none",
+            "mode": "relative",
+            "stddev": 0.05,
+        }
+        equivalent["sensors"]["motor_speed"]["interpolation"] = "linear"
+
+        self.assertEqual(
+            _simulator_compatibility_fingerprint(baseline),
+            _simulator_compatibility_fingerprint(equivalent),
+        )
+        equivalent["body"]["mass"]["value"] = 2.0
+        self.assertNotEqual(
+            _simulator_compatibility_fingerprint(baseline),
+            _simulator_compatibility_fingerprint(equivalent),
         )
 
     def test_realtime_backend_defaults_to_compiled_500_hz_execution(self) -> None:
@@ -181,6 +249,70 @@ class RuntimeOptionsTests(unittest.TestCase):
 
 
 class RuntimeControllerIntegrationTests(unittest.TestCase):
+    def test_cascade_neural_hover_keeps_collective_external(self) -> None:
+        test_config = {
+            "run": {"device": "cpu", "dtype": "float32"},
+            "environment": {"observation_source": "truth"},
+            "runtime": {
+                "cpu_threads": 1,
+                "compile_kernels": False,
+                "telemetry_hz": 30,
+                "command_timeout_ms": 1000,
+            },
+            "controller": {
+                "type": "neural",
+                "params": {
+                    "collective_mode": "hover",
+                    "flight_mode": "attitude",
+                },
+            },
+            "command_source": {
+                "params": {
+                    "throttle": {
+                        "minimum": 0.2,
+                        "maximum": 0.85,
+                        "slew_rate": {
+                            "rise_per_s": 4.0,
+                            "fall_per_s": 0.35,
+                        },
+                    }
+                }
+            },
+            "task": {"episode_duration_s": 1.0},
+            "randomization": {"dynamic": {"parameters": {}}},
+        }
+        simenv_config = yaml.safe_load(
+            SIM_CONFIG.read_text(encoding="utf-8")
+        )
+        with tempfile.TemporaryDirectory() as log_root:
+            session = CpuRuntimeSession(
+                yaml.safe_dump(simenv_config),
+                yaml.safe_dump(test_config),
+                Path(log_root) / "zero-cascade-policy",
+                log_root,
+                inference_package_loader=(
+                    lambda path, device, dtype: _ZeroCascadeInferencePackage()
+                ),
+            )
+            try:
+                self.assertEqual(
+                    session.status()["controller"]["height_controller"],
+                    "shared_altitude_pid",
+                )
+                with torch.no_grad():
+                    session._step_cpu(inspect_safety=False)
+                command = session.last_controller_output.command
+                collective = session.last_reference.collective_command
+                torch.testing.assert_close(command[:, :1], collective)
+                torch.testing.assert_close(
+                    command[:, 1:2], collective * 0.947558738884
+                )
+                torch.testing.assert_close(
+                    command[:, 2:], torch.zeros_like(command[:, 2:])
+                )
+            finally:
+                session.close()
+
     def test_neural_hover_uses_shared_realtime_altitude_pid(
         self,
     ) -> None:

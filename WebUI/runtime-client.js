@@ -469,6 +469,20 @@
       if (checkpointInput instanceof HTMLSelectElement) {
         checkpointInput.replaceChildren();
         const packages = checkpointData.checkpoints || [];
+        const recommendedSimenv = new Map(
+          packages
+            .filter(item => item.recommended_simenv)
+            .map(item => [item.path, item.recommended_simenv])
+        );
+        const applyRecommendedSimenv = () => {
+          const config = recommendedSimenv.get(checkpointInput.value);
+          if (!config || !window.RLFlightConfig?.importConfig) return;
+          window.RLFlightConfig.importConfig(
+            'simenv',
+            config,
+            `${checkpointInput.value} · 内置训练环境`
+          );
+        };
         if (!packages.length) {
           const option = document.createElement('option');
           option.value = '';
@@ -484,6 +498,7 @@
           });
           checkpointInput.disabled = false;
           checkpointInput.value = packages[0].path;
+          checkpointInput.addEventListener('change', applyRecommendedSimenv);
           checkpointInput.dispatchEvent(new Event('input', { bubbles: true }));
           checkpointInput.dispatchEvent(new Event('change', { bubbles: true }));
         }
