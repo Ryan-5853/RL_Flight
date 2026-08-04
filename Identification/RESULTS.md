@@ -156,3 +156,71 @@ Dataset generation, MLP training, target transforms, and local control-value
 evaluation are implemented in `Identification/src/flight_identification/`.
 Representative commands are documented in `Identification/README.md`. Full
 datasets and checkpoints are intentionally excluded from git.
+
+## Joint Plus/Minus Two-Decade Experiment
+
+The deployment-oriented follow-up randomizes all 13 physical labels jointly in
+`[-2, 2]` log10 units. The final dataset contains 32,768 parameter groups,
+65,536 episodes, and 46,486 safety-valid one-second adaptation windows:
+32,645 train, 6,988 validation, and 6,853 test. Every raw parameter reaches
+approximately both range endpoints in every split. Splits remain disjoint by
+parameter group.
+
+Only 384 complete episodes converged under the fixed nominal LQR. This is an
+important feasibility result: a controller that must wait one second before
+identification cannot recover trajectories that leave the safety envelope
+earlier. The adaptation dataset therefore uses safety-valid prefixes rather
+than requiring eventual nominal-controller convergence.
+
+### Identifier Selection
+
+| Candidate | Parameters | Test group mean R2 | Test local stable fraction |
+| --- | ---: | ---: | ---: |
+| effective MLP, one member | 883k | 0.630-0.639 | 0.618 |
+| effective TCN | 837k | 0.630 | 0.651 on v1 |
+| five-member effective MLP ensemble | 4.42M | 0.665 | 0.639 ungated |
+| direct 20D PCA gain MLP | 884k | n/a | 0.381 |
+
+The direct-gain alternative was rejected. Although 20 PCA coordinates explain
+99.91% of training-group gain variance, its test median relative gain error is
+0.816 and it is less stable than reconstructing a gain from effective ratios.
+
+The selected ensemble identifies control authority and motor time constants
+well enough to improve a broad local audit, but servo time constants remain
+weak: their group R2 values are approximately 0.22-0.24. The uncertainty model
+is calibrated on individual one-second windows, not averages over multiple
+initial conditions.
+
+### Local Gain Gate
+
+The conservative validation-selected policy uses 25% of the predicted gain
+step and requires the predicted closed-loop pole radius to be below 0.9999.
+On 6,853 held-out test windows it accepts 4,604 (67.2%). Among accepted updates,
+99.283% do not turn a nominally stable true plant unstable. It rescues 495
+nominally unstable cases and harms 33 nominally stable cases. The resulting
+local stable fraction is 0.388, versus 0.320 for the nominal gain. This passes
+the configured empirical 99% non-degradation threshold, although its 95%
+Wilson lower bound is 0.98995 and should not be interpreted as a hardware
+safety guarantee.
+
+### Nonlinear Decision
+
+The final audit uses all 3,490 held-out parameter groups with newly sampled
+initial states. Both branches share an exactly identical first nominal-LQR
+second (`prefix_max_absolute_difference=0`); accepted gains are interpolated
+over two seconds.
+
+| Duration | Accepted | Nominal/adaptive safe, all | Nominal/adaptive converged, accepted | Safety rescued/harmed |
+| --- | ---: | ---: | ---: | ---: |
+| 4 s | 1,313 | 57.36% / 57.28% | 9.90% / 9.06% | 13 / 10 |
+| 8 s | 1,313 | 46.28% / 46.39% | 11.35% / 10.89% | 34 / 36 |
+
+The nonlinear convergence gate therefore fails. The final artifact is frozen
+as `deployment_mode=shadow_only` with gain updates disabled. The network has
+deployment value for real-time shadow identification, OOD/DARE rejection, and
+new data collection, but not yet for automatic LQR scheduling.
+
+The next experiment must add persistent multiaxis excitation during otherwise
+normal flight and collect longer overlapping histories. Merely increasing MLP
+capacity or regressing oracle gains directly did not solve the missing
+information problem.

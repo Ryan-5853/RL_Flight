@@ -33,6 +33,13 @@ def _lqr_weights(controller_config: Path) -> tuple[np.ndarray, np.ndarray]:
 
     config = load_controller_config(controller_config)["params"]["lqr"]
     state_scales = np.asarray(config["state_scales"], dtype=np.float64)
+    if "integral_state_scales" in config:
+        state_scales = np.concatenate(
+            (
+                state_scales,
+                np.asarray(config["integral_state_scales"], dtype=np.float64),
+            )
+        )
     input_scales = np.asarray(config["input_scales"], dtype=np.float64)
     return (
         np.diag(1.0 / state_scales**2),

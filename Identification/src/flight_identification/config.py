@@ -13,6 +13,7 @@ class InitialStateConfig:
     minimum_tilt_rad: float
     maximum_tilt_rad: float
     maximum_angular_rate_rad_s: tuple[float, float, float]
+    sampling_design: str = "random"
 
 
 @dataclass(frozen=True)
@@ -33,6 +34,43 @@ class WindowConfig:
 
 
 @dataclass(frozen=True)
+class EmpiricalCoreRanges:
+    inertia_scale: tuple[float, float]
+    thrust_to_weight: tuple[float, float]
+    motor_reaction_scale: tuple[float, float]
+    motor_time_constant_s: tuple[float, float]
+    grid_effectiveness_scale: tuple[float, float]
+    servo_time_constant_s: tuple[float, float]
+
+
+@dataclass(frozen=True)
+class Sim2RealMicroRanges:
+    mass_kg: tuple[float, float]
+    inertia_xy_radius_of_gyration_m: tuple[float, float]
+    inertia_z_radius_of_gyration_m: tuple[float, float]
+    thrust_to_weight: tuple[float, float]
+    motor_reaction_scale: tuple[float, float]
+    motor_reaction_ratio: tuple[float, float]
+    motor_time_constant_s: tuple[float, float]
+    direct_center_xy_radius_m: tuple[float, float]
+    direct_center_z_m: tuple[float, float]
+    direct_thrust_fraction: tuple[float, float]
+    grid_radius_m: tuple[float, float]
+    grid_azimuth_error_rad: tuple[float, float]
+    grid_center_z_m: tuple[float, float]
+    grid_effectiveness_scale: tuple[float, float]
+    servo_time_constant_s: tuple[float, float]
+    servo_max_speed_rad_s: tuple[float, float]
+    coupling_attenuation: tuple[float, float]
+
+
+@dataclass(frozen=True)
+class Sim2RealFeasibility:
+    maximum_linear_trim_servo_angle_rad: float
+    maximum_linear_trim_residual_rad_s2: float
+
+
+@dataclass(frozen=True)
 class IdentificationExperimentConfig:
     source_path: Path
     simulator_config: Path
@@ -50,6 +88,10 @@ class IdentificationExperimentConfig:
     initial_state: InitialStateConfig
     convergence: ConvergenceConfig
     window: WindowConfig
+    parameterization: str = "legacy_collective"
+    empirical_ranges: EmpiricalCoreRanges | None = None
+    sim2real_ranges: Sim2RealMicroRanges | None = None
+    sim2real_feasibility: Sim2RealFeasibility | None = None
 
     @property
     def control_hz(self) -> int:
@@ -101,14 +143,151 @@ def load_experiment_config(path: str | Path) -> IdentificationExperimentConfig:
     initial = mapping("initial_state")
     convergence = mapping("convergence")
     window = mapping("window")
-    scale_range = tuple(float(v) for v in sampling.get("log10_effectiveness_range", ()))
+    scale_range = tuple(
+        float(v)
+        for v in sampling.get("log10_effectiveness_range", (-2.0, 2.0))
+    )
     if len(scale_range) != 2 or not all(math.isfinite(v) for v in scale_range):
         raise ValueError("sampling.log10_effectiveness_range must have two finite values")
     if scale_range[0] >= scale_range[1]:
         raise ValueError("sampling.log10_effectiveness_range must be ordered")
+
+    parameterization = str(
+        sampling.get("parameterization", "legacy_collective")
+    )
+    if parameterization not in {
+        "legacy_collective",
+        "empirical_core",
+        "sim2real_micro",
+    }:
+        raise ValueError(
+            "sampling.parameterization must be legacy_collective, empirical_core, "
+            "or sim2real_micro"
+        )
+
+    def ordered_range(
+        node: Mapping[str, Any], name: str, *, maximum: float | None = None
+    ) -> tuple[float, float]:
+        values = tuple(float(v) for v in node.get(name, ()))
+        if (
+            len(values) != 2
+            or not all(math.isfinite(v) and v > 0.0 for v in values)
+            or values[0] >= values[1]
+            or (maximum is not None and values[1] > maximum)
+        ):
+            suffix = f" and <= {maximum}" if maximum is not None else ""
+            raise ValueError(
+                f"sampling.empirical_ranges.{name} must contain two ordered "
+                f"positive finite values{suffix}"
+            )
+        return values[0], values[1]
+
+    empirical_ranges = None
+    if parameterization == "empirical_core":
+        ranges = sampling.get("empirical_ranges")
+        if not isinstance(ranges, Mapping):
+            raise ValueError(
+                "sampling.empirical_ranges must be a mapping for empirical_core"
+            )
+        empirical_ranges = EmpiricalCoreRanges(
+            inertia_scale=ordered_range(ranges, "inertia_scale"),
+            thrust_to_weight=ordered_range(ranges, "thrust_to_weight"),
+            motor_reaction_scale=ordered_range(
+                ranges, "motor_reaction_scale"
+            ),
+            motor_time_constant_s=ordered_range(
+                ranges, "motor_time_constant_s"
+            ),
+            grid_effectiveness_scale=ordered_range(
+                ranges, "grid_effectiveness_scale"
+            ),
+            servo_time_constant_s=ordered_range(
+                ranges, "servo_time_constant_s"
+            ),
+        )
+    sim2real_ranges = None
+    sim2real_feasibility = None
+    if parameterization == "sim2real_micro":
+        ranges = sampling.get("sim2real_ranges")
+        if not isinstance(ranges, Mapping):
+            raise ValueError(
+                "sampling.sim2real_ranges must be a mapping for sim2real_micro"
+            )
+
+        def sim_range(name: str) -> tuple[float, float]:
+            return ordered_range(ranges, name)
+
+        sim2real_ranges = Sim2RealMicroRanges(
+            mass_kg=sim_range("mass_kg"),
+            inertia_xy_radius_of_gyration_m=sim_range(
+                "inertia_xy_radius_of_gyration_m"
+            ),
+            inertia_z_radius_of_gyration_m=sim_range(
+                "inertia_z_radius_of_gyration_m"
+            ),
+            thrust_to_weight=sim_range("thrust_to_weight"),
+            motor_reaction_scale=sim_range("motor_reaction_scale"),
+            motor_reaction_ratio=sim_range("motor_reaction_ratio"),
+            motor_time_constant_s=sim_range("motor_time_constant_s"),
+            direct_center_xy_radius_m=sim_range(
+                "direct_center_xy_radius_m"
+            ),
+            direct_center_z_m=sim_range("direct_center_z_m"),
+            direct_thrust_fraction=sim_range("direct_thrust_fraction"),
+            grid_radius_m=sim_range("grid_radius_m"),
+            grid_azimuth_error_rad=tuple(
+                float(value)
+                for value in ranges.get("grid_azimuth_error_rad", ())
+            ),
+            grid_center_z_m=sim_range("grid_center_z_m"),
+            grid_effectiveness_scale=sim_range(
+                "grid_effectiveness_scale"
+            ),
+            servo_time_constant_s=sim_range("servo_time_constant_s"),
+            servo_max_speed_rad_s=sim_range("servo_max_speed_rad_s"),
+            coupling_attenuation=tuple(
+                float(value)
+                for value in ranges.get("coupling_attenuation", ())
+            ),
+        )
+        for name in ("grid_azimuth_error_rad", "coupling_attenuation"):
+            values = getattr(sim2real_ranges, name)
+            if (
+                len(values) != 2
+                or not all(math.isfinite(value) for value in values)
+                or values[0] > values[1]
+            ):
+                raise ValueError(
+                    f"sampling.sim2real_ranges.{name} must contain two ordered "
+                    "finite values"
+                )
+        if sim2real_ranges.direct_thrust_fraction[1] >= 1.0:
+            raise ValueError("direct_thrust_fraction maximum must be below 1")
+        if not 0.0 <= sim2real_ranges.coupling_attenuation[0]:
+            raise ValueError("coupling_attenuation minimum must be nonnegative")
+        if sim2real_ranges.coupling_attenuation[1] > 1.0:
+            raise ValueError("coupling_attenuation maximum must not exceed 1")
+        feasibility = sampling.get("feasibility")
+        if not isinstance(feasibility, Mapping):
+            raise ValueError(
+                "sampling.feasibility must be a mapping for sim2real_micro"
+            )
+        sim2real_feasibility = Sim2RealFeasibility(
+            maximum_linear_trim_servo_angle_rad=positive(
+                feasibility, "maximum_linear_trim_servo_angle_rad"
+            ),
+            maximum_linear_trim_residual_rad_s2=positive(
+                feasibility, "maximum_linear_trim_residual_rad_s2"
+            ),
+        )
     rate = tuple(float(v) for v in initial.get("maximum_angular_rate_rad_s", ()))
     if len(rate) != 3 or any(not math.isfinite(v) or v < 0 for v in rate):
         raise ValueError("initial_state.maximum_angular_rate_rad_s must contain 3 nonnegative values")
+    initial_sampling_design = str(initial.get("sampling_design", "random"))
+    if initial_sampling_design not in {"random", "stratified_multiaxis"}:
+        raise ValueError(
+            "initial_state.sampling_design must be random or stratified_multiaxis"
+        )
     fractions = tuple(float(v) for v in window.get("split_fractions", ()))
     if len(fractions) != 3 or any(v <= 0 for v in fractions):
         raise ValueError("window.split_fractions must contain 3 positive values")
@@ -180,6 +359,7 @@ def load_experiment_config(path: str | Path) -> IdentificationExperimentConfig:
             minimum_tilt_rad=minimum_tilt,
             maximum_tilt_rad=maximum_tilt,
             maximum_angular_rate_rad_s=rate,  # type: ignore[arg-type]
+            sampling_design=initial_sampling_design,
         ),
         convergence=ConvergenceConfig(
             maximum_roll_pitch_error_rad=positive(convergence, "maximum_roll_pitch_error_rad"),
@@ -194,4 +374,8 @@ def load_experiment_config(path: str | Path) -> IdentificationExperimentConfig:
             split_fractions=fractions,  # type: ignore[arg-type]
             maximum_start_s=maximum_start_s,
         ),
+        parameterization=parameterization,
+        empirical_ranges=empirical_ranges,
+        sim2real_ranges=sim2real_ranges,
+        sim2real_feasibility=sim2real_feasibility,
     )

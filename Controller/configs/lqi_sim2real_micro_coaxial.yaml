@@ -1,0 +1,26 @@
+type: lqr
+params:
+  collective_mode: hover
+  pid:
+    altitude:
+      kp: 4.0
+      ki: 0.8
+      kd: 3.2
+      integral_limit: 2.0
+      minimum_thrust_fraction: 0.20
+      maximum_thrust_fraction: 0.96
+    attitude:
+      roll_pitch_natural_frequency_rad_s: 6.0
+      yaw_rate_bandwidth_rad_s: 5.0
+      damping_ratio: 0.85
+      integral_fraction: [0.08, 0.08, 0.04]
+      integral_limit: [0.30, 0.30, 0.60]
+      maximum_moment_n_m: [0.08, 0.08, 0.04]
+  lqr:
+    state_scales: [0.0872665, 0.0872665, 1.0, 1.0, 2.0, 300.0, 300.0, 0.15, 0.15, 0.15]
+    integral_state_scales: [0.05, 0.05, 0.30]
+    input_scales: [0.16, 0.16, 0.40, 0.40, 0.40]
+    input_weight_scale: 0.10
+  allocation:
+    input_weights: [1.5, 1.5, 1.0, 1.0, 1.0]
+    damping: 1.0e-5

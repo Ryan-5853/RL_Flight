@@ -1,0 +1,55 @@
+schema_version: 5
+name: fixed_angular_acceleration_tracking_bad_points_v1
+
+seed: 83004
+parallel_count: 4
+output_root: ../../evaluation_runs
+
+scenarios:
+  - {name: x_step_25, type: angular_acceleration_step, duration_s: 2.0, angular_acceleration_amplitude_rad_s2: [1.0, 0.0, 0.0]}
+  - {name: x_step_50, type: angular_acceleration_step, duration_s: 2.0, angular_acceleration_amplitude_rad_s2: [2.0, 0.0, 0.0]}
+  - {name: x_step_100, type: angular_acceleration_step, duration_s: 2.0, angular_acceleration_amplitude_rad_s2: [4.0, 0.0, 0.0]}
+  - {name: y_step_25, type: angular_acceleration_step, duration_s: 2.0, angular_acceleration_amplitude_rad_s2: [0.0, 1.0, 0.0]}
+  - {name: y_step_50, type: angular_acceleration_step, duration_s: 2.0, angular_acceleration_amplitude_rad_s2: [0.0, 2.0, 0.0]}
+  - {name: y_step_100, type: angular_acceleration_step, duration_s: 2.0, angular_acceleration_amplitude_rad_s2: [0.0, 4.0, 0.0]}
+  - {name: z_step_25, type: angular_acceleration_step, duration_s: 2.0, angular_acceleration_amplitude_rad_s2: [0.0, 0.0, 0.375]}
+  - {name: z_step_50, type: angular_acceleration_step, duration_s: 2.0, angular_acceleration_amplitude_rad_s2: [0.0, 0.0, 0.75]}
+  - {name: z_step_100, type: angular_acceleration_step, duration_s: 2.0, angular_acceleration_amplitude_rad_s2: [0.0, 0.0, 1.5]}
+  - {name: xyz_step_25, type: angular_acceleration_step, duration_s: 2.0, angular_acceleration_amplitude_rad_s2: [1.0, 1.0, 0.375]}
+  - {name: xyz_step_50, type: angular_acceleration_step, duration_s: 2.0, angular_acceleration_amplitude_rad_s2: [2.0, 2.0, 0.75]}
+  - {name: xyz_step_100, type: angular_acceleration_step, duration_s: 2.0, angular_acceleration_amplitude_rad_s2: [4.0, 4.0, 1.5]}
+
+  - {name: x_sine_0_25_hz, type: angular_acceleration_sine, duration_s: 10.0, angular_acceleration_amplitude_rad_s2: [0.2, 0.0, 0.0], frequency_hz: 0.25}
+  - {name: x_sine_0_50_hz, type: angular_acceleration_sine, duration_s: 8.0, angular_acceleration_amplitude_rad_s2: [0.2, 0.0, 0.0], frequency_hz: 0.50}
+  - {name: x_sine_0_75_hz, type: angular_acceleration_sine, duration_s: 7.0, angular_acceleration_amplitude_rad_s2: [0.2, 0.0, 0.0], frequency_hz: 0.75}
+  - {name: x_sine_1_00_hz, type: angular_acceleration_sine, duration_s: 6.0, angular_acceleration_amplitude_rad_s2: [0.2, 0.0, 0.0], frequency_hz: 1.00}
+  - {name: x_sine_1_50_hz, type: angular_acceleration_sine, duration_s: 6.0, angular_acceleration_amplitude_rad_s2: [0.2, 0.0, 0.0], frequency_hz: 1.50}
+  - {name: y_sine_0_25_hz, type: angular_acceleration_sine, duration_s: 10.0, angular_acceleration_amplitude_rad_s2: [0.0, 0.2, 0.0], frequency_hz: 0.25}
+  - {name: y_sine_0_50_hz, type: angular_acceleration_sine, duration_s: 8.0, angular_acceleration_amplitude_rad_s2: [0.0, 0.2, 0.0], frequency_hz: 0.50}
+  - {name: y_sine_0_75_hz, type: angular_acceleration_sine, duration_s: 7.0, angular_acceleration_amplitude_rad_s2: [0.0, 0.2, 0.0], frequency_hz: 0.75}
+  - {name: y_sine_1_00_hz, type: angular_acceleration_sine, duration_s: 6.0, angular_acceleration_amplitude_rad_s2: [0.0, 0.2, 0.0], frequency_hz: 1.00}
+  - {name: y_sine_1_50_hz, type: angular_acceleration_sine, duration_s: 6.0, angular_acceleration_amplitude_rad_s2: [0.0, 0.2, 0.0], frequency_hz: 1.50}
+  - {name: z_sine_0_25_hz, type: angular_acceleration_sine, duration_s: 10.0, angular_acceleration_amplitude_rad_s2: [0.0, 0.0, 0.075], frequency_hz: 0.25}
+  - {name: z_sine_0_50_hz, type: angular_acceleration_sine, duration_s: 8.0, angular_acceleration_amplitude_rad_s2: [0.0, 0.0, 0.075], frequency_hz: 0.50}
+  - {name: z_sine_0_75_hz, type: angular_acceleration_sine, duration_s: 7.0, angular_acceleration_amplitude_rad_s2: [0.0, 0.0, 0.075], frequency_hz: 0.75}
+  - {name: z_sine_1_00_hz, type: angular_acceleration_sine, duration_s: 6.0, angular_acceleration_amplitude_rad_s2: [0.0, 0.0, 0.075], frequency_hz: 1.00}
+  - {name: z_sine_1_50_hz, type: angular_acceleration_sine, duration_s: 6.0, angular_acceleration_amplitude_rad_s2: [0.0, 0.0, 0.075], frequency_hz: 1.50}
+
+scoring:
+  limits:
+    attitude_rmse_bad_deg: 10.0
+    yaw_rate_rmse_bad_rad_s: 0.35
+    position_rmse_bad_m: 5.0
+    velocity_rmse_bad_m_s: 3.0
+    action_rms_bad: 1.0
+    action_delta_rms_bad: 0.25
+    saturation_fraction_bad: 0.50
+    response_time_bad_s: 0.50
+    settling_error_deg: 2.0
+    settling_window_s: 0.02
+    phase_lag_max_s: 0.50
+  weights:
+    survival: 0.15
+    tracking: 0.55
+    action: 0.10
+    response: 0.20

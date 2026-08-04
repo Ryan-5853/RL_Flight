@@ -30,6 +30,10 @@ EFFECTIVE_LABEL_NAMES = (
     "log10.servo_3_tau_scale",
 )
 
+EMPIRICAL_EFFECTIVE_LABEL_NAMES = EFFECTIVE_LABEL_NAMES + (
+    "log10.thrust_to_weight_scale",
+)
+
 LQR_LATENT_LABEL_NAMES = (
     "log10.effectiveness.roll_servo_1_scale",
     "log10.effectiveness.roll_servo_2_scale",
@@ -242,7 +246,17 @@ def fit_normalization(train: Mapping[str, torch.Tensor]) -> dict[str, torch.Tens
     }
 
 
-def effective_lqr_labels(labels: torch.Tensor) -> torch.Tensor:
+def effective_lqr_label_names(parameterization: str) -> tuple[str, ...]:
+    if parameterization == "legacy_collective":
+        return EFFECTIVE_LABEL_NAMES
+    if parameterization == "empirical_core":
+        return EMPIRICAL_EFFECTIVE_LABEL_NAMES
+    raise ValueError(f"unsupported parameterization: {parameterization}")
+
+
+def effective_lqr_labels(
+    labels: torch.Tensor, parameterization: str = "legacy_collective"
+) -> torch.Tensor:
     """Map physical scales to the local angular-acceleration model LQR uses.
 
     The transform is exact for the multiplicative randomization around hover:
@@ -251,19 +265,37 @@ def effective_lqr_labels(labels: torch.Tensor) -> torch.Tensor:
     """
 
     inertia_x, inertia_y, inertia_z = labels[:, 0], labels[:, 1], labels[:, 2]
-    collective, reaction = labels[:, 3], labels[:, 4]
+    expected = 13
+    if labels.ndim != 2 or labels.shape[1] != expected:
+        raise ValueError(
+            f"{parameterization} physical labels must have shape [batch, {expected}]"
+        )
+    thrust_to_weight, reaction = labels[:, 3], labels[:, 4]
     grid_1, grid_2, grid_3 = labels[:, 7], labels[:, 8], labels[:, 9]
-    return torch.stack(
+    # In the empirical parameterization mass is fixed. At hover the servo
+    # force is mg, so servo angular authority does not scale with maximum
+    # thrust. Motor speed scales as T/W**-0.5, hence motor yaw authority does.
+    servo_collective = (
+        thrust_to_weight
+        if parameterization == "legacy_collective"
+        else torch.zeros_like(thrust_to_weight)
+    )
+    yaw_thrust_term = (
+        torch.zeros_like(thrust_to_weight)
+        if parameterization == "legacy_collective"
+        else -0.5 * thrust_to_weight
+    )
+    effective = torch.stack(
         (
-            collective + grid_1 - inertia_x,
-            collective + grid_2 - inertia_x,
-            collective + grid_3 - inertia_x,
-            collective + grid_2 - inertia_y,
-            collective + grid_3 - inertia_y,
-            reaction - inertia_z,
-            collective + grid_1 - inertia_z,
-            collective + grid_2 - inertia_z,
-            collective + grid_3 - inertia_z,
+            servo_collective + grid_1 - inertia_x,
+            servo_collective + grid_2 - inertia_x,
+            servo_collective + grid_3 - inertia_x,
+            servo_collective + grid_2 - inertia_y,
+            servo_collective + grid_3 - inertia_y,
+            reaction + yaw_thrust_term - inertia_z,
+            servo_collective + grid_1 - inertia_z,
+            servo_collective + grid_2 - inertia_z,
+            servo_collective + grid_3 - inertia_z,
             labels[:, 5],
             labels[:, 6],
             labels[:, 10],
@@ -272,6 +304,9 @@ def effective_lqr_labels(labels: torch.Tensor) -> torch.Tensor:
         ),
         dim=1,
     )
+    if parameterization == "empirical_core":
+        effective = torch.cat((effective, labels[:, 3:4]), dim=1)
+    return effective
 
 
 def lqr_latent_labels(labels: torch.Tensor) -> torch.Tensor:

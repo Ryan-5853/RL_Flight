@@ -1,0 +1,122 @@
+# Isolated nominal model for the 15 cm diameter, 10 cm tall micro coaxial vehicle.
+# Physical-domain randomization is applied by Identification's sim2real sampler.
+schema_version: 1
+seed: 20260820
+
+parallel:
+  independent_rng: true
+
+timing:
+  physics_hz: {value: 500}
+  control_hz: {value: 500}
+
+initial_state:
+  position_n: {value: [0.0, 0.0, 0.0]}
+  velocity_n: {value: [0.0, 0.0, 0.0]}
+  attitude_q_wb: {value: [1.0, 0.0, 0.0, 0.0]}
+  angular_velocity_b: {value: [0.0, 0.0, 0.0]}
+
+body:
+  mass: {value: 0.300}
+  center_of_mass_b: {value: [0.0, 0.0, 0.0]}
+  inertia_diagonal_b: {value: [0.00075, 0.00075, 0.00110]}
+
+motors:
+  - &motor
+    name: upper
+    pwm_deadzone: {value: 0.08}
+    pwm_to_rpm_table:
+      value: [[0.0, 0.0], [0.08, 0.0], [0.5, 900.0], [1.0, 1800.0]]
+    time_constant: {value: 0.040}
+    torque_coefficient: {value: 2.30e-8}
+    noise:
+      distribution: normal
+      stddev: {value: 5.0}
+  - <<: *motor
+    name: lower
+    time_constant: {value: 0.050}
+
+servos:
+  - &servo
+    name: servo_1
+    pwm_angle_table:
+      value: [[-1.0, -0.35], [0.0, 0.0], [1.0, 0.35]]
+    tau: {value: 0.030}
+    # 0.09 s / 60 deg = 11.6355 rad/s unloaded angular speed.
+    max_speed: {value: 11.6355}
+    backlash: {value: 0.008}
+    deadzone: {value: 0.015}
+  - <<: *servo
+    name: servo_2
+  - <<: *servo
+    name: servo_3
+
+aerodynamics:
+  # At 1800 rad/s these coefficients produce 7.355 N: T/W = 2.5 at 0.3 kg.
+  thrust_coefficients: {value: [9.08e-7, 9.08e-7, 4.54e-7]}
+  neutral_thrust_direction_b: {value: [0.0, 0.0, -1.0]}
+  direct_thrust_center_b: {value: [0.0, 0.0, 0.030]}
+  thrust_partition:
+    direct: {value: 0.65}
+    grid_1: {value: 0.1166666667}
+    grid_2: {value: 0.1166666667}
+    grid_3: {value: 0.1166666666}
+
+  # FRD body frame: one grid aft, two grids forward-left/right.
+  grids:
+    - &grid
+      name: grid_1
+      aerodynamic_center_b: {value: [-0.050, 0.0, 0.030]}
+      deflection_axis_b: {value: [-1.0, 0.0, 0.0]}
+      self_attenuation_curve:
+        value: [[0.0, 1.0], [0.35, 0.85]]
+      vector_deflection:
+        gain: {value: 1.0}
+        offset: {value: 0.0}
+    - <<: *grid
+      name: grid_2
+      aerodynamic_center_b: {value: [0.025, 0.04330127, 0.030]}
+      deflection_axis_b: {value: [0.5, 0.8660254, 0.0]}
+    - <<: *grid
+      name: grid_3
+      aerodynamic_center_b: {value: [0.025, -0.04330127, 0.030]}
+      deflection_axis_b: {value: [0.5, -0.8660254, 0.0]}
+
+  coupling_attenuation:
+    value:
+      - [0.0, 0.15, 0.15]
+      - [0.15, 0.0, 0.15]
+      - [0.15, 0.15, 0.0]
+
+sensors:
+  gyro:
+    sample_hz: {value: 500}
+    noise:
+      distribution: normal
+      stddev: {value: [0.003, 0.003, 0.003]}
+    bias: {value: [0.0, 0.0, 0.0]}
+    delay: {value: 0.002}
+    interpolation: linear
+  accelerometer:
+    sample_hz: {value: 500}
+    noise:
+      distribution: normal
+      stddev: {value: [0.03, 0.03, 0.03]}
+    bias: {value: [0.0, 0.0, 0.0]}
+    delay: {value: 0.002}
+    interpolation: linear
+  motor_speed:
+    sample_hz: {value: 500}
+    noise:
+      distribution: normal
+      stddev: {value: [3.0, 3.0]}
+    bias: {value: [0.0, 0.0]}
+    delay: {value: 0.0}
+
+logging:
+  directory: ../logs/sim2real_micro_coaxial
+  mode: compact
+  physics_step_stride: 10
+  chunk_steps: 1024
+  queue_chunks: 2
+  overflow: block

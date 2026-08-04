@@ -3037,6 +3037,60 @@ class TensorTrainingTests(unittest.TestCase):
         for name, value in qvalue_before.items():
             torch.testing.assert_close(target.qvalue.state_dict()[name], value)
 
+    def test_policy_reset_mean_retains_hidden_features_and_zeros_action_head(self):
+        config = ModelConfig(
+            (32, 32),
+            32,
+            32,
+            architecture="mlp",
+            sac_initial_action_std=(0.04, 0.05, 0.05),
+            sac_minimum_action_std=(0.01, 0.015, 0.015),
+            sac_maximum_action_std=(0.06, 0.08, 0.08),
+        )
+        source = build_sac_actor_critic(21, 3, config, torch.device("cpu"))
+        target = build_sac_actor_critic(21, 3, config, torch.device("cpu"))
+        with torch.no_grad():
+            for parameter in source.actor.parameters():
+                parameter.fill_(0.125)
+        source_distribution = next(
+            module
+            for module in source.actor.modules()
+            if isinstance(module, BoundedNormalParameters)
+        )
+        source_linear = [
+            module
+            for module in source_distribution.network.modules()
+            if isinstance(module, torch.nn.Linear)
+        ]
+        expected_hidden = source_linear[0].weight.clone()
+
+        _restore_policy(
+            {"actor": source.actor.state_dict()},
+            model=target,
+            reset_mean_output=True,
+        )
+
+        target_distribution = next(
+            module
+            for module in target.actor.modules()
+            if isinstance(module, BoundedNormalParameters)
+        )
+        target_linear = [
+            module
+            for module in target_distribution.network.modules()
+            if isinstance(module, torch.nn.Linear)
+        ]
+        torch.testing.assert_close(target_linear[0].weight, expected_hidden)
+        action_dim = 3
+        torch.testing.assert_close(
+            target_linear[-1].weight[:action_dim],
+            torch.zeros_like(target_linear[-1].weight[:action_dim]),
+        )
+        torch.testing.assert_close(
+            target_linear[-1].bias[:action_dim],
+            torch.zeros_like(target_linear[-1].bias[:action_dim]),
+        )
+
     def test_reward_terms_log_alive_and_sum_to_total_reward(self):
         calculator = AttitudeRewardCalculator(
             {

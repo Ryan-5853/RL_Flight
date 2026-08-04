@@ -1,0 +1,266 @@
+schema_version: 2
+experiment:
+  name: mlp_sac_angular_acceleration_bad_point_1581_v1
+  entrypoint:
+    type: flight_train.runner:run_experiment
+    version: train-framework-v1
+seed:
+  base: 20260841
+  deterministic_algorithms: true
+  cudnn_benchmark: false
+run:
+  device: cuda:0
+  dtype: float32
+  parallel_count: 512
+  total_control_steps: 4194304
+  output_root: ../../../runs
+  allow_unimplemented_simulator: false
+environment:
+  factory: simenv:SimulationEnvironment
+  config_path: ../../../../SimEnv/configs/sim2real_bad_points/group_1581.yaml
+  observation_source: truth
+command_source:
+  type: flight_train.commands:DirectAngularAccelerationCommandSource
+  version: '3'
+  seed: 52042
+  params:
+    throttle:
+      minimum: 0.1208262142609299
+      maximum: 0.39816974906358765
+      spool:
+        duration_s: 0.1
+        target_range:
+        - 0.2558262142609299
+        - 0.2858262142609299
+      height_controller:
+        observation_source: truth
+        target_m: 0.0
+        initial_throttle_range:
+        - 0.2558262142609299
+        - 0.2858262142609299
+        proportional_gain: 0.08
+        integral_gain: 0.04
+        error_limit_m: 5.0
+      slew_rate:
+        rise_per_s: 4.0
+        fall_per_s: 0.35
+    sticks:
+      roll:
+        mode: angle
+        limit_rad: 0.0
+        time_constant_s: 0.2
+      pitch:
+        mode: angle
+        limit_rad: 0.0
+        time_constant_s: 0.2
+      yaw:
+        mode: rate
+        limit_rad_s: 0.0
+        time_constant_s: 0.3
+      target_sampling:
+        distribution: centered
+        center_exponent: 2.0
+        hold_duration_s:
+          range:
+          - 2.0
+          - 4.0
+      reset:
+        filtered_stick: zero
+        initial_target_scale: 0.0
+    direct_angular_acceleration:
+      limits_rad_s2:
+      - 4.0
+      - 4.0
+      - 1.5
+      probabilities:
+        zero: 0.35
+        sine: 0.45
+        balanced_step: 0.2
+      zero:
+        hold_duration_s:
+        - 1.0
+        - 4.0
+      sine:
+        frequency_hz:
+        - 0.25
+        - 1.5
+        amplitude_fraction:
+        - 0.05
+        - 0.2
+        hold_duration_s:
+        - 6.0
+        - 10.0
+      balanced_step:
+        cycle_duration_s:
+        - 0.8
+        - 1.2
+        amplitude_fraction:
+        - 0.1
+        - 1.0
+control_contract:
+  version: self_stabilize_v1
+  observation_profile: angular_acceleration_allocated_inner_loop_21d_v2
+  observation_history:
+    mode: uniform
+    frames: 61
+    stride_steps: 1
+  action_transform:
+    type: coaxial_differential_cyclic
+    lower_motor_upper_ratio: 2.1659103988391513
+    trim_command:
+    - 0.2708262142609299
+    - 0.7799153009770031
+    - 0.5692409218589091
+    - -8.242696411475298e-14
+    residual_scale:
+    - 0.12
+    - 0.1980762291206972
+    - 0.1980762291206972
+  policy_action:
+    fields:
+    - lower_motor_differential
+    - servo_cyclic_a
+    - servo_cyclic_b
+  external_action:
+    fields:
+    - upper_motor
+  simulator_command:
+    fields:
+    - upper_motor
+    - lower_motor
+    - servo_1
+    - servo_2
+    - servo_3
+randomization:
+  static:
+    seed: 32042
+    scope: episode
+    parameters: {}
+  dynamic:
+    seed: 42042
+    scope: simulator
+    parameters: {}
+task:
+  episode_duration_s: 10.0
+  outer_loop:
+    type: attitude_pid
+    proportional_gain:
+    - 18.0
+    - 18.0
+    - 8.0
+    integral_gain:
+    - 1.5
+    - 1.5
+    - 0.75
+    derivative_gain:
+    - 7.0
+    - 7.0
+    - 4.0
+    integral_limit_rad_s:
+    - 0.15
+    - 0.15
+    - 0.2
+    max_angular_acceleration_rad_s2:
+    - 4.0
+    - 4.0
+    - 1.5
+  episode_curriculum:
+    durations_s:
+    - 4.0
+    - 6.0
+    - 8.0
+    - 10.0
+    target_scales:
+    - 0.25
+    - 0.5
+    - 0.75
+    - 1.0
+    success_fraction: 0.8
+    evaluation_episodes_per_env: 1.0
+    consecutive_passes: 2
+    quality_gate:
+      max_angular_rate_rms_rad_s: 4.0
+  termination:
+    max_tilt_rad: 1.0
+    max_angular_rate_rad_s: 6.0
+    angular_rate_axes: all
+reward:
+  calculator:
+    type: flight_train.rewards.angular_acceleration:AngularAccelerationTrackingRewardCalculator
+    version: '1'
+    params:
+      weight: 1.0
+      error_scale_rad_s2:
+      - 0.25
+      - 0.25
+      - 0.125
+      huber_delta: 1.0
+      reward_form: positive_exponential
+      aggregation: worst_axis
+  context:
+    fields:
+    - name: desired_angular_acceleration_b
+      source: task
+    - name: actual_angular_acceleration_b
+      source: task
+model:
+  type: mlp_actor_critic
+  hidden_sizes:
+  - 256
+  - 256
+  policy_distribution:
+    learnable_action_std: true
+    initial_action_std:
+    - 0.025
+    - 0.02
+    - 0.02
+    minimum_action_std:
+    - 0.005
+    - 0.005
+    - 0.005
+    maximum_action_std:
+    - 0.05
+    - 0.04
+    - 0.04
+algorithm:
+  name: sac
+  gamma: 0.99
+  n_step_return: 8
+  replay:
+    capacity_transitions: 524288
+    warmup_transitions: 131072
+    batch_size: 4096
+  critic_pretraining_updates: 1024
+  actor_update_interval: 8
+  policy_anchor:
+    weight: 5.0
+    max_action_deviation: 0.05
+  updates_per_collection: 64
+  target_update:
+    tau: 0.0025
+    interval_updates: 1
+  entropy:
+    automatic: true
+    initial_alpha: 0.0002
+    target_entropy: -3.0
+    min_alpha: 2.0e-05
+    max_alpha: 0.0008
+  actor_max_grad_norm: 0.5
+  critic_max_grad_norm: 2.5
+  optimizer:
+    type: adam
+    actor_learning_rate: 2.0e-06
+    critic_learning_rate: 0.0001
+    alpha_learning_rate: 5.0e-05
+collector:
+  control_steps_per_rollout: 256
+evaluation:
+  enabled: false
+checkpoint:
+  minimum_free_space_bytes: 8589934592
+  resume:
+    from: ../../../runs/sim2real_bad_point_teacher_bootstrap/group_1581_v1.pt
+    mode: policy
+  interval_control_steps: 1048576
+  keep_last: 4
+recording: {}

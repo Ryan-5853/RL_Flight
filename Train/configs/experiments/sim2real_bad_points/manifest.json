@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "source_experiment": "/home/ryan/RL_Flight/Train/configs/experiments/mlp_sac_pid_angular_acceleration_tracking_v8.yaml",
+  "source_point_manifest": "/home/ryan/RL_Flight/Identification/runs/sim2real_micro_selected_points_v1.json",
+  "experiments": [
+    {
+      "group_id": 1927,
+      "experiment_config": "/home/ryan/RL_Flight/Train/configs/experiments/sim2real_bad_points/mlp_sac_angular_acceleration_bad_point_1927_v1.yaml",
+      "upper_hover_pwm": 0.4635045771681325,
+      "lower_hover_pwm": 0.4365456190189079,
+      "lower_motor_upper_ratio": 0.9418366948737911,
+      "servo_trim_command": [
+        -0.39379232710824175,
+        0.06637287046035123,
+        -0.26051443825658444
+      ],
+      "motor_residual_scale": 0.12,
+      "cyclic_residual_scale": 0.4,
+      "throttle_range": [
+        0.3135045771681325,
+        0.85
+      ],
+      "acceleration_limits_rad_s2": [
+        4.0,
+        4.0,
+        1.5
+      ]
+    },
+    {
+      "group_id": 1581,
+      "experiment_config": "/home/ryan/RL_Flight/Train/configs/experiments/sim2real_bad_points/mlp_sac_angular_acceleration_bad_point_1581_v1.yaml",
+      "upper_hover_pwm": 0.2708262142609299,
+      "lower_hover_pwm": 0.5865853137459881,
+      "lower_motor_upper_ratio": 2.1659103988391513,
+      "servo_trim_command": [
+        0.7799153009770031,
+        0.5692409218589091,
+        -8.242696411475298e-14
+      ],
+      "motor_residual_scale": 0.12,
+      "cyclic_residual_scale": 0.1980762291206972,
+      "throttle_range": [
+        0.1208262142609299,
+        0.39816974906358765
+      ],
+      "acceleration_limits_rad_s2": [
+        4.0,
+        4.0,
+        1.5
+      ]
+    },
+    {
+      "group_id": 3468,
+      "experiment_config": "/home/ryan/RL_Flight/Train/configs/experiments/sim2real_bad_points/mlp_sac_angular_acceleration_bad_point_3468_v1.yaml",
+      "upper_hover_pwm": 0.729006090134273,
+      "lower_hover_pwm": 0.6707097201460656,
+      "lower_motor_upper_ratio": 0.9200330823334136,
+      "servo_trim_command": [
+        0.04300165702708362,
+        -0.27578176983837766,
+        0.3499801262195477
+      ],
+      "motor_residual_scale": 0.12,
+      "cyclic_residual_scale": 0.4,
+      "throttle_range": [
+        0.579006090134273,
+        0.85
+      ],
+      "acceleration_limits_rad_s2": [
+        4.0,
+        4.0,
+        1.5
+      ]
+    }
+  ]
+}

@@ -216,3 +216,11 @@ class FlightTrainAdapterTests(unittest.TestCase):
             ],
             [6.0, 6.0, 3.0],
         )
+        controller = converted.contract["controller"]
+        self.assertNotIn("identified_inner_loop", controller)
+        self.assertNotIn("outer_loop_validation", controller)
+        self.assertEqual(controller["validation"]["status"], "external")
+        self.assertEqual(
+            controller["validation"]["required_suite"],
+            "fixed_small_command_tracking_v1",
+        )

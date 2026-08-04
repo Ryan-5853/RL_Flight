@@ -508,10 +508,10 @@ def _select_gate(
     return max(
         pool,
         key=lambda candidate: (
-            candidate["coverage"]
+            candidate["rescued_count"]
             if eligible
             else candidate["non_degradation_fraction_when_accepted"],
-            candidate["rescued_count"],
+            candidate["coverage"],
             candidate["non_degradation_wilson_lower_95"],
             -candidate["uncertainty_multiplier"],
         ),

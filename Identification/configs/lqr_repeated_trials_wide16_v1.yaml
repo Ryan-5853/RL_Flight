@@ -1,0 +1,38 @@
+schema_version: 1
+
+simulator_config: ../../SimEnv/configs/example.yaml
+controller_config: ../../Controller/configs/lqr_identification_nominal.yaml
+
+run:
+  seed: 20260813
+  device: cuda:0
+  dtype: float32
+  parallel_count: 2048
+  output_directory: ../datasets/lqr_repeated_trials_wide16_v1
+
+observation:
+  measurement_mode: simulated_sensors
+
+sampling:
+  parameter_groups: 8192
+  initial_conditions_per_group: 16
+  episode_duration_s: 2.0
+  log10_effectiveness_range: [-2.0, 2.0]
+
+initial_state:
+  minimum_tilt_rad: 0.0523599
+  maximum_tilt_rad: 0.3490659
+  maximum_angular_rate_rad_s: [0.8, 0.8, 0.8]
+
+convergence:
+  maximum_roll_pitch_error_rad: 0.0349066
+  maximum_angular_rate_rad_s: 0.10
+  hold_s: 0.5
+  safety_tilt_rad: 1.0471976
+  safety_angular_rate_rad_s: 8.0
+
+window:
+  length_s: 1.0
+  stride_s: 1.0
+  maximum_start_s: 0.0
+  split_fractions: [0.70, 0.15, 0.15]

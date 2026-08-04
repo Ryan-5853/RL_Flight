@@ -1,6 +1,6 @@
 schema_version: 1
 
-artifact: ../artifacts/lqr_wide_effective_deployment_v2/deployment.pt
+artifact: ../artifacts/lqr_wide_effective_deployment_v2/deployment_validated.pt
 history:
   duration_s: 1.0
   raw_sample_hz: 500

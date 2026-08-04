@@ -1,0 +1,45 @@
+schema_version: 1
+
+simulator_config: ../../SimEnv/configs/example.yaml
+controller_config: ../../Controller/configs/lqr_identification_nominal.yaml
+
+run:
+  seed: 20260815
+  device: cuda:0
+  dtype: float32
+  parallel_count: 2048
+  output_directory: ../datasets/lqr_repeated_trials_empirical_core16_v1
+
+observation:
+  measurement_mode: simulated_sensors
+
+sampling:
+  parameterization: empirical_core
+  parameter_groups: 8192
+  initial_conditions_per_group: 16
+  episode_duration_s: 2.0
+  empirical_ranges:
+    inertia_scale: [0.5, 2.0]
+    thrust_to_weight: [1.2, 5.0]
+    motor_reaction_scale: [0.25, 4.0]
+    motor_time_constant_s: [0.015, 0.120]
+    grid_effectiveness_scale: [0.25, 4.0]
+    servo_time_constant_s: [0.010, 0.080]
+
+initial_state:
+  minimum_tilt_rad: 0.0523599
+  maximum_tilt_rad: 0.3490659
+  maximum_angular_rate_rad_s: [0.8, 0.8, 0.8]
+
+convergence:
+  maximum_roll_pitch_error_rad: 0.0349066
+  maximum_angular_rate_rad_s: 0.10
+  hold_s: 0.5
+  safety_tilt_rad: 1.0471976
+  safety_angular_rate_rad_s: 8.0
+
+window:
+  length_s: 1.0
+  stride_s: 1.0
+  maximum_start_s: 0.0
+  split_fractions: [0.70, 0.15, 0.15]

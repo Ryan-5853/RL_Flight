@@ -394,7 +394,21 @@ bash ./Tools/setup/ubuntu.sh --no-sim-tools
 
 该安装脚本会使用系统包管理器、网络和 `sudo`。
 
-### 14.3 编译神经网络控制器固件
+### 14.3 选择控制器后端并编译固件
+
+框架输入和执行器输出接口固定，构建时只编入一个控制器后端。在
+`px4/boards/micoair/h743-v2/nncontrol.px4board` 中保留下列三项之一：
+
+```text
+CONFIG_NN_CONTROL_BACKEND_NEURAL=y
+CONFIG_NN_CONTROL_BACKEND_LQR=y
+CONFIG_NN_CONTROL_BACKEND_HYBRID=y
+```
+
+当前默认项是 `NEURAL`。`LQR` 和 `HYBRID` 已有可独立编译的后端文件与完整接口，
+但控制律仍是安全骨架，会拒绝执行器输出；实现分别放在
+`LqrControllerBackend.cpp` 和 `HybridControllerBackend.cpp`，不得在验证完成前把
+`actuatorOutputAllowed()` 改为 `true`。
 
 在 `px4/` 目录中执行以下完整命令：
 
@@ -459,11 +473,30 @@ build/micoair_h743-v2_nncontrol/micoair_h743-v2_nncontrol.px4
 
 ### 14.5 烧录后的模块检查
 
-当前 `nn_control` 已编入固件，但尚未设置为开机自动启动。进入 NSH 后执行：
+`micoair_h743-v2_nncontrol` 固件包含专用机架
+`Direct Actuator Controller (2 motors, 3 servos)`，其 ID 为 `22001`。空参数存储首次启动
+会自动使用该机架。该专用固件启动时会检查 ROMFS 中的 22001 脚本，并把当前
+`SYS_AUTOSTART` 强制设置、保存为 `22001`；因此即使 QGC 没有加载自定义机架列表，
+飞控启动也不再依赖 QGC 的机架选择页面。
+
+QGC 的自定义机架列表来自刷写固件时提取到其配置目录的
+`PX4AirframeFactMetaData.xml`，并在单次 QGC 进程中只加载一次。使用 QGC 的
+“Custom firmware file”刷入本项目生成的完整 `.px4` 文件后，应完全退出 QGC，确认后台
+进程也已结束，再重新打开并连接；只断开、重连飞控不会刷新已经加载的机架列表。
+
+如果旧固件已经把无效机架保存为 `0`，可在 NSH 中显式恢复一次：
 
 ```text
-nn_control start
+param set SYS_AUTOSTART 22001
+param save
+reboot
+```
+
+该机架会自动启动 `nn_control`。进入 NSH 检查：
+
+```text
 nn_control status
+param show SYS_AUTOSTART
 ```
 
 检查输入和执行器主题：
@@ -476,11 +509,47 @@ listener vehicle_local_position
 listener manual_control_setpoint
 listener actuator_motors
 listener actuator_servos
+listener actuator_servos_trim
 ```
 
-当前神经网络接口仍是安全桩，`NeuralNetworkInterface::run()` 默认返回 `false`，所以
-`actuator_motors` 和 `actuator_servos` 应显示 `NaN` 安全输出。接入并验证真实模型前，
-不得通过临时常量或无条件 `return true` 绕过该保护。
+固定执行器契约是两路非反转电机 `[0,1]` 加三路舵机 `[-1,1]`。默认物理输出映射为：
+
+| 飞控输出 | PX4 功能 | 定时器组 | 默认协议 |
+| --- | --- | --- | --- |
+| M1/M2（PWM 1/2） | 上桨/下桨，Motor 1/2 | TIM1 | PWM 400 Hz |
+| M6（PWM 6） | Servo 1 | TIM3 | PWM 333 Hz |
+| M7/M8（PWM 7/8） | Servo 2/3 | TIM4 | PWM 333 Hz |
+
+未使用的 M3/M4/M5/M9/M10 在 22001 机架中显式设置为 `Disabled`。这里的
+`Motor 1/2` 和 `Servo 1/2/3` 是 PX4 输出功能，`M1/M2/M6/M7/M8` 是飞控板上的
+物理插针编号，不要把两者混淆。
+
+如果飞控已经运行过采用旧通道映射的 22001 固件，旧的用户参数可能优先于新默认值。
+刷入本固件后在 NSH 执行一次以下命令，再重启：
+
+```text
+param reset PWM_MAIN_TIM*
+param reset PWM_MAIN_FUNC*
+param reset PWM_MAIN_DIS*
+param reset PWM_MAIN_FAIL*
+param save
+reboot
+```
+
+这些命令不重置 `PWM_MAIN_MINx`/`PWM_MAIN_MAXx` 和 `NN_SV_TRIMx`，已有的端点及中值
+标定可以保留。也可以在 QGC 中重新选择 22001 并同意重置机架参数，然后核对五个通道。
+
+QGC 的 Actuators 页面仍负责底层输出测试与标定。`PWM_MAIN_REV` 控制各物理通道方向，
+`PWM_MAIN_MINx`/`PWM_MAIN_MAXx` 控制端点，`PWM_MAIN_DISx` 和
+`PWM_MAIN_FAILx` 控制停机与失效值。三路舵机独立中值由
+`NN_SV_TRIM1`/`NN_SV_TRIM2`/`NN_SV_TRIM3` 设置，单位为归一化输出；在
+1000–2000 us 范围内，`0.02` 约等于 `10 us`。这些 trim 同时用于正常控制输出和 QGC
+执行器测试。
+
+当前 Neural 后端使用确定性随机权重，LQR/Hybrid 后端是未实现骨架，三者都通过
+`actuatorOutputAllowed()` 强制保持安全禁止状态。因此即使推理或框架循环正常，
+`actuator_motors` 和 `actuator_servos` 也应显示 `NaN`。接入并验证真实控制器前，不得
+绕过该保护。
 
 ### 14.6 常见构建错误
 

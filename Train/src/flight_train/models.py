@@ -267,6 +267,19 @@ class BoundedNormalParameters(nn.Module):
         final_linear.weight[action_dim:].zero_()
         final_linear.bias[action_dim:].copy_(raw_initial)
 
+    @torch.no_grad()
+    def reset_mean_output(self) -> None:
+        """Reset only the action-mean head while retaining hidden features."""
+
+        final_linear = [
+            module
+            for module in self.network.modules()
+            if isinstance(module, nn.Linear)
+        ][-1]
+        action_dim = self.initial_std.numel()
+        final_linear.weight[:action_dim].zero_()
+        final_linear.bias[:action_dim].zero_()
+
     def forward(
         self, observation: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:

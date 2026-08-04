@@ -6,7 +6,10 @@ from .rewards import (
     AngularAccelerationTrackingRewardCalculator,
     AttitudeRewardCalculator,
 )
-from .commands import VirtualPilotCommandSource
+from .commands import (
+    DirectAngularAccelerationCommandSource,
+    VirtualPilotCommandSource,
+)
 
 
 class ComponentRegistry:
@@ -20,6 +23,9 @@ class ComponentRegistry:
     }
     _command_source_types = {
         "flight_train.commands:VirtualPilotCommandSource": VirtualPilotCommandSource,
+        "flight_train.commands:DirectAngularAccelerationCommandSource": (
+            DirectAngularAccelerationCommandSource
+        ),
     }
 
     def build_reward(self, node: Mapping[str, Any]):

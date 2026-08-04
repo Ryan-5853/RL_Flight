@@ -966,6 +966,27 @@ class SimEnvAdapter:
     ) -> None:
         if self.outer_loop is None:
             return
+        if getattr(
+            self.command_source,
+            "angular_acceleration_override_enabled",
+            False,
+        ):
+            override = self.command_source.desired_angular_acceleration
+            assert_tensor_on(
+                override,
+                device=self.device,
+                dtype=self.dtype,
+                shape=(self.batch_size, 3),
+                name="direct desired angular acceleration",
+            )
+            self.outer_loop.desired_angular_acceleration.copy_(
+                torch.where(
+                    active_mask[:, None],
+                    override,
+                    self.outer_loop.desired_angular_acceleration,
+                )
+            )
+            return
         target_angular_velocity = torch.zeros_like(angular_velocity)
         target_angular_velocity[:, 2:3] = self.command_source.desired_yaw_rate
         self.outer_loop.update(

@@ -473,7 +473,13 @@ def run_experiment(config: ExperimentConfig) -> dict[str, Any]:
                     device=device,
                 )
             else:
-                _restore_policy(resume_state, model=model)
+                _restore_policy(
+                    resume_state,
+                    model=model,
+                    reset_mean_output=(
+                        config.checkpoint.resume_mode == "policy_reset_mean"
+                    ),
+                )
                 if isinstance(algorithm, TorchRLSAC):
                     algorithm.initialize_policy_anchor()
             # policy 热启动只需 actor；exact restore 也已把所有状态复制到对应
@@ -1270,7 +1276,9 @@ def _apply_sac_continuation_overrides(
             group["lr"] = learning_rate
 
 
-def _restore_policy(state: Mapping[str, Any], *, model) -> None:
+def _restore_policy(
+    state: Mapping[str, Any], *, model, reset_mean_output: bool = False
+) -> None:
     """恢复策略均值；新目标下的方差、critic、replay 与优化器重新初始化。"""
 
     actor_state = state.get("actor")
@@ -1296,6 +1304,8 @@ def _restore_policy(state: Mapping[str, Any], *, model) -> None:
             minimum,
             maximum,
         )
+        if reset_mean_output:
+            distribution.reset_mean_output()
 
 
 def _copy_training_tensor(

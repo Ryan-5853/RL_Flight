@@ -108,6 +108,52 @@ class ControllerTests(unittest.TestCase):
         )
         self.assertLess(max(abs(controller._lqr_poles)), 1.0)
 
+    def test_optional_lqr_integral_augmentation_is_stable(self) -> None:
+        controller = create_controller(
+            {
+                "type": "lqr",
+                "params": {
+                    "collective_mode": "hover",
+                    "lqr": {
+                        "integral_state_scales": [0.2, 0.2, 0.5],
+                    },
+                },
+            },
+            self.context,
+        )
+        self.assertTrue(controller._lqr_integral_enabled)
+        self.assertEqual(tuple(controller._lqr_gain.shape), (5, 13))
+        self.assertLess(max(abs(controller._lqr_poles)), 1.0)
+        output = controller.step(
+            self.state_at_trim(controller), self.reference()
+        )
+        self.assertEqual(
+            tuple(output.diagnostics["controller.lqr_state"].shape),
+            (2, 13),
+        )
+
+    def test_lqi_freezes_integral_while_actuator_command_is_saturated(self) -> None:
+        controller = create_controller(
+            {
+                "type": "lqr",
+                "params": {
+                    "collective_mode": "hover",
+                    "lqr": {"integral_state_scales": [0.2, 0.2, 0.5]},
+                },
+            },
+            self.context,
+        )
+        state = self.state_at_trim(controller)
+        half_angle = math.radians(80.0) / 2.0
+        state.attitude_q_wb[:, 0] = math.cos(half_angle)
+        state.attitude_q_wb[:, 1] = math.sin(half_angle)
+        output = controller.step(state, self.reference())
+        self.assertTrue(output.diagnostics["controller.lqr_saturated"].all())
+        torch.testing.assert_close(
+            controller.attitude_integral,
+            torch.zeros_like(controller.attitude_integral),
+        )
+
     def test_lqr_supports_one_scheduled_gain_per_vehicle(self) -> None:
         controller = create_controller(
             {"type": "lqr", "params": {"collective_mode": "hover"}},

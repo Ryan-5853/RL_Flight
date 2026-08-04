@@ -8,6 +8,8 @@ version = "0.1.0"
 description = "Closed-loop LQR system-identification dataset experiments"
 requires-python = ">=3.10,<3.11"
 dependencies = [
+    "numpy>=1.26,<3.0",
+    "scipy>=1.11,<2.0",
     "torch>=2.2,<3.0",
     "PyYAML>=6.0,<7.0",
 ]
@@ -21,6 +23,17 @@ flight-identification-ensemble-control-eval = "flight_identification.ensemble_co
 flight-identification-gain-train = "flight_identification.gain_training:main"
 flight-identification-gain-control-eval = "flight_identification.gain_control_evaluation:main"
 flight-identification-nonlinear-eval = "flight_identification.nonlinear_evaluation:main"
+flight-identification-finalize = "flight_identification.finalize_deployment:main"
+flight-identification-repeated-trials = "flight_identification.repeated_trial_experiment:main"
+flight-identification-repeated-trial-train = "flight_identification.repeated_trial_training:main"
+flight-identification-repeated-trial-eval = "flight_identification.repeated_trial_evaluation:main"
+flight-identification-sim2real-control-eval = "flight_identification.sim2real_control_evaluation:main"
+flight-identification-sim2real-parameter-diagnostics = "flight_identification.sim2real_parameter_diagnostics:main"
+flight-identification-sim2real-composite-train = "flight_identification.sim2real_composite_training:main"
+flight-identification-sim2real-composite-eval = "flight_identification.sim2real_composite_evaluation:main"
+flight-identification-offline-log-infer = "flight_identification.offline_log_inference:main"
+flight-identification-sim2real-bad-point-screen = "flight_identification.sim2real_bad_point_screening:main"
+flight-identification-sim2real-point-materialize = "flight_identification.sim2real_point_materialization:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

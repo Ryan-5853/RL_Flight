@@ -269,6 +269,20 @@ flight-train run --config configs/experiments/mlp_ppo_smoke.json \
 三个和严格为零的舵面命令，因此 yaw 不能借用舵面共模。对应实验配置为
 `configs/experiments/mlp_sac_pid_angular_acceleration_tracking_v3.yaml`。
 
+角加速度内环的小误差精调使用隔离配置
+`configs/experiments/mlp_sac_pid_angular_acceleration_tracking_v8.yaml`。该配置从已稳定
+策略只恢复 actor，以直接零值、正弦和成对阶跃角加速度训练；奖励仍只有期望/实际角
+加速度误差，但采用 `[0.25, 0.25, 0.125] rad/s²` 尺度和最差轴聚合，使持续的跨轴
+小偏差不会被三轴平均或宽尺度隐藏。精调使用较低 actor 学习率和源策略 anchor，并每
+`1,048,576` 控制步保存候选。SAC 最终迭代不保证最好，必须先用
+`configs/evaluation/fixed_angular_acceleration_screen_v1.yaml` 快速筛选，再用
+`configs/evaluation/fixed_angular_acceleration_tracking_v1.yaml` 跑完整直接内环验收。
+
+直接训练配置把 roll/pitch/yaw stick 限制设为零，不能直接用于姿态指令级联评测。
+部署闭环应使用正常 VirtualPilot 范围的 v3 配置加载选中的 v8 checkpoint，并运行
+`configs/evaluation/fixed_small_command_tracking_v1.yaml`。这只替换评测命令源，不
+改变 21 维观察、61 帧历史、3 维策略动作、PID、执行器分配或 SimEnv 动力学。
+
 `control_contract.observation_history` 支持两种 MLP 历史输入。`uniform` 模式
 按固定控制步间隔抽取 21 维整帧，并按 oldest→current 展平。更适合执行器低通
 建模的 `multirate_actuator` 模式会拼接：

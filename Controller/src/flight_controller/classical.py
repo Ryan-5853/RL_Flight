@@ -126,6 +126,8 @@ class ClassicalControllerBase(FlightController):
         )
         self.last_command = self.trim.command.clone()
         self._lqr_gain: torch.Tensor | None = None
+        self._lqr_integral_enabled = False
+        self._lqr_state_size = 10
         self._lqr_poles = np.asarray([], dtype=np.complex128)
         if self.controller_type != "pid":
             self._lqr_gain, self._lqr_poles = self._design_lqr(
@@ -159,8 +161,12 @@ class ClassicalControllerBase(FlightController):
         """Install one shared gain or one gain per parallel vehicle."""
         if self._lqr_gain is None:
             raise RuntimeError("LQR gain scheduling requires an LQR controller")
-        expected_shared = (5, 10)
-        expected_batched = (self.context.batch_size, 5, 10)
+        expected_shared = (5, self._lqr_state_size)
+        expected_batched = (
+            self.context.batch_size,
+            5,
+            self._lqr_state_size,
+        )
         if tuple(gain.shape) not in {expected_shared, expected_batched}:
             raise ValueError(
                 "LQR gain must have shape (5, 10) or "
@@ -298,16 +304,33 @@ class ClassicalControllerBase(FlightController):
         target_motor_speed: torch.Tensor,
         attitude_error: torch.Tensor,
         rate_error: torch.Tensor,
+        active: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        lqr_state = torch.cat(
-            (
-                attitude_error[:, :2],
-                rate_error,
-                state.motor_speed - target_motor_speed,
-                state.servo_angle,
-            ),
-            dim=1,
+        state_parts = (
+            attitude_error[:, :2],
+            rate_error,
+            state.motor_speed - target_motor_speed,
+            state.servo_angle,
         )
+        previous_integral = None
+        if self._lqr_integral_enabled:
+            previous_integral = self.attitude_integral.clone()
+            integral_error = torch.cat(
+                (attitude_error[:, :2], rate_error[:, 2:3]), dim=1
+            )
+            candidate = (
+                self.attitude_integral
+                + integral_error * self.context.control_dt
+            ).clamp(
+                -self.attitude_integral_limit,
+                self.attitude_integral_limit,
+            )
+            self.attitude_integral.copy_(
+                torch.where(active[:, None], candidate, self.attitude_integral)
+            )
+            lqr_state = torch.cat((*state_parts, self.attitude_integral), dim=1)
+        else:
+            lqr_state = torch.cat(state_parts, dim=1)
         if self._lqr_gain is None:
             raise RuntimeError("LQR gain is unavailable for this controller")
         if self._lqr_gain.ndim == 2:
@@ -318,10 +341,25 @@ class ClassicalControllerBase(FlightController):
             ).squeeze(-1)
         lower = delta.new_tensor([0.0, 0.0, -1.0, -1.0, -1.0])
         upper = delta.new_tensor([1.0, 1.0, 1.0, 1.0, 1.0])
-        command = (base + delta).clamp(lower, upper)
+        unconstrained_command = base + delta
+        command = unconstrained_command.clamp(lower, upper)
+        saturated = (
+            (unconstrained_command < lower) | (unconstrained_command > upper)
+        ).any(dim=1)
+        if self._lqr_integral_enabled:
+            if previous_integral is None:
+                raise RuntimeError("LQI integral snapshot is unavailable")
+            self.attitude_integral.copy_(
+                torch.where(
+                    (active & saturated)[:, None],
+                    previous_integral,
+                    self.attitude_integral,
+                )
+            )
         return command, {
             "controller.lqr_state": lqr_state,
             "controller.lqr_delta_command": delta,
+            "controller.lqr_saturated": saturated,
         }
 
     def _common_step(
@@ -396,12 +434,43 @@ class ClassicalControllerBase(FlightController):
             b = torch.autograd.functional.jacobian(
                 lambda value: continuous(x0, value), u0
             ).detach().cpu().numpy()
+        integral_scales_raw = config.get("integral_state_scales")
+        if integral_scales_raw is not None:
+            integral_scales = np.asarray(
+                _vector(
+                    config,
+                    "integral_state_scales",
+                    (0.20, 0.20, 0.50),
+                ),
+                dtype=np.float64,
+            )
+            if np.any(integral_scales <= 0.0):
+                raise ValueError("lqr integral_state_scales must be positive")
+            integral_output = np.zeros((3, 10), dtype=np.float64)
+            integral_output[0, 0] = 1.0
+            integral_output[1, 1] = 1.0
+            integral_output[2, 4] = 1.0
+            a = np.block(
+                [
+                    [a, np.zeros((10, 3), dtype=np.float64)],
+                    [integral_output, np.zeros((3, 3), dtype=np.float64)],
+                ]
+            )
+            b = np.vstack((b, np.zeros((3, 5), dtype=np.float64)))
+            self._lqr_integral_enabled = True
+            self._lqr_state_size = 13
+        else:
+            integral_scales = np.asarray([], dtype=np.float64)
         augmented = np.block(
-            [[a, b], [np.zeros((5, 15), dtype=np.float64)]]
+            [
+                [a, b],
+                [np.zeros((5, a.shape[0] + 5), dtype=np.float64)],
+            ]
         )
         discrete = expm(augmented * self.context.control_dt)
-        ad = discrete[:10, :10]
-        bd = discrete[:10, 10:]
+        state_count = a.shape[0]
+        ad = discrete[:state_count, :state_count]
+        bd = discrete[:state_count, state_count:]
         state_scales = np.asarray(
             _vector(
                 config,
@@ -421,6 +490,8 @@ class ClassicalControllerBase(FlightController):
             ),
             dtype=np.float64,
         )
+        if self._lqr_integral_enabled:
+            state_scales = np.concatenate((state_scales, integral_scales))
         input_scales = np.asarray(
             _vector(config, "input_scales", (0.18, 0.18, 0.45, 0.45, 0.45)),
             dtype=np.float64,
@@ -485,7 +556,7 @@ class LQRController(ClassicalControllerBase):
             state, reference, active_mask
         )
         command, diagnostics = self._lqr_command(
-            state, base, target_speed, attitude_error, rate_error
+            state, base, target_speed, attitude_error, rate_error, active
         )
         diagnostics.update(
             {
@@ -553,7 +624,7 @@ class HybridPIDLQRController(ClassicalControllerBase):
             state, reference, base, attitude_error, rate_error, active
         )
         lqr_command, lqr_diagnostics = self._lqr_command(
-            state, base, target_speed, attitude_error, rate_error
+            state, base, target_speed, attitude_error, rate_error, active
         )
         speed_fraction = (
             state.motor_speed / target_speed.clamp_min(1.0)

@@ -80,6 +80,12 @@ class FixedScenario:
     roll_amplitude_rad: float
     pitch_amplitude_rad: float
     yaw_rate_amplitude_rad_s: float = 0.0
+    angular_acceleration_amplitude_rad_s2: tuple[float, float, float] = (
+        0.0,
+        0.0,
+        0.0,
+    )
+    frequency_hz: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -155,6 +161,14 @@ class ScriptedEvaluationCommandSource:
         self._desired_yaw_rate = torch.zeros(
             base.batch_size, 1, dtype=base.dtype, device=base.device
         )
+        self.angular_acceleration_override_enabled = all(
+            item.type
+            in {"angular_acceleration_step", "angular_acceleration_sine"}
+            for item in self.scenarios
+        )
+        self._desired_angular_acceleration = torch.zeros(
+            base.batch_size, 3, dtype=base.dtype, device=base.device
+        )
         yaw_rate_limit = base.config.max_yaw_rate_rad_s
         for item in self.scenarios:
             if (
@@ -183,6 +197,10 @@ class ScriptedEvaluationCommandSource:
     @property
     def desired_yaw_rate(self) -> torch.Tensor:
         return self._desired_yaw_rate
+
+    @property
+    def desired_angular_acceleration(self) -> torch.Tensor:
+        return self._desired_angular_acceleration
 
     def set_curriculum_scale(self, scale: float) -> None:
         self.base.set_curriculum_scale(scale)
@@ -256,6 +274,12 @@ class ScriptedEvaluationCommandSource:
             device=self.base.device,
             dtype=self.base.dtype,
         )
+        scripted_angular_acceleration = torch.zeros(
+            self.base.batch_size,
+            3,
+            device=self.base.device,
+            dtype=self.base.dtype,
+        )
         for index, scenario in enumerate(self.scenarios):
             group = slice(
                 index * self.group_size,
@@ -268,6 +292,9 @@ class ScriptedEvaluationCommandSource:
                 (roll, pitch, yaw), dim=-1
             )
             scripted_yaw_rate[group] = yaw_rate
+            scripted_angular_acceleration[group] = (
+                _scenario_angular_acceleration(scenario, time_s[group])
+            )
         yaw_rate_limit = self.base.config.max_yaw_rate_rad_s
         yaw_stick = (
             scripted_yaw_rate / yaw_rate_limit
@@ -291,6 +318,9 @@ class ScriptedEvaluationCommandSource:
             scripted_euler[:, 2],
         )
         self._desired_yaw_rate.copy_(scripted_yaw_rate[:, None])
+        self._desired_angular_acceleration.copy_(
+            scripted_angular_acceleration
+        )
 
 
 def load_fixed_evaluation_suite(path: str | Path) -> FixedEvaluationSuite:
@@ -313,9 +343,9 @@ def load_fixed_evaluation_suite(path: str | Path) -> FixedEvaluationSuite:
         "evaluation suite",
     )
     schema_version = int(raw.get("schema_version", -1))
-    if schema_version not in {1, 2, 3, 4}:
+    if schema_version not in {1, 2, 3, 4, 5}:
         raise ValueError(
-            "evaluation schema_version must equal 1, 2, 3, or 4"
+            "evaluation schema_version must equal 1, 2, 3, 4, or 5"
         )
     scenarios_node = raw.get("scenarios")
     if not isinstance(scenarios_node, list) or not scenarios_node:
@@ -331,7 +361,7 @@ def load_fixed_evaluation_suite(path: str | Path) -> FixedEvaluationSuite:
             f"evaluation scenarios must contain exactly "
             f"{sorted(required_types)}"
         )
-    if schema_version >= 4:
+    if schema_version == 4:
         if not required_types.issubset(scenario_types):
             raise ValueError(
                 f"evaluation scenarios must include "
@@ -341,10 +371,25 @@ def load_fixed_evaluation_suite(path: str | Path) -> FixedEvaluationSuite:
             raise ValueError(
                 "evaluation schema_version 4 requires a command_step scenario"
             )
+    if schema_version == 5:
+        direct_types = {
+            "angular_acceleration_step",
+            "angular_acceleration_sine",
+        }
+        if not scenario_types.issubset(direct_types):
+            raise ValueError(
+                "evaluation schema_version 5 only supports direct angular-"
+                "acceleration scenarios"
+            )
+        if scenario_types != direct_types:
+            raise ValueError(
+                "evaluation schema_version 5 requires angular_acceleration_"
+                "step and angular_acceleration_sine scenarios"
+            )
 
     scoring = _mapping(raw.get("scoring"), "scoring")
     scoring_fields = {"limits", "weights"}
-    if schema_version >= 3:
+    if schema_version in {3, 4}:
         scoring_fields.add("self_stabilize_tracking")
     _only_keys(scoring, scoring_fields, "scoring")
     limits_node = _mapping(scoring.get("limits"), "scoring.limits")
@@ -364,7 +409,7 @@ def load_fixed_evaluation_suite(path: str | Path) -> FixedEvaluationSuite:
     total_weight = sum(parsed_weights.values())
     if not math.isclose(total_weight, 1.0, abs_tol=1e-6):
         raise ValueError("scoring.weights must sum to 1")
-    if schema_version >= 3:
+    if schema_version in {3, 4}:
         stabilization_scoring = _mapping(
             scoring.get("self_stabilize_tracking"),
             "scoring.self_stabilize_tracking",
@@ -402,8 +447,10 @@ def load_fixed_evaluation_suite(path: str | Path) -> FixedEvaluationSuite:
         selection_names
         if schema_version <= 2
         else selection_names - {"maximum_hover_yaw_rate_rmse_rad_s"}
+        if schema_version in {3, 4}
+        else set()
     )
-    if (schema_version >= 2 or selection_node) and not (
+    if ((2 <= schema_version <= 4) or selection_node) and not (
         required_selection_names.issubset(selection_node)
     ):
         missing = sorted(required_selection_names - set(selection_node))
@@ -440,7 +487,7 @@ def load_fixed_evaluation_suite(path: str | Path) -> FixedEvaluationSuite:
         scenarios=scenarios,
         limits=limits,
         score_weights=parsed_weights,
-        self_stabilize_tracking=schema_version >= 2,
+        self_stabilize_tracking=schema_version in {2, 3, 4},
         yaw_rate_tracking_weight=yaw_rate_tracking_weight,
         checkpoint_selection=checkpoint_selection,
         output_root=output_root,
@@ -464,6 +511,7 @@ def run_fixed_evaluation(
     device = torch.device(config.run.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError(f"CUDA requested but unavailable: {device}")
+    _validate_angular_acceleration_suite(config, suite)
     checkpoint_source = Path(checkpoint_path).expanduser().resolve()
     state = load_checkpoint(checkpoint_source)
     checkpoint_reference = (
@@ -560,6 +608,10 @@ def run_fixed_evaluation(
                 directory / f"trajectory_{scenario.name}.pt",
             )
         report["total_score"] = sum(scenario_scores) / len(scenario_scores)
+        if suite.schema_version == 5:
+            report["angular_acceleration_summary"] = (
+                _angular_acceleration_suite_summary(report["scenarios"])
+            )
         report["status"] = "completed"
     except BaseException:
         report["status"] = "failed"
@@ -1194,6 +1246,10 @@ def _score_trajectory(
     yaw_rate_tracking_weight: float = 0.25,
 ) -> dict[str, Any]:
     alive = trajectory["alive"].bool()
+    direct_angular_acceleration = scenario.type in {
+        "angular_acceleration_step",
+        "angular_acceleration_sine",
+    }
     attitude_error_deg = torch.rad2deg(
         quaternion_geodesic_angle(
             trajectory["attitude_q_wb"], trajectory["target_attitude_q_wb"]
@@ -1254,6 +1310,81 @@ def _score_trajectory(
     action_peak = _masked_quantile(trajectory["action"].abs().amax(dim=-1), alive, 1.0)
     action_delta_rms = _masked_rmse(action_delta, alive)
     saturation_fraction = _masked_mean(saturation, alive)
+    angular_acceleration_error = trajectory.get(
+        "angular_acceleration_error_b"
+    )
+    angular_acceleration_tracking_score = None
+    angular_acceleration_response = None
+    angular_acceleration_metrics: dict[str, torch.Tensor] = {}
+    if direct_angular_acceleration:
+        if angular_acceleration_error is None:
+            raise ValueError(
+                "direct angular-acceleration evaluation requires controller "
+                "tracking diagnostics"
+            )
+        time_s = trajectory["time_s"]
+        start_s = (
+            0.20 * scenario.duration_s
+            if scenario.type == "angular_acceleration_step"
+            else min(1.0, 0.20 * scenario.duration_s)
+        )
+        tracking_alive = alive & (time_s >= start_s)
+        vector_error = torch.linalg.vector_norm(
+            angular_acceleration_error, dim=-1
+        )
+        amplitude_norm = math.sqrt(
+            sum(
+                value * value
+                for value in scenario.angular_acceleration_amplitude_rad_s2
+            )
+        )
+        normalized_error = vector_error / amplitude_norm
+        normalized_rmse = _masked_rmse(normalized_error, tracking_alive)
+        angular_acceleration_tracking_score = _lower_is_better(
+            normalized_rmse, 1.0
+        )
+        angular_acceleration_metrics.update(
+            {
+                "angular_acceleration_vector_rmse_rad_s2": _masked_rmse(
+                    vector_error, tracking_alive
+                ),
+                "angular_acceleration_error_p95_rad_s2": _masked_quantile(
+                    vector_error, tracking_alive, 0.95
+                ),
+                "angular_acceleration_normalized_vector_rmse": normalized_rmse,
+            }
+        )
+        for axis_index, axis in enumerate("xyz"):
+            angular_acceleration_metrics[
+                f"angular_acceleration_{axis}_rmse_rad_s2"
+            ] = _masked_rmse(
+                angular_acceleration_error[..., axis_index],
+                tracking_alive,
+            )
+        if scenario.type == "angular_acceleration_step":
+            angular_acceleration_response = _command_step_response_time(
+                normalized_error,
+                alive,
+                scenario,
+                control_hz,
+                threshold=0.20,
+                window_s=0.02,
+            )
+            angular_acceleration_metrics[
+                "angular_acceleration_step_response_time_s"
+            ] = angular_acceleration_response
+        else:
+            frequency_metrics = _angular_acceleration_frequency_metrics(
+                trajectory["desired_angular_acceleration_b"],
+                trajectory["actual_angular_acceleration_b"],
+                alive,
+                scenario,
+                control_hz,
+            )
+            angular_acceleration_metrics.update(frequency_metrics)
+            angular_acceleration_response = frequency_metrics[
+                "angular_acceleration_phase_lag_s"
+            ]
     response_error_deg = (
         roll_pitch_error_deg if self_stabilize_tracking else attitude_error_deg
     )
@@ -1267,7 +1398,11 @@ def _score_trajectory(
             response_error_deg,
             yaw_response_error_deg,
         )
-    if scenario.type == "circle":
+    if direct_angular_acceleration:
+        if angular_acceleration_response is None:
+            raise RuntimeError("missing angular-acceleration response metric")
+        response_s = angular_acceleration_response
+    elif scenario.type == "circle":
         response_s = _circle_phase_lag(
             trajectory["target_euler_rad"], trajectory["actual_euler_rad"], alive,
             control_hz, limits.phase_lag_max_s,
@@ -1310,7 +1445,11 @@ def _score_trajectory(
     )
     position_score = _lower_is_better(position_rmse, limits.position_rmse_bad_m)
     velocity_score = _lower_is_better(velocity_rmse, limits.velocity_rmse_bad_m_s)
-    if scenario.type == "hover":
+    if direct_angular_acceleration:
+        if angular_acceleration_tracking_score is None:
+            raise RuntimeError("missing angular-acceleration tracking score")
+        tracking_score = angular_acceleration_tracking_score
+    elif scenario.type == "hover":
         tracking_score = 0.6 * inner_attitude_score + 0.4 * position_score
     elif scenario.type == "command_step":
         # 指令阶跃只评估姿态/偏航角速度内环；位置没有作为策略目标暴露。
@@ -1351,6 +1490,7 @@ def _score_trajectory(
         "action_saturation_fraction": saturation_fraction,
         **control_quality,
         "response_time_s": response_s,
+        **angular_acceleration_metrics,
     }
     for source, metric in (
         (
@@ -1363,10 +1503,7 @@ def _score_trajectory(
         value = trajectory.get(source)
         if value is not None:
             raw[metric] = _masked_rmse(value, alive)
-    angular_acceleration_error = trajectory.get(
-        "angular_acceleration_error_b"
-    )
-    if angular_acceleration_error is not None:
+    if angular_acceleration_error is not None and not direct_angular_acceleration:
         vector_error = torch.linalg.vector_norm(
             angular_acceleration_error, dim=-1
         )
@@ -1384,12 +1521,218 @@ def _score_trajectory(
         "response": response_score,
         "total": total_score,
     }
-    return {
+    result = {
         "type": scenario.type,
         "duration_s": scenario.duration_s,
         "metrics": {name: _summarize(value) for name, value in raw.items()},
         "scores": {name: _summarize(value) for name, value in scores.items()},
         "total_score": float(total_score.mean().item()),
+    }
+    if direct_angular_acceleration:
+        amplitudes = scenario.angular_acceleration_amplitude_rad_s2
+        active_axes = [
+            axis for axis, value in zip("xyz", amplitudes) if value != 0.0
+        ]
+        result["command"] = {
+            "axes": active_axes,
+            "amplitude_rad_s2": list(amplitudes),
+            "frequency_hz": scenario.frequency_hz,
+        }
+    return result
+
+
+def _angular_acceleration_frequency_metrics(
+    desired: torch.Tensor,
+    actual: torch.Tensor,
+    alive: torch.Tensor,
+    scenario: FixedScenario,
+    control_hz: int,
+) -> dict[str, torch.Tensor]:
+    """Estimate sine gain and phase from least-squares phasors."""
+
+    batch_size = desired.shape[1]
+    dtype = desired.dtype
+    gain = torch.full((batch_size,), float("inf"), dtype=dtype)
+    phase_lag_deg = torch.full_like(gain, float("inf"))
+    phase_lag_s = torch.full_like(gain, float("inf"))
+    active_axes = [
+        index
+        for index, value in enumerate(
+            scenario.angular_acceleration_amplitude_rad_s2
+        )
+        if value != 0.0
+    ]
+    warmup_s = min(1.0, 0.20 * scenario.duration_s)
+    omega = 2.0 * math.pi * scenario.frequency_hz
+    for batch_index in range(batch_size):
+        mask = alive[:, batch_index]
+        sample_index = torch.arange(desired.shape[0])
+        mask = mask & (
+            sample_index.to(dtype) / float(control_hz) >= warmup_s
+        )
+        if int(mask.sum().item()) < 4:
+            continue
+        time_s = sample_index[mask].to(torch.float64) / float(control_hz)
+        basis = torch.stack(
+            (
+                torch.sin(omega * time_s),
+                torch.cos(omega * time_s),
+                torch.ones_like(time_s),
+            ),
+            dim=-1,
+        )
+        axis_gains: list[torch.Tensor] = []
+        axis_lags: list[torch.Tensor] = []
+        for axis in active_axes:
+            desired_signal = desired[mask, batch_index, axis].to(torch.float64)
+            actual_signal = actual[mask, batch_index, axis].to(torch.float64)
+            desired_fit = torch.linalg.lstsq(
+                basis, desired_signal[:, None]
+            ).solution[:2, 0]
+            actual_fit = torch.linalg.lstsq(
+                basis, actual_signal[:, None]
+            ).solution[:2, 0]
+            desired_amplitude = torch.linalg.vector_norm(desired_fit)
+            actual_amplitude = torch.linalg.vector_norm(actual_fit)
+            if desired_amplitude <= 1e-12:
+                continue
+            axis_gains.append(actual_amplitude / desired_amplitude)
+            desired_phase = torch.atan2(desired_fit[1], desired_fit[0])
+            actual_phase = torch.atan2(actual_fit[1], actual_fit[0])
+            difference = desired_phase - actual_phase
+            axis_lags.append(torch.atan2(torch.sin(difference), torch.cos(difference)).abs())
+        if not axis_gains:
+            continue
+        mean_gain = torch.stack(axis_gains).mean()
+        worst_lag = torch.stack(axis_lags).amax()
+        gain[batch_index] = mean_gain.to(dtype)
+        phase_lag_deg[batch_index] = torch.rad2deg(worst_lag).to(dtype)
+        phase_lag_s[batch_index] = (worst_lag / omega).to(dtype)
+    return {
+        "angular_acceleration_gain": gain,
+        "angular_acceleration_gain_db": 20.0 * torch.log10(
+            gain.clamp_min(1e-12)
+        ),
+        "angular_acceleration_phase_lag_deg": phase_lag_deg,
+        "angular_acceleration_phase_lag_s": phase_lag_s,
+    }
+
+
+def _validate_angular_acceleration_suite(
+    config: ExperimentConfig,
+    suite: FixedEvaluationSuite,
+) -> None:
+    if suite.schema_version != 5:
+        return
+    outer_loop = config.task.outer_loop_pid
+    if outer_loop is None:
+        raise ValueError(
+            "direct angular-acceleration evaluation requires an angular-"
+            "acceleration inner-loop control contract"
+        )
+    limits = outer_loop.max_angular_acceleration_rad_s2
+    for scenario in suite.scenarios:
+        amplitudes = scenario.angular_acceleration_amplitude_rad_s2
+        if not any(value != 0.0 for value in amplitudes):
+            raise ValueError(
+                f"scenario {scenario.name!r} requires a nonzero angular-"
+                "acceleration amplitude"
+            )
+        for axis, (amplitude, limit) in enumerate(zip(amplitudes, limits)):
+            if abs(amplitude) > limit + 1e-9:
+                raise ValueError(
+                    f"scenario {scenario.name!r} axis {axis} amplitude "
+                    f"{amplitude} exceeds controller limit {limit}"
+                )
+
+
+def _angular_acceleration_suite_summary(
+    scenarios: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    threshold = 1.0 / math.sqrt(2.0)
+    axes: dict[str, Any] = {}
+    for axis in "xyz":
+        sine_points: list[dict[str, float]] = []
+        step_points: list[dict[str, float]] = []
+        for name, result in scenarios.items():
+            command = result.get("command", {})
+            if axis not in command.get("axes", []):
+                continue
+            metrics = result["metrics"]
+            axis_index = "xyz".index(axis)
+            amplitude = abs(float(command["amplitude_rad_s2"][axis_index]))
+            if result["type"] == "angular_acceleration_sine":
+                sine_points.append(
+                    {
+                        "scenario": name,
+                        "frequency_hz": float(command["frequency_hz"]),
+                        "gain": float(
+                            metrics["angular_acceleration_gain"]["mean"]
+                        ),
+                        "gain_db": float(
+                            metrics["angular_acceleration_gain_db"]["mean"]
+                        ),
+                        "phase_lag_deg": float(
+                            metrics[
+                                "angular_acceleration_phase_lag_deg"
+                            ]["mean"]
+                        ),
+                        "survival_time_s": float(
+                            metrics["survival_time_s"]["mean"]
+                        ),
+                        "duration_s": float(result["duration_s"]),
+                        "rmse_rad_s2": float(
+                            metrics[
+                                "angular_acceleration_vector_rmse_rad_s2"
+                            ]["mean"]
+                        ),
+                    }
+                )
+            else:
+                step_points.append(
+                    {
+                        "scenario": name,
+                        "amplitude_rad_s2": amplitude,
+                        "rmse_rad_s2": float(
+                            metrics[
+                                "angular_acceleration_vector_rmse_rad_s2"
+                            ]["mean"]
+                        ),
+                        "p95_error_rad_s2": float(
+                            metrics[
+                                "angular_acceleration_error_p95_rad_s2"
+                            ]["mean"]
+                        ),
+                        "response_time_s": float(
+                            metrics[
+                                "angular_acceleration_step_response_time_s"
+                            ]["mean"]
+                        ),
+                    }
+                )
+        sine_points.sort(key=lambda item: item["frequency_hz"])
+        step_points.sort(key=lambda item: item["amplitude_rad_s2"])
+        low_frequency_gain = (
+            sine_points[0]["gain"] if sine_points else None
+        )
+        qualified = [
+            item["frequency_hz"]
+            for item in sine_points
+            if low_frequency_gain is not None
+            and item["gain"] >= low_frequency_gain * threshold
+            and item["phase_lag_deg"] <= 90.0
+            and item["survival_time_s"] >= 0.99 * item["duration_s"]
+        ]
+        axes[axis] = {
+            "minus_3db_bandwidth_hz": max(qualified) if qualified else None,
+            "bandwidth_is_sampled_lower_bound": bool(qualified),
+            "low_frequency_gain": low_frequency_gain,
+            "sine_points": sine_points,
+            "step_points": step_points,
+        }
+    return {
+        "bandwidth_rule": "highest fully survived sampled sine frequency within -3 dB of the lowest-frequency gain and phase lag <= 90 deg",
+        "axes": axes,
     }
 
 
@@ -1509,7 +1852,12 @@ def _scenario_euler(
     if scenario.type == "command_step":
         roll, pitch, yaw, _ = _scenario_command(scenario, time_s)
         return roll, pitch, yaw
-    if scenario.type in {"hover", "constant_translation"}:
+    if scenario.type in {
+        "hover",
+        "constant_translation",
+        "angular_acceleration_step",
+        "angular_acceleration_sine",
+    }:
         return tuple(torch.full_like(time_s, value) for value in scenario.fixed_euler_rad)  # type: ignore[return-value]
     omega = 2.0 * math.pi / scenario.circle_period_s
     return (
@@ -1567,12 +1915,67 @@ def _scenario_command(
     return roll, pitch, yaw, yaw_rate
 
 
+def _scenario_angular_acceleration(
+    scenario: FixedScenario,
+    time_s: torch.Tensor,
+) -> torch.Tensor:
+    amplitude = torch.tensor(
+        scenario.angular_acceleration_amplitude_rad_s2,
+        device=time_s.device,
+        dtype=time_s.dtype,
+    )
+    if scenario.type == "angular_acceleration_step":
+        positive_start = 0.20 * scenario.duration_s
+        # Keep the paired pulses dynamically feasible under the suite's 1 rad
+        # tilt termination. At the 6 rad/s2 limit and a 2 s scenario, two
+        # 0.36 s pulses produce 6 * 0.36**2 = 0.778 rad ideal displacement.
+        negative_start = 0.38 * scenario.duration_s
+        zero_start = 0.56 * scenario.duration_s
+        sign = torch.where(
+            time_s < positive_start,
+            torch.zeros_like(time_s),
+            torch.where(
+                time_s < negative_start,
+                torch.ones_like(time_s),
+                torch.where(
+                    time_s < zero_start,
+                    -torch.ones_like(time_s),
+                    torch.zeros_like(time_s),
+                ),
+            ),
+        )
+        return sign[..., None] * amplitude
+    if scenario.type == "angular_acceleration_sine":
+        warmup_s = min(1.0, 0.20 * scenario.duration_s)
+        elapsed = (time_s - warmup_s).clamp_min(0.0)
+        active = time_s >= warmup_s
+        # Cosine starts with zero angular velocity and integrates to a zero-mean
+        # angular-rate sine, avoiding the attitude drift of a sine acceleration
+        # command initialized at zero angular velocity.
+        signal = torch.cos(2.0 * math.pi * scenario.frequency_hz * elapsed)
+        return torch.where(
+            active[..., None],
+            signal[..., None] * amplitude,
+            torch.zeros_like(time_s[..., None] * amplitude),
+        )
+    return torch.zeros(
+        (*time_s.shape, 3),
+        device=time_s.device,
+        dtype=time_s.dtype,
+    )
+
+
 def _scenario_trajectory(
     scenario: FixedScenario,
     time_s: torch.Tensor,
     origin: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if scenario.type in {"hover", "command_step"}:
+    if scenario.type in {
+        "hover",
+        "command_step",
+        "angular_acceleration_step",
+        "angular_acceleration_sine",
+    }:
         return origin, torch.zeros_like(origin)
     if scenario.type == "constant_translation":
         velocity = torch.tensor(
@@ -1762,7 +2165,8 @@ def _parse_scenario(node: Any, index: int) -> FixedScenario:
     allowed = {
         "name", "type", "duration_s", "fixed_euler_deg", "target_velocity_n_m_s",
         "circle_radius_m", "circle_period_s", "roll_amplitude_deg", "pitch_amplitude_deg",
-        "yaw_rate_amplitude_rad_s",
+        "yaw_rate_amplitude_rad_s", "angular_acceleration_amplitude_rad_s2",
+        "frequency_hz",
     }
     _only_keys(value, allowed, f"scenarios[{index}]")
     type_name = str(value.get("type"))
@@ -1771,6 +2175,8 @@ def _parse_scenario(node: Any, index: int) -> FixedScenario:
         "constant_translation",
         "circle",
         "command_step",
+        "angular_acceleration_step",
+        "angular_acceleration_sine",
     }:
         raise ValueError(f"unsupported scenario type: {type_name}")
     euler_deg = _float_triplet(value.get("fixed_euler_deg", [0, 0, 0]), f"scenarios[{index}].fixed_euler_deg")
@@ -1790,6 +2196,18 @@ def _parse_scenario(node: Any, index: int) -> FixedScenario:
         yaw_rate_amplitude_rad_s=_nonnegative_float(
             value.get("yaw_rate_amplitude_rad_s", 0.0),
             f"scenarios[{index}].yaw_rate_amplitude_rad_s",
+        ),
+        angular_acceleration_amplitude_rad_s2=_float_triplet(
+            value.get("angular_acceleration_amplitude_rad_s2", [0, 0, 0]),
+            f"scenarios[{index}].angular_acceleration_amplitude_rad_s2",
+        ),
+        frequency_hz=(
+            _positive_float(
+                value.get("frequency_hz"),
+                f"scenarios[{index}].frequency_hz",
+            )
+            if type_name == "angular_acceleration_sine"
+            else 0.0
         ),
     )
 

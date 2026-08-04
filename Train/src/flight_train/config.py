@@ -72,6 +72,20 @@ class TaskConfig:
 
 
 @dataclass(frozen=True)
+class DirectAngularAccelerationCommandConfig:
+    limits_rad_s2: tuple[float, float, float]
+    zero_probability: float
+    sine_probability: float
+    balanced_step_probability: float
+    zero_hold_duration_range_s: tuple[float, float]
+    sine_frequency_range_hz: tuple[float, float]
+    sine_amplitude_fraction_range: tuple[float, float]
+    sine_hold_duration_range_s: tuple[float, float]
+    step_cycle_duration_range_s: tuple[float, float]
+    step_amplitude_fraction_range: tuple[float, float]
+
+
+@dataclass(frozen=True)
 class VirtualPilotConfig:
     type: str
     version: str
@@ -96,6 +110,7 @@ class VirtualPilotConfig:
     center_exponent: float
     hold_duration_range_s: tuple[float, float]
     initial_target_scale: float
+    direct_angular_acceleration: DirectAngularAccelerationCommandConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -1211,10 +1226,11 @@ def _checkpoint_config(node: Mapping[str, Any], source: Path) -> CheckpointConfi
         "continuation",
         "continuation_rebatch",
         "policy",
+        "policy_reset_mean",
     }:
         raise ConfigError(
             "checkpoint.resume.mode must be exact, continuation, "
-            "continuation_rebatch, or policy"
+            "continuation_rebatch, policy, or policy_reset_mean"
         )
     value = resume.get("from")
     if value is None or value == "":
@@ -1317,13 +1333,23 @@ def _evaluation_config(
 def _virtual_pilot(node: Mapping[str, Any]) -> VirtualPilotConfig:
     _keys(node, {"type", "version", "seed", "params"}, "command_source")
     type_name = str(node.get("type", ""))
-    if type_name != "flight_train.commands:VirtualPilotCommandSource":
-        raise ConfigError("command_source.type must be the registered VirtualPilotCommandSource")
+    virtual_pilot_type = "flight_train.commands:VirtualPilotCommandSource"
+    direct_type = (
+        "flight_train.commands:DirectAngularAccelerationCommandSource"
+    )
+    if type_name not in {virtual_pilot_type, direct_type}:
+        raise ConfigError("command_source.type is not registered")
     version = str(node.get("version", ""))
-    if version != "2":
-        raise ConfigError("command_source.version must be 2 for incremental height PI")
+    expected_version = "3" if type_name == direct_type else "2"
+    if version != expected_version:
+        raise ConfigError(
+            f"command_source.version must be {expected_version} for {type_name}"
+        )
     params = _map(node, "params")
-    _keys(params, {"throttle", "sticks"}, "command_source.params")
+    allowed_params = {"throttle", "sticks"}
+    if type_name == direct_type:
+        allowed_params.add("direct_angular_acceleration")
+    _keys(params, allowed_params, "command_source.params")
     throttle = _map(params, "throttle")
     sticks = _map(params, "sticks")
     _keys(throttle, {"minimum", "maximum", "spool", "height_controller", "slew_rate"}, "command_source.params.throttle")
@@ -1371,6 +1397,95 @@ def _virtual_pilot(node: Mapping[str, Any]) -> VirtualPilotConfig:
     )
     hold_range = _bounded_pair(hold, "range", 0.0, float("inf"), strict_low=True)
     initial_scale = _unit_float(reset, "initial_target_scale")
+    direct_config = None
+    if type_name == direct_type:
+        direct = _map(params, "direct_angular_acceleration")
+        _keys(
+            direct,
+            {"limits_rad_s2", "probabilities", "zero", "sine", "balanced_step"},
+            "command_source.params.direct_angular_acceleration",
+        )
+        probabilities = _map(direct, "probabilities")
+        zero = _map(direct, "zero")
+        sine = _map(direct, "sine")
+        balanced_step = _map(direct, "balanced_step")
+        _keys(
+            probabilities,
+            {"zero", "sine", "balanced_step"},
+            "command_source.params.direct_angular_acceleration.probabilities",
+        )
+        _keys(
+            zero,
+            {"hold_duration_s"},
+            "command_source.params.direct_angular_acceleration.zero",
+        )
+        _keys(
+            sine,
+            {"frequency_hz", "amplitude_fraction", "hold_duration_s"},
+            "command_source.params.direct_angular_acceleration.sine",
+        )
+        _keys(
+            balanced_step,
+            {"cycle_duration_s", "amplitude_fraction"},
+            "command_source.params.direct_angular_acceleration.balanced_step",
+        )
+
+        raw_limits = _sequence(direct, "limits_rad_s2")
+        if len(raw_limits) != 3:
+            raise ConfigError(
+                "command_source.params.direct_angular_acceleration."
+                "limits_rad_s2 must contain 3 values"
+            )
+        limits = tuple(
+            _positive_float_value(
+                value,
+                "command_source.params.direct_angular_acceleration.limits_rad_s2",
+            )
+            for value in raw_limits
+        )
+        zero_probability = _unit_float(probabilities, "zero")
+        sine_probability = _unit_float(probabilities, "sine")
+        step_probability = _unit_float(probabilities, "balanced_step")
+        if not math.isclose(
+            zero_probability + sine_probability + step_probability,
+            1.0,
+            abs_tol=1e-9,
+        ):
+            raise ConfigError(
+                "direct angular-acceleration waveform probabilities must sum to 1"
+            )
+        direct_config = DirectAngularAccelerationCommandConfig(
+            limits_rad_s2=limits,  # type: ignore[arg-type]
+            zero_probability=zero_probability,
+            sine_probability=sine_probability,
+            balanced_step_probability=step_probability,
+            zero_hold_duration_range_s=_bounded_pair(
+                zero, "hold_duration_s", 0.0, float("inf"), strict_low=True
+            ),
+            sine_frequency_range_hz=_bounded_pair(
+                sine, "frequency_hz", 0.0, float("inf"), strict_low=True
+            ),
+            sine_amplitude_fraction_range=_bounded_pair(
+                sine, "amplitude_fraction", 0.0, 1.0, strict_low=True
+            ),
+            sine_hold_duration_range_s=_bounded_pair(
+                sine, "hold_duration_s", 0.0, float("inf"), strict_low=True
+            ),
+            step_cycle_duration_range_s=_bounded_pair(
+                balanced_step,
+                "cycle_duration_s",
+                0.0,
+                float("inf"),
+                strict_low=True,
+            ),
+            step_amplitude_fraction_range=_bounded_pair(
+                balanced_step,
+                "amplitude_fraction",
+                0.0,
+                1.0,
+                strict_low=True,
+            ),
+        )
     return VirtualPilotConfig(
         type=type_name,
         version=version,
@@ -1395,6 +1510,7 @@ def _virtual_pilot(node: Mapping[str, Any]) -> VirtualPilotConfig:
         center_exponent=_positive_float(sampling, "center_exponent"),
         hold_duration_range_s=hold_range,
         initial_target_scale=initial_scale,
+        direct_angular_acceleration=direct_config,
     )
 
 
@@ -1564,21 +1680,22 @@ def _control_contract(node: Mapping[str, Any]) -> ControlContractConfig:
         lower_motor_upper_ratio = _positive_float(
             transform, "lower_motor_upper_ratio"
         )
-        if lower_motor_upper_ratio > 1.0:
+        if not 0.0 <= trim[0] <= 1.0:
             raise ConfigError(
-                "coaxial lower_motor_upper_ratio must not exceed 1"
+                "coaxial trim_command motor value must be inside [0, 1]"
             )
-        if any(abs(value) > 1e-12 for value in trim[1:]):
-            raise ConfigError(
-                "coaxial differential/cyclic transform requires zero servo trim"
-            )
-        maximum_servo_command = max(
+        cyclic_extent = (
             scale[1],
             0.5 * scale[1] + 0.5 * math.sqrt(3.0) * scale[2],
+            0.5 * scale[1] + 0.5 * math.sqrt(3.0) * scale[2],
         )
-        if maximum_servo_command > 1.0:
+        if any(
+            not math.isfinite(center) or abs(center) + extent > 1.0
+            for center, extent in zip(trim[1:], cyclic_extent, strict=True)
+        ):
             raise ConfigError(
-                "coaxial cyclic scales can exceed the servo command bounds"
+                "coaxial servo trim plus cyclic scales can exceed the servo "
+                "command bounds"
             )
     else:
         expected_policy = ("lower_motor", "servo_1", "servo_2", "servo_3")

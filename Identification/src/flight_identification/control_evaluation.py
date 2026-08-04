@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
-from scipy.linalg import solve_discrete_are, solve_discrete_lyapunov
+from scipy.linalg import expm, solve_discrete_are, solve_discrete_lyapunov
 import torch
 
 from .training import (
@@ -72,6 +72,43 @@ def _nominal_actuator_model(
     )
 
 
+def _command_slopes_for_thrust_scale(
+    simulator_config: Path,
+    thrust_scales: np.ndarray,
+) -> np.ndarray:
+    """Evaluate the command-to-actuator slopes at each scaled hover trim."""
+    from flight_controller.plant import LocalPlantModel
+    from simenv.config import load_and_materialize
+
+    scales = np.asarray(thrust_scales, dtype=np.float64)
+    if scales.ndim != 1 or np.any(~np.isfinite(scales)) or np.any(scales <= 0.0):
+        raise ValueError("thrust scales must be a finite positive vector")
+    materialized = load_and_materialize(
+        simulator_config, 1, torch.device("cpu"), torch.float64
+    )
+    parameters = materialized.parameters
+    trim_speed = LocalPlantModel(parameters).hover_trim().motor_speed[0].numpy()
+    target_speed = trim_speed[None, :] / np.sqrt(scales[:, None])
+    table = parameters["motors.pwm_to_rpm_table"][0].numpy()
+    motor_slopes = np.empty_like(target_speed)
+    for motor_index in range(2):
+        x = table[motor_index, :, 0]
+        y = table[motor_index, :, 1]
+        segment = np.searchsorted(y, target_speed[:, motor_index], side="right") - 1
+        segment = np.clip(segment, 0, len(y) - 2)
+        motor_slopes[:, motor_index] = (
+            (y[segment + 1] - y[segment]) / (x[segment + 1] - x[segment])
+        )
+    _, nominal_slopes, _ = _nominal_actuator_model(simulator_config)
+    return np.concatenate(
+        (
+            motor_slopes,
+            np.broadcast_to(nominal_slopes[None, 2:], (len(scales), 3)),
+        ),
+        axis=1,
+    )
+
+
 def _scaled_actuator_model(
     effective_labels: np.ndarray,
     nominal_effectiveness: np.ndarray,
@@ -104,7 +141,27 @@ def _discrete_model(
     command_slopes: np.ndarray,
     time_constants: np.ndarray,
     dt: float,
+    integral: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
+    if integral:
+        continuous_a = np.zeros((13, 13), dtype=np.float64)
+        continuous_b = np.zeros((13, 5), dtype=np.float64)
+        continuous_a[0, 2] = 1.0
+        continuous_a[1, 3] = 1.0
+        continuous_a[2:5, 5:10] = effectiveness
+        continuous_a[5:10, 5:10] = np.diag(-1.0 / time_constants)
+        continuous_b[5:10] = np.diag(command_slopes / time_constants)
+        continuous_a[10, 0] = 1.0
+        continuous_a[11, 1] = 1.0
+        continuous_a[12, 4] = 1.0
+        augmented = np.block(
+            [
+                [continuous_a, continuous_b],
+                [np.zeros((5, 18), dtype=np.float64)],
+            ]
+        )
+        discrete = expm(augmented * dt)
+        return discrete[:13, :13], discrete[:13, 13:]
     # Exact zero-order-hold discretization for the rigid-body integrator chain
     # driven by five independent first-order actuator states.
     decay = np.exp(-dt / time_constants)

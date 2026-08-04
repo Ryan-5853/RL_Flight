@@ -109,6 +109,7 @@ def _simulate(
         accepted = torch.zeros(count, device=device, dtype=torch.bool)
         gate_candidate = torch.zeros_like(accepted)
         stability_probability = torch.zeros(count, device=device, dtype=dtype)
+        synthesis_valid = torch.zeros(count, device=device, dtype=torch.bool)
         for step in range(total_steps):
             if step == history_steps and scheduler is not None:
                 scheduled = scheduler.schedule(history)
@@ -127,6 +128,7 @@ def _simulate(
                     accepted[:, None, None], scheduled.target_gain, nominal
                 )
                 stability_probability = scheduled.stability_probability
+                synthesis_valid = scheduled.synthesis_valid
             if target_gain is not None:
                 alpha = min(1.0, (step - history_steps + 1) / interpolation_steps)
                 nominal = torch.as_tensor(
@@ -214,6 +216,7 @@ def _simulate(
             "gate_candidate": gate_candidate.cpu(),
             "accepted": accepted.cpu(),
             "stability_probability": stability_probability.cpu(),
+            "synthesis_valid": synthesis_valid.cpu(),
         }
     finally:
         environment.close()
@@ -278,6 +281,7 @@ def evaluate_nonlinear(args: argparse.Namespace) -> Mapping[str, Any]:
         "artifact_gate_enabled": scheduler.gate_enabled,
         "prefix_max_absolute_difference": float(prefix_difference),
         "gate_candidate_count": int(adaptive["gate_candidate"].sum()),
+        "synthesis_invalid_count": int((~adaptive["synthesis_valid"]).sum()),
         "accepted_count": int(accepted.sum()),
         "nominal": {
             "safe_fraction": _fraction(nominal["safe"]),

@@ -1,0 +1,301 @@
+schema_version: 1
+seed: 20262757
+parallel:
+  independent_rng: true
+timing:
+  physics_hz:
+    value: 500
+  control_hz:
+    value: 500
+initial_state:
+  position_n:
+    value:
+    - 0.0
+    - 0.0
+    - 0.0
+  velocity_n:
+    value:
+    - 0.0
+    - 0.0
+    - 0.0
+  attitude_q_wb:
+    value:
+    - 1.0
+    - 0.0
+    - 0.0
+    - 0.0
+  angular_velocity_b:
+    value:
+    - 0.0
+    - 0.0
+    - 0.0
+body:
+  mass:
+    value: 0.4091844856739044
+  center_of_mass_b:
+    value:
+    - 0.0
+    - 0.0
+    - 0.0
+  inertia_diagonal_b:
+    value:
+    - 0.0006728651351295412
+    - 0.0011834603501483798
+    - 0.001583173288963735
+motors:
+- name: upper
+  pwm_deadzone:
+    value: 0.08
+  pwm_to_rpm_table:
+    value:
+    - - 0.0
+      - 0.0
+    - - 0.08
+      - 0.0
+    - - 0.5
+      - 900.0
+    - - 1.0
+      - 1800.0
+  time_constant:
+    value: 0.11239888519048691
+  torque_coefficient:
+    value: 3.999779668046645e-08
+  noise:
+    distribution: normal
+    stddev:
+      value: 5.0
+- name: lower
+  pwm_deadzone:
+    value: 0.08
+  pwm_to_rpm_table:
+    value:
+    - - 0.0
+      - 0.0
+    - - 0.08
+      - 0.0
+    - - 0.5
+      - 900.0
+    - - 1.0
+      - 1800.0
+  time_constant:
+    value: 0.06266704946756363
+  torque_coefficient:
+    value: 3.2038648641879265e-08
+  noise:
+    distribution: normal
+    stddev:
+      value: 5.0
+servos:
+- name: servo_1
+  pwm_angle_table:
+    value:
+    - - -1.0
+      - -0.35
+    - - 0.0
+      - 0.0
+    - - 1.0
+      - 0.35
+  tau:
+    value: 0.013265203684568405
+  max_speed:
+    value: 5.702357292175293
+  backlash:
+    value: 0.008
+  deadzone:
+    value: 0.015
+- name: servo_2
+  pwm_angle_table:
+    value:
+    - - -1.0
+      - -0.35
+    - - 0.0
+      - 0.0
+    - - 1.0
+      - 0.35
+  tau:
+    value: 0.027614643797278404
+  max_speed:
+    value: 6.332080364227295
+  backlash:
+    value: 0.008
+  deadzone:
+    value: 0.015
+- name: servo_3
+  pwm_angle_table:
+    value:
+    - - -1.0
+      - -0.35
+    - - 0.0
+      - 0.0
+    - - 1.0
+      - 0.35
+  tau:
+    value: 0.048559922724962234
+  max_speed:
+    value: 6.927103519439697
+  backlash:
+    value: 0.008
+  deadzone:
+    value: 0.015
+aerodynamics:
+  thrust_coefficients:
+    value:
+    - 2.615392521055284e-06
+    - 2.615392521055284e-06
+    - 1.307696260527642e-06
+  neutral_thrust_direction_b:
+    value:
+    - 0.0
+    - 0.0
+    - -1.0
+  direct_thrust_center_b:
+    value:
+    - 0.0020694478880614042
+    - 0.002315244637429714
+    - 0.03481746464967728
+  thrust_partition:
+    direct:
+      value: 0.5038345456123352
+    grid_1:
+      value: 0.16643060743808746
+    grid_2:
+      value: 0.14714860916137695
+    grid_3:
+      value: 0.18258625268936157
+  grids:
+  - name: grid_1
+    aerodynamic_center_b:
+      value:
+      - -0.0556611530482769
+      - -0.0024442370049655437
+      - 0.0385461151599884
+    deflection_axis_b:
+      value:
+      - -1.0
+      - 0.0
+      - 0.0
+    self_attenuation_curve:
+      value:
+      - - 0.0
+        - 1.0
+      - - 0.35
+        - 0.85
+    vector_deflection:
+      gain:
+        value: 1.0515142679214478
+      offset:
+        value: 0.0
+  - name: grid_2
+    aerodynamic_center_b:
+      value:
+      - 0.025404948741197586
+      - 0.049585551023483276
+      - 0.020154695957899094
+    deflection_axis_b:
+      value:
+      - 0.5
+      - 0.8660254
+      - 0.0
+    self_attenuation_curve:
+      value:
+      - - 0.0
+        - 1.0
+      - - 0.35
+        - 0.85
+    vector_deflection:
+      gain:
+        value: 1.4606471061706543
+      offset:
+        value: 0.0
+  - name: grid_3
+    aerodynamic_center_b:
+      value:
+      - 0.02725793421268463
+      - -0.04859159514307976
+      - 0.04703502357006073
+    deflection_axis_b:
+      value:
+      - 0.5
+      - -0.8660254
+      - 0.0
+    self_attenuation_curve:
+      value:
+      - - 0.0
+        - 1.0
+      - - 0.35
+        - 0.85
+    vector_deflection:
+      gain:
+        value: 1.1774529218673706
+      offset:
+        value: 0.0
+  coupling_attenuation:
+    value:
+    - - 0.0
+      - 0.09890260547399521
+      - 0.09890260547399521
+    - - 0.09890260547399521
+      - 0.0
+      - 0.09890260547399521
+    - - 0.09890260547399521
+      - 0.09890260547399521
+      - 0.0
+sensors:
+  gyro:
+    sample_hz:
+      value: 500
+    noise:
+      distribution: normal
+      stddev:
+        value:
+        - 0.003
+        - 0.003
+        - 0.003
+    bias:
+      value:
+      - 0.0
+      - 0.0
+      - 0.0
+    delay:
+      value: 0.002
+    interpolation: linear
+  accelerometer:
+    sample_hz:
+      value: 500
+    noise:
+      distribution: normal
+      stddev:
+        value:
+        - 0.03
+        - 0.03
+        - 0.03
+    bias:
+      value:
+      - 0.0
+      - 0.0
+      - 0.0
+    delay:
+      value: 0.002
+    interpolation: linear
+  motor_speed:
+    sample_hz:
+      value: 500
+    noise:
+      distribution: normal
+      stddev:
+        value:
+        - 3.0
+        - 3.0
+    bias:
+      value:
+      - 0.0
+      - 0.0
+    delay:
+      value: 0.0
+logging:
+  directory: ../logs/sim2real_bad_points/group_1927
+  mode: compact
+  physics_step_stride: 10
+  chunk_steps: 1024
+  queue_chunks: 2
+  overflow: block

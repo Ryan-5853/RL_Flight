@@ -133,23 +133,13 @@ class FlightTrainAngularAccelerationCascadeAdapter(FlightTrainMLPAdapter):
                 "source": "angular_velocity_b",
                 "reset_value": [0.0, 0.0, 0.0],
             },
-            "identified_inner_loop": {
-                "method": "fixed-suite first-order ARX",
-                "delay_ms": [4.0, 4.0, 2.0],
-                "time_constant_ms": [234.35, 250.0, 304.0],
-                "effective_bandwidth_rad_s": [4.27, 4.0, 3.29],
-            },
-            "outer_loop_validation": {
-                "suite": "webui_virtual_pilot_10s_seed_52040",
-                "selected_attitude_rmse_deg": 1.587,
-                "selected_max_attitude_error_deg": 2.716,
-                "selected_action_saturation_fraction": 0.0,
-                "candidate_order_best_to_worst": [
-                    "training_bandwidth",
-                    "identified_bandwidth_compromise",
-                    "medium_bandwidth",
-                    "low_bandwidth",
-                ],
+            "validation": {
+                "status": "external",
+                "required_suite": "fixed_small_command_tracking_v1",
+                "reason": (
+                    "checkpoint-specific nonlinear results are stored in the "
+                    "evaluation report and are not inferred during export"
+                ),
             },
             "training_outer_loop": dict(training_outer),
         }

@@ -14,6 +14,7 @@ from flight_train.evaluation import (
     FixedScenario,
     ScoreLimits,
     ScriptedEvaluationCommandSource,
+    _angular_acceleration_frequency_metrics,
     _command_step_response_time,
     _control_quality_metrics,
     _create_evaluation_environment,
@@ -21,6 +22,7 @@ from flight_train.evaluation import (
     _run_packed_scenarios,
     _run_scenario,
     _scenario_command,
+    _scenario_angular_acceleration,
     _scenario_trajectory,
     _score_trajectory,
     load_fixed_evaluation_suite,
@@ -34,6 +36,113 @@ ROOT = Path(__file__).parents[1]
 
 
 class FixedEvaluationTests(unittest.TestCase):
+    def test_direct_angular_acceleration_screen_covers_bias_and_authority(self):
+        suite = load_fixed_evaluation_suite(
+            ROOT
+            / "configs/evaluation/"
+            "fixed_angular_acceleration_screen_v1.yaml"
+        )
+        self.assertEqual(suite.schema_version, 5)
+        self.assertEqual(len(suite.scenarios), 5)
+        self.assertEqual(
+            {item.name for item in suite.scenarios},
+            {
+                "xyz_step_25",
+                "xyz_step_100",
+                "x_sine_0_25_hz",
+                "y_sine_0_25_hz",
+                "z_sine_0_25_hz",
+            },
+        )
+
+    def test_direct_angular_acceleration_suite_parses_isolated_scenarios(self):
+        suite = load_fixed_evaluation_suite(
+            ROOT
+            / "configs/evaluation/"
+            "fixed_angular_acceleration_tracking_v1.yaml"
+        )
+        self.assertEqual(suite.schema_version, 5)
+        self.assertEqual(len(suite.scenarios), 27)
+        self.assertFalse(suite.self_stabilize_tracking)
+        self.assertEqual(
+            {item.type for item in suite.scenarios},
+            {"angular_acceleration_step", "angular_acceleration_sine"},
+        )
+
+    def test_direct_angular_acceleration_commands_are_exact(self):
+        suite = load_fixed_evaluation_suite(
+            ROOT
+            / "configs/evaluation/"
+            "fixed_angular_acceleration_tracking_v1.yaml"
+        )
+        x_step = next(item for item in suite.scenarios if item.name == "x_step_100")
+        time_s = torch.tensor([0.0, 0.4, 0.75, 0.9, 1.11, 1.4])
+        torch.testing.assert_close(
+            _scenario_angular_acceleration(x_step, time_s),
+            torch.tensor(
+                [
+                    [0.0, 0.0, 0.0],
+                    [6.0, 0.0, 0.0],
+                    [6.0, 0.0, 0.0],
+                    [-6.0, 0.0, 0.0],
+                    [-6.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0],
+                ]
+            ),
+        )
+        pulse_duration_s = (0.38 - 0.20) * x_step.duration_s
+        self.assertLess(6.0 * pulse_duration_s**2, 1.0)
+        x_sine = next(
+            item for item in suite.scenarios if item.name == "x_sine_0_25_hz"
+        )
+        torch.testing.assert_close(
+            _scenario_angular_acceleration(
+                x_sine, torch.tensor([0.5, 1.0, 2.0])
+            ),
+            torch.tensor(
+                [
+                    [0.0, 0.0, 0.0],
+                    [0.3, 0.0, 0.0],
+                    [0.0, 0.0, 0.0],
+                ]
+            ),
+            atol=1e-6,
+            rtol=1e-6,
+        )
+
+    def test_sine_frequency_metrics_recover_unit_gain_and_zero_phase(self):
+        scenario = FixedScenario(
+            "x_sine",
+            "angular_acceleration_sine",
+            4.0,
+            (0.0, 0.0, 0.0),
+            (0.0, 0.0, 0.0),
+            1.0,
+            8.0,
+            0.0,
+            0.0,
+            angular_acceleration_amplitude_rad_s2=(1.5, 0.0, 0.0),
+            frequency_hz=1.0,
+        )
+        control_hz = 100
+        time_s = torch.arange(400, dtype=torch.float32) / control_hz
+        desired = _scenario_angular_acceleration(scenario, time_s)[:, None, :]
+        metrics = _angular_acceleration_frequency_metrics(
+            desired,
+            desired.clone(),
+            torch.ones(400, 1, dtype=torch.bool),
+            scenario,
+            control_hz,
+        )
+        torch.testing.assert_close(
+            metrics["angular_acceleration_gain"], torch.ones(1),
+            atol=1e-5, rtol=1e-5,
+        )
+        torch.testing.assert_close(
+            metrics["angular_acceleration_phase_lag_deg"], torch.zeros(1),
+            atol=1e-4, rtol=1e-4,
+        )
+
     def test_control_quality_reports_tv_and_low_frequency_rms(self):
         control_hz = 100
         steps = 1000

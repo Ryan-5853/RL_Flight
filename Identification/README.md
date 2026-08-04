@@ -1,5 +1,67 @@
 # LQR Identification Experiment
 
+The micro-coaxial physical-domain Sim2Real design, scale derivations, conditional
+trim-feasibility sampling, LQI weights, identification results, and paired
+nonlinear control audit are documented in
+[SIM2REAL_MICRO_DESIGN_zh.md](SIM2REAL_MICRO_DESIGN_zh.md). The current learned
+gain scheduler is `shadow_only`: it produces finite candidate gains, but the
+paired nonlinear audit has not shown a convergence advantage over the fixed
+nominal LQI.
+
+The follow-up [composite servo experiment](SIM2REAL_COMPOSITE_SERVO_EXPERIMENT_zh.md)
+does not separately identify servo effectiveness and time constant. It predicts
+the command-to-angular-acceleration step response at five short-time snapshots,
+projects it onto fixed stable filters, and synthesizes a 19-state LQI. On the
+held-out paired nonlinear audit, a 50% gain blend improves convergence by 1.34
+percentage points over the matching fixed composite nominal controller. This is
+still `research_only`; runtime gain updates remain disabled until time-varying
+gain interpolation, uncertainty gating, sensor-path testing, and HIL validation
+are complete.
+
+The next-stage [offline flight-log design](OFFLINE_LOG_IDENTIFICATION_zh.md)
+targets post-flight inference on complete real logs rather than onboard or
+online adaptation. Its training data remains closed loop: stratified multiaxis
+initial attitude/rate disturbances are allowed, while per-actuator steps,
+open-loop sweeps, and oracle-gain data collection are explicitly excluded.
+The canonical NPZ adapter and offline analysis CLI produce candidate composite
+gains but never mark them as flight-accepted.
+
+The reproducible baseline uses 4,096 airframes with eight trials each:
+
+```bash
+env PYTHONNOUSERSITE=1 \
+  PYTHONPATH=Identification/src:Controller/src:SimEnv/src \
+  /home/ryan/miniconda3/envs/rl-flight/bin/python \
+  -m flight_identification.repeated_trial_experiment \
+  --config Identification/configs/lqr_sim2real_micro_repeated8_v1.yaml
+
+env PYTHONNOUSERSITE=1 \
+  PYTHONPATH=Identification/src:Controller/src:SimEnv/src \
+  /home/ryan/miniconda3/envs/rl-flight/bin/python \
+  -m flight_identification.repeated_trial_training \
+  --dataset Identification/datasets/lqr_sim2real_micro_repeated8_v1 \
+  --output Identification/runs/sim2real_micro_repeated8_mlp_v3 \
+  --device cuda:0 --downsample 5
+
+env PYTHONNOUSERSITE=1 \
+  PYTHONPATH=Identification/src:Controller/src:SimEnv/src \
+  /home/ryan/miniconda3/envs/rl-flight/bin/python \
+  -m flight_identification.sim2real_control_evaluation \
+  --checkpoint Identification/runs/sim2real_micro_repeated8_mlp_v3/identifier.pt \
+  --dataset Identification/datasets/lqr_sim2real_micro_repeated8_v1 \
+  --experiment-config Identification/configs/lqr_sim2real_micro_repeated8_v1.yaml \
+  --output Identification/runs/sim2real_micro_repeated8_mlp_v3/control_audit_paired_large_v2.json \
+  --device cuda:0 --maximum-parameter-groups 393 \
+  --evaluation-initial-conditions 8
+```
+
+The evaluator rebuilds SimEnv for every controller variant with identical seeds,
+sample ordering, initial states, and noise counters. Its confidence intervals
+cluster repeated initial conditions by airframe parameter group. The companion
+`sim2real_parameter_diagnostics` command reports which inferred quantities are
+actually consumed by gain synthesis and separates identifiability from local
+closed-loop sensitivity.
+
 This package generates supervised one-second histories for an online LQR model
 identifier. The flight controller always starts from one nominal gain. Only the
 SimEnv plant receives randomized parameters, so the collected distribution does
@@ -112,6 +174,13 @@ regression dataset.
 
 ## MLP Feasibility Baseline
 
+The wide `[-2, 2]` randomization is retained only as a historical stress test.
+The deployment-oriented repeated-trial design now uses explicit empirical-core
+ranges for inertia, thrust-to-weight ratio, reaction authority, grid authority,
+and actuator time constants. It deliberately excludes undefined coupling
+scalars. See [EMPIRICAL_PRIOR_DESIGN_zh.md](EMPIRICAL_PRIOR_DESIGN_zh.md) for
+the parameter audit, pilot fit, and gain/observer ablation.
+
 The baseline downsamples each one-second history to 100 Hz, normalizes each
 feature channel using the training split only, and trains a flattened-history
 MLP. Sampling is balanced by parameter group, and reported test metrics include
@@ -152,3 +221,95 @@ python -m flight_identification.control_evaluation \
 The report compares nominal, identified, and oracle gains using true-plant pole
 radii and infinite-horizon LQR cost. This is a local linear audit, not a
 substitute for nonlinear gain-blending and saturation tests.
+
+## Wide-Range Deployment Experiment
+
+`lqr_wide_adaptation_v2.yaml` covers every raw randomized parameter over
+`log10(scale) in [-2, 2]`. It contains 32,768 independent parameter groups and
+65,536 one-second roll/pitch-zero, yaw-rate-zero episodes. A window enters the
+adaptation dataset when it remains inside the safety envelope for the complete
+first second; final convergence is metadata rather than an inclusion filter.
+
+The selected identifier is a five-member `512-256-128` MLP ensemble trained on
+14 LQR-effective log ratios. Each member has 883,342 parameters. The ensemble
+artifact contains per-window calibrated uncertainty and is intentionally
+separate from the final nonlinear-validation decision.
+
+The online API consumes exactly one raw 500 Hz history:
+
+```python
+from flight_identification.deployment import AdaptiveLQRScheduler
+
+scheduler = AdaptiveLQRScheduler(
+    "Identification/artifacts/lqr_wide_effective_deployment_v2/"
+    "deployment_validated.pt",
+    device="cuda:0",
+)
+result = scheduler.schedule(history)  # history: [batch, 500, 14]
+# Feed result.target_gain to the configured two-second interpolation loop.
+```
+
+Always use `result.accepted`; do not apply `predicted_gain` directly. A failed
+or ill-conditioned DARE is rejected per vehicle and falls back to the nominal
+gain without aborting the batch.
+
+The current validated artifact is `shadow_only`, so `result.accepted` is always
+false. This is deliberate: the local-linear non-degradation gate passed, but
+paired 4 s and 8 s nonlinear tests did not improve convergence. Shadow mode is
+appropriate for collecting flight histories and comparing predictions; it is
+not authorization to update flight gains.
+
+The frozen operating policy is described by
+`configs/lqr_identifier_deployment_v2.yaml`. It requires a two-second gain
+interpolation, at most one inference per second, and freezes adaptation on
+invalid state, excessive tilt/rate, non-finite history, or excessive command
+saturation.
+
+## Repeated Destructive-Trial Calibration
+
+The repeated-trial experiment uses a different deployment contract from the
+online one-second scheduler above. One unknown airframe may perform many
+independent identification flights, including flights that cross the safety
+envelope. Every valid pre-failure prefix is retained. Identification and DARE
+synthesis run once after the trials, and the resulting fixed gain is installed
+before the first control step of a new evaluation flight.
+
+Generate and train the 16-trial dataset with:
+
+```bash
+env PYTHONNOUSERSITE=1 \
+  PYTHONPATH=Identification/src:Controller/src:SimEnv/src \
+  /home/ryan/miniconda3/envs/rl-flight/bin/python \
+  -m flight_identification.repeated_trial_experiment \
+  --config Identification/configs/lqr_repeated_trials_wide16_v1.yaml
+
+env PYTHONNOUSERSITE=1 \
+  PYTHONPATH=Identification/src \
+  /home/ryan/miniconda3/envs/rl-flight/bin/python \
+  -m flight_identification.repeated_trial_training \
+  --dataset Identification/datasets/lqr_repeated_trials_wide16_v1 \
+  --output Identification/artifacts/lqr_repeated_trials_wide16_mlp_v1_seed20260814 \
+  --device cuda:0
+```
+
+The one-shot runtime API consumes raw repeated histories and their pre-failure
+masks:
+
+```python
+from flight_identification.repeated_trial_deployment import (
+    RepeatedTrialLQRScheduler,
+)
+
+scheduler = RepeatedTrialLQRScheduler("path/to/identifier.pt", device="cuda:0")
+result = scheduler.synthesize(histories, valid_mask)
+# histories: [batch, trials, 1000, 14] at 500 Hz
+# result.predicted_gain: [batch, 5, 10]
+# result.servo_time_constant_s updates the command-driven servo observer.
+```
+
+This artifact has no automatic acceptance gate and
+`scheduler.deployment_validated` is false. The gain must not be applied without
+the separate nonlinear per-airframe validation described in
+[`REPEATED_TRIAL_RESULTS_zh.md`](REPEATED_TRIAL_RESULTS_zh.md). The evaluation
+showed that gain synthesis alone is insufficient: without servo-angle feedback,
+the command observer must also model known deadzone, backlash and rate limits.

@@ -315,3 +315,278 @@ class VirtualPilotCommandSource:
     ) -> torch.Tensor:
         sampled = self._sample_uniform(*bounds)
         return torch.where(mask[:, None], sampled, current)
+
+
+class DirectAngularAccelerationCommandSource(VirtualPilotCommandSource):
+    """Training-only balanced inner-loop angular-acceleration commands."""
+
+    version = 3
+    angular_acceleration_override_enabled = True
+
+    def __init__(
+        self,
+        config: VirtualPilotConfig,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        control_hz: int,
+    ) -> None:
+        super().__init__(config, batch_size, device, dtype, control_hz)
+        if config.direct_angular_acceleration is None:
+            raise ValueError(
+                "direct angular-acceleration command source requires its config"
+            )
+        self.direct_config = config.direct_angular_acceleration
+        self.direct_waveform = torch.zeros(
+            batch_size, device=device, dtype=torch.int64
+        )
+        self.direct_elapsed_s = torch.zeros(
+            batch_size, 1, device=device, dtype=dtype
+        )
+        self.direct_duration_s = torch.ones_like(self.direct_elapsed_s)
+        self.direct_frequency_hz = torch.zeros_like(self.direct_elapsed_s)
+        self.direct_amplitude = torch.zeros(
+            batch_size, 3, device=device, dtype=dtype
+        )
+        self._desired_angular_acceleration = torch.zeros_like(
+            self.direct_amplitude
+        )
+        all_instances = torch.ones(batch_size, device=device, dtype=torch.bool)
+        self._sample_direct_command(all_instances)
+        self._update_direct_command(all_instances)
+
+    @property
+    def desired_angular_acceleration(self) -> torch.Tensor:
+        return self._desired_angular_acceleration
+
+    def reset(self, mask: torch.Tensor) -> None:
+        super().reset(mask)
+        self._sample_direct_command(mask)
+        self._update_direct_command(mask)
+
+    @torch.no_grad()
+    def step(
+        self,
+        height_m: torch.Tensor,
+        active_mask: torch.Tensor | None = None,
+    ) -> None:
+        super().step(height_m, active_mask=active_mask)
+        if active_mask is None:
+            active_mask = torch.ones(
+                self.batch_size, device=self.device, dtype=torch.bool
+            )
+        active = active_mask[:, None]
+        elapsed = self.direct_elapsed_s + self.dt
+        self.direct_elapsed_s = torch.where(
+            active, elapsed, self.direct_elapsed_s
+        )
+        expired = active_mask & (
+            self.direct_elapsed_s[:, 0] >= self.direct_duration_s[:, 0]
+        )
+        self._sample_direct_command(expired)
+        self._update_direct_command(active_mask)
+
+    def info(self) -> TensorDict:
+        result = super().info()
+        result.set(
+            "pilot.desired_angular_acceleration_b",
+            self._desired_angular_acceleration,
+        )
+        result.set("pilot.direct_waveform", self.direct_waveform[:, None])
+        return result
+
+    def state_dict(self) -> Mapping[str, Any]:
+        state = dict(super().state_dict())
+        state.update(
+            {
+                "direct_waveform": self.direct_waveform,
+                "direct_elapsed_s": self.direct_elapsed_s,
+                "direct_duration_s": self.direct_duration_s,
+                "direct_frequency_hz": self.direct_frequency_hz,
+                "direct_amplitude": self.direct_amplitude,
+                "desired_angular_acceleration": (
+                    self._desired_angular_acceleration
+                ),
+            }
+        )
+        return state
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        super().load_state_dict(state)
+        for name in (
+            "direct_waveform",
+            "direct_elapsed_s",
+            "direct_duration_s",
+            "direct_frequency_hz",
+            "direct_amplitude",
+        ):
+            target = getattr(self, name)
+            value = state.get(name)
+            if not isinstance(value, torch.Tensor) or value.shape != target.shape:
+                raise ValueError(f"incompatible direct command tensor {name}")
+            target.copy_(value.to(device=self.device, dtype=target.dtype))
+        desired = state.get("desired_angular_acceleration")
+        if (
+            not isinstance(desired, torch.Tensor)
+            or desired.shape != self._desired_angular_acceleration.shape
+        ):
+            raise ValueError(
+                "incompatible direct command tensor desired_angular_acceleration"
+            )
+        self._desired_angular_acceleration.copy_(
+            desired.to(device=self.device, dtype=self.dtype)
+        )
+
+    def _sample_direct_command(self, mask: torch.Tensor) -> None:
+        random = torch.rand(
+            self.batch_size,
+            1,
+            device=self.device,
+            dtype=self.dtype,
+            generator=self.generator,
+        )
+        zero_threshold = self.direct_config.zero_probability
+        sine_threshold = zero_threshold + self.direct_config.sine_probability
+        sampled_waveform = torch.where(
+            random[:, 0] < zero_threshold,
+            torch.zeros_like(self.direct_waveform),
+            torch.where(
+                random[:, 0] < sine_threshold,
+                torch.ones_like(self.direct_waveform),
+                torch.full_like(self.direct_waveform, 2),
+            ),
+        )
+
+        zero_duration = self._sample_uniform(
+            *self.direct_config.zero_hold_duration_range_s
+        )
+        sine_duration = self._sample_uniform(
+            *self.direct_config.sine_hold_duration_range_s
+        )
+        step_duration = self._sample_uniform(
+            *self.direct_config.step_cycle_duration_range_s
+        )
+        sampled_duration = torch.where(
+            sampled_waveform[:, None] == 0,
+            zero_duration,
+            torch.where(
+                sampled_waveform[:, None] == 1,
+                sine_duration,
+                step_duration,
+            ),
+        )
+        sampled_frequency = self._sample_uniform(
+            *self.direct_config.sine_frequency_range_hz
+        )
+
+        sine_axis = torch.randint(
+            0,
+            3,
+            (self.batch_size,),
+            device=self.device,
+            generator=self.generator,
+        )
+        step_axis = torch.randint(
+            0,
+            4,
+            (self.batch_size,),
+            device=self.device,
+            generator=self.generator,
+        )
+        sampled_axis = torch.where(
+            sampled_waveform == 1, sine_axis, step_axis
+        )
+        axis_mask = torch.nn.functional.one_hot(
+            sampled_axis.clamp_max(2), num_classes=3
+        ).to(self.dtype)
+        axis_mask = torch.where(
+            (sampled_axis == 3)[:, None],
+            torch.ones_like(axis_mask),
+            axis_mask,
+        )
+        signs = torch.where(
+            torch.rand(
+                self.batch_size,
+                3,
+                device=self.device,
+                dtype=self.dtype,
+                generator=self.generator,
+            ) < 0.5,
+            -torch.ones_like(axis_mask),
+            torch.ones_like(axis_mask),
+        )
+        sine_fraction = self._sample_uniform(
+            *self.direct_config.sine_amplitude_fraction_range
+        )
+        step_fraction = self._sample_uniform(
+            *self.direct_config.step_amplitude_fraction_range
+        )
+        amplitude_fraction = torch.where(
+            sampled_waveform[:, None] == 1,
+            sine_fraction,
+            torch.where(
+                sampled_waveform[:, None] == 2,
+                step_fraction,
+                torch.zeros_like(step_fraction),
+            ),
+        )
+        limits = torch.tensor(
+            self.direct_config.limits_rad_s2,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        sampled_amplitude = axis_mask * signs * amplitude_fraction * limits
+
+        expanded = mask[:, None]
+        self.direct_waveform.copy_(
+            torch.where(mask, sampled_waveform, self.direct_waveform)
+        )
+        self.direct_elapsed_s.copy_(
+            torch.where(expanded, torch.zeros_like(self.direct_elapsed_s), self.direct_elapsed_s)
+        )
+        self.direct_duration_s.copy_(
+            torch.where(expanded, sampled_duration, self.direct_duration_s)
+        )
+        self.direct_frequency_hz.copy_(
+            torch.where(expanded, sampled_frequency, self.direct_frequency_hz)
+        )
+        self.direct_amplitude.copy_(
+            torch.where(expanded, sampled_amplitude, self.direct_amplitude)
+        )
+
+    def _update_direct_command(self, mask: torch.Tensor) -> None:
+        elapsed = self.direct_elapsed_s
+        sine_signal = torch.cos(
+            2.0 * torch.pi * self.direct_frequency_hz * elapsed
+        )
+        phase = elapsed / self.direct_duration_s.clamp_min(self.dt)
+        step_signal = torch.where(
+            phase < 0.20,
+            torch.zeros_like(phase),
+            torch.where(
+                phase < 0.38,
+                torch.ones_like(phase),
+                torch.where(
+                    phase < 0.56,
+                    -torch.ones_like(phase),
+                    torch.zeros_like(phase),
+                ),
+            ),
+        )
+        signal = torch.where(
+            self.direct_waveform[:, None] == 1,
+            sine_signal,
+            torch.where(
+                self.direct_waveform[:, None] == 2,
+                step_signal,
+                torch.zeros_like(step_signal),
+            ),
+        )
+        desired = (
+            signal * self.direct_amplitude * float(self.curriculum_scale)
+        )
+        self._desired_angular_acceleration.copy_(
+            torch.where(
+                mask[:, None], desired, self._desired_angular_acceleration
+            )
+        )

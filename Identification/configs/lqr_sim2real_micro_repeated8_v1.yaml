@@ -1,0 +1,61 @@
+schema_version: 1
+
+simulator_config: ../../SimEnv/configs/sim2real_micro_coaxial.yaml
+controller_config: ../../Controller/configs/lqi_sim2real_micro_coaxial.yaml
+
+run:
+  seed: 20260823
+  device: cuda:0
+  dtype: float32
+  parallel_count: 2048
+  output_directory: ../datasets/lqr_sim2real_micro_repeated8_v1
+
+observation:
+  measurement_mode: simulated_sensors
+
+sampling:
+  parameterization: sim2real_micro
+  parameter_groups: 4096
+  initial_conditions_per_group: 8
+  episode_duration_s: 2.0
+  sim2real_ranges:
+    mass_kg: [0.15, 0.60]
+    inertia_xy_radius_of_gyration_m: [0.035, 0.075]
+    inertia_z_radius_of_gyration_m: [0.045, 0.080]
+    thrust_to_weight: [1.2, 5.0]
+    motor_reaction_scale: [0.25, 4.0]
+    motor_reaction_ratio: [0.70, 1.40]
+    motor_time_constant_s: [0.015, 0.120]
+    direct_center_xy_radius_m: [0.00001, 0.010]
+    direct_center_z_m: [0.010, 0.050]
+    direct_thrust_fraction: [0.50, 0.80]
+    grid_radius_m: [0.040, 0.060]
+    grid_azimuth_error_rad: [-0.1396263, 0.1396263]
+    grid_center_z_m: [0.010, 0.050]
+    grid_effectiveness_scale: [0.50, 1.50]
+    servo_time_constant_s: [0.010, 0.080]
+    servo_max_speed_rad_s: [5.0, 11.6355]
+    # This is specifically SimEnv's off-diagonal grid-to-grid attenuation,
+    # not a generic dynamics coupling coefficient.
+    coupling_attenuation: [0.0, 0.40]
+  feasibility:
+    maximum_linear_trim_servo_angle_rad: 0.125
+    maximum_linear_trim_residual_rad_s2: 0.10
+
+initial_state:
+  minimum_tilt_rad: 0.0523599
+  maximum_tilt_rad: 0.2617994
+  maximum_angular_rate_rad_s: [1.0, 1.0, 1.0]
+
+convergence:
+  maximum_roll_pitch_error_rad: 0.0349066
+  maximum_angular_rate_rad_s: 0.10
+  hold_s: 0.5
+  safety_tilt_rad: 1.0471976
+  safety_angular_rate_rad_s: 10.0
+
+window:
+  length_s: 1.0
+  stride_s: 1.0
+  maximum_start_s: 0.0
+  split_fractions: [0.70, 0.15, 0.15]
