@@ -266,6 +266,10 @@ class InferencePackageTests(unittest.TestCase):
                 package.metadata.output_mode,
                 "coaxial_differential_cyclic_3",
             )
+            package.configure_realtime(compile_kernels=False)
+            self.assertFalse(package.control_features_compiled)
+            package.configure_realtime(compile_kernels=True)
+            self.assertTrue(package.control_features_compiled)
             zeros3 = torch.zeros((1, 3))
             identity = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
             angle = torch.tensor(0.05)

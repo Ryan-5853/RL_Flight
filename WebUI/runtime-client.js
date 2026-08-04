@@ -200,6 +200,7 @@
         transportSequence = 0;
         lastTelemetrySequence = -1;
         controlInFlight.clear();
+        window.RLFlightLatency?.reset();
       }
       if (pendingTargetPosition) await sendPositionTarget();
       await sendControllerAction(singleStep ? 'step' : 'start');
@@ -469,12 +470,18 @@
       if (checkpointInput instanceof HTMLSelectElement) {
         checkpointInput.replaceChildren();
         const packages = checkpointData.checkpoints || [];
+        const storedPackage = (() => {
+          try { return localStorage.getItem('rlflight.inference-package.v1') || ''; }
+          catch (_) { return ''; }
+        })();
         const recommendedSimenv = new Map(
           packages
             .filter(item => item.recommended_simenv)
             .map(item => [item.path, item.recommended_simenv])
         );
         const applyRecommendedSimenv = () => {
+          try { localStorage.setItem('rlflight.inference-package.v1', checkpointInput.value); }
+          catch (_) { /* Selection remains valid for this page lifetime. */ }
           const config = recommendedSimenv.get(checkpointInput.value);
           if (!config || !window.RLFlightConfig?.importConfig) return;
           window.RLFlightConfig.importConfig(
@@ -493,11 +500,19 @@
           packages.forEach(item => {
             const option = document.createElement('option');
             option.value = item.path;
-            option.textContent = item.path;
+            const family = item.contract_version === 'self_stabilize_v1'
+              ? 'DIRECT'
+              : item.contract_version === 'angular_acceleration_cascade_v1'
+                ? 'CASCADE'
+                : 'CUSTOM';
+            option.textContent = `[${family}] ${item.path}`;
             checkpointInput.appendChild(option);
           });
           checkpointInput.disabled = false;
-          checkpointInput.value = packages[0].path;
+          const preferred = packages.find(item => item.path === storedPackage)
+            || packages.find(item => item.contract_version === 'self_stabilize_v1')
+            || packages[0];
+          checkpointInput.value = preferred.path;
           checkpointInput.addEventListener('change', applyRecommendedSimenv);
           checkpointInput.dispatchEvent(new Event('input', { bubbles: true }));
           checkpointInput.dispatchEvent(new Event('change', { bubbles: true }));

@@ -307,9 +307,26 @@ class WebUIHandler(SimpleHTTPRequestHandler):
                     package_manifest = json.loads(
                         manifest.read_text(encoding="utf-8")
                     )
-                    compatibility = package_manifest.get("contract", {}).get(
+                    contract = package_manifest.get("contract", {})
+                    if isinstance(contract, Mapping):
+                        entry["contract_version"] = str(
+                            contract.get("version", "unknown")
+                        )
+                        entry["observation_profile"] = str(
+                            contract.get("observation_profile", "unknown")
+                        )
+                    interface = package_manifest.get("interface", {})
+                    if isinstance(interface, Mapping):
+                        output = interface.get("output", {})
+                        if isinstance(output, Mapping):
+                            shape = output.get("shape", [])
+                            if isinstance(shape, list) and shape:
+                                entry["output_dimension"] = shape[-1]
+                    compatibility = contract.get(
                         "simulator_compatibility", {}
-                    )
+                    ) if isinstance(contract, Mapping) else {}
+                    if not isinstance(compatibility, Mapping):
+                        compatibility = {}
                     recommended = compatibility.get("configuration")
                     if isinstance(recommended, Mapping):
                         entry["recommended_simenv"] = recommended

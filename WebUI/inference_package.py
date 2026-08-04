@@ -291,15 +291,10 @@ class FlightDeployInferencePackage:
         )
         self.history_frames = frames
         self.history_stride_steps = stride_steps
-        self.control_features_compiled = False
+        self._history_reset_pending = True
         self._control_features = self._build_control_features
-        if device.type == "cpu":
-            self._control_features = torch.compile(
-                self._build_control_features,
-                fullgraph=True,
-                mode="reduce-overhead",
-            )
-            self.control_features_compiled = True
+        self.control_features_compiled = False
+        self._device = device
         self.metadata = InferencePackageMetadata(
             format_version=1,
             package_id=path.name,
@@ -310,6 +305,19 @@ class FlightDeployInferencePackage:
         )
         self.metadata.validate()
 
+    def configure_realtime(self, *, compile_kernels: bool) -> None:
+        if (
+            compile_kernels
+            and self._device.type == "cpu"
+            and not self.control_features_compiled
+        ):
+            self._control_features = torch.compile(
+                self._build_control_features,
+                fullgraph=True,
+                mode="reduce-overhead",
+            )
+            self.control_features_compiled = True
+
     def infer(
         self,
         observation: torch.Tensor,
@@ -319,13 +327,21 @@ class FlightDeployInferencePackage:
         del recurrent_state
         if observation.shape != (1, 21):
             raise ValueError("flight control base observation must have shape [1,21]")
-        reset = bool(is_init.reshape(-1)[0].item())
-        if reset or not bool(self.history.initialized.all()):
+        del is_init
+        if self._history_reset_pending:
             self.history.reset(observation)
             runtime_observation = self.history.observation()
+            self._history_reset_pending = False
         else:
-            runtime_observation = self.history.append(observation)
+            runtime_observation = self._append_history(observation)
         return self.runtime.infer(runtime_observation), None
+
+    def _append_history(self, observation: torch.Tensor) -> torch.Tensor:
+        """Append without repeated tensor-to-Python initialization checks."""
+
+        self.history.index = (self.history.index + 1) % self.history.capacity
+        self.history.values[:, self.history.index].copy_(observation)
+        return self.history.observation()
 
     def infer_control(
         self,
@@ -409,6 +425,7 @@ class FlightDeployInferencePackage:
         self.history.values.zero_()
         self.history.index = self.history.capacity - 1
         self.history.initialized.zero_()
+        self._history_reset_pending = True
 
     def warmup(self, observation: torch.Tensor) -> None:
         is_init = torch.ones((1, 1), device=observation.device, dtype=torch.bool)
@@ -608,15 +625,20 @@ class AngularAccelerationCascadePackage:
         )
         self.history_frames = frames
         self.history_stride_steps = stride_steps
+        self._history_reset_pending = True
         self.integral_error = torch.zeros((1, 3), device=device, dtype=dtype)
         self.previous_angular_velocity = torch.zeros_like(self.integral_error)
         self.estimator_initialized = torch.zeros(1, device=device, dtype=torch.bool)
+        self._estimator_reset_pending = True
         self.last_desired_angular_acceleration = torch.zeros_like(
             self.integral_error
         )
         self.last_actual_angular_acceleration = torch.zeros_like(
             self.integral_error
         )
+        self.control_features_compiled = False
+        self._control_features = self._build_control_features
+        self._device = device
         self.metadata = InferencePackageMetadata(
             format_version=1,
             package_id=path.name,
@@ -627,6 +649,19 @@ class AngularAccelerationCascadePackage:
         )
         self.metadata.validate()
 
+    def configure_realtime(self, *, compile_kernels: bool) -> None:
+        if (
+            compile_kernels
+            and self._device.type == "cpu"
+            and not self.control_features_compiled
+        ):
+            self._control_features = torch.compile(
+                self._build_control_features,
+                fullgraph=True,
+                mode="reduce-overhead",
+            )
+            self.control_features_compiled = True
+
     def infer(
         self,
         observation: torch.Tensor,
@@ -636,13 +671,19 @@ class AngularAccelerationCascadePackage:
         del recurrent_state
         if observation.shape != (1, 21):
             raise ValueError("cascade base observation must have shape [1,21]")
-        reset = bool(is_init.reshape(-1)[0].item())
-        if reset or not bool(self.history.initialized.all()):
+        del is_init
+        if self._history_reset_pending:
             self.history.reset(observation)
             runtime_observation = self.history.observation()
+            self._history_reset_pending = False
         else:
-            runtime_observation = self.history.append(observation)
+            runtime_observation = self._append_history(observation)
         return self.runtime.infer(runtime_observation), None
+
+    def _append_history(self, observation: torch.Tensor) -> torch.Tensor:
+        self.history.index = (self.history.index + 1) % self.history.capacity
+        self.history.values[:, self.history.index].copy_(observation)
+        return self.history.observation()
 
     def infer_control(
         self,
@@ -654,54 +695,90 @@ class AngularAccelerationCascadePackage:
     ) -> tuple[torch.Tensor, Any | None]:
         if previous_action.shape != (1, 3):
             raise ValueError("cascade previous action must have shape [1,3]")
-        reset = bool(is_init.reshape(-1)[0].item())
         angular_velocity = state.angular_velocity_b
-        if reset or not bool(self.estimator_initialized[0].item()):
+        if self._estimator_reset_pending:
             self.integral_error.zero_()
             actual_angular_acceleration = torch.zeros_like(angular_velocity)
             self.estimator_initialized.fill_(True)
+            self._estimator_reset_pending = False
         else:
             actual_angular_acceleration = (
                 angular_velocity - self.previous_angular_velocity
             ) / self.control_dt
-        self.previous_angular_velocity.copy_(angular_velocity)
-
-        attitude_error = self._attitude_error_rotation_vector(
+        (
+            frame,
+            candidate_integral,
+            desired_angular_acceleration,
+        ) = self._control_features(
             state.attitude_q_wb,
+            angular_velocity,
+            self.integral_error,
+            actual_angular_acceleration,
+            state.linear_acceleration_n,
+            state.motor_speed,
+            state.servo_angle,
             reference.target_attitude_q_wb,
+            reference.target_angular_velocity_b,
+            reference.collective_command,
+            previous_action,
         )
-        candidate_integral = torch.clamp(
-            self.integral_error + attitude_error * self.control_dt,
-            min=-self.integral_limit,
-            max=self.integral_limit,
-        )
+        self.previous_angular_velocity.copy_(angular_velocity)
         self.integral_error.copy_(candidate_integral)
-        rate_error = reference.target_angular_velocity_b - angular_velocity
-        desired_angular_acceleration = torch.clamp(
-            self.proportional_gain * attitude_error
-            + self.integral_gain * self.integral_error
-            + self.derivative_gain * rate_error,
-            min=-self.command_scale,
-            max=self.command_scale,
-        )
         self.last_desired_angular_acceleration.copy_(
             desired_angular_acceleration
         )
         self.last_actual_angular_acceleration.copy_(actual_angular_acceleration)
+        return self.infer(frame, recurrent_state, is_init)
+
+    def _build_control_features(
+        self,
+        attitude_q_wb: torch.Tensor,
+        angular_velocity: torch.Tensor,
+        integral_error: torch.Tensor,
+        actual_angular_acceleration: torch.Tensor,
+        linear_acceleration_n: torch.Tensor,
+        motor_speed: torch.Tensor,
+        servo_angle: torch.Tensor,
+        target_attitude_q_wb: torch.Tensor,
+        target_angular_velocity_b: torch.Tensor,
+        collective_command: torch.Tensor,
+        previous_action: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        attitude_error = self._attitude_error_rotation_vector(
+            attitude_q_wb,
+            target_attitude_q_wb,
+        )
+        candidate_integral = torch.clamp(
+            integral_error + attitude_error * self.control_dt,
+            min=-self.integral_limit,
+            max=self.integral_limit,
+        )
+        rate_error = target_angular_velocity_b - angular_velocity
+        desired_angular_acceleration = torch.clamp(
+            self.proportional_gain * attitude_error
+            + self.integral_gain * candidate_integral
+            + self.derivative_gain * rate_error,
+            min=-self.command_scale,
+            max=self.command_scale,
+        )
         frame = torch.cat(
             (
                 desired_angular_acceleration / self.command_scale,
                 actual_angular_acceleration / self.command_scale,
                 angular_velocity / self.angular_velocity_scale,
-                state.linear_acceleration_n / self.acceleration_scale,
-                state.motor_speed / self.motor_speed_scale,
-                state.servo_angle / self.servo_angle_scale,
-                reference.collective_command * 2.0 - 1.0,
+                linear_acceleration_n / self.acceleration_scale,
+                motor_speed / self.motor_speed_scale,
+                servo_angle / self.servo_angle_scale,
+                collective_command * 2.0 - 1.0,
                 previous_action,
             ),
             dim=1,
         )
-        return self.infer(frame, recurrent_state, is_init)
+        return (
+            frame,
+            candidate_integral,
+            desired_angular_acceleration,
+        )
 
     def action_to_command(
         self,
@@ -752,9 +829,11 @@ class AngularAccelerationCascadePackage:
         self.history.values.zero_()
         self.history.index = self.history.capacity - 1
         self.history.initialized.zero_()
+        self._history_reset_pending = True
         self.integral_error.zero_()
         self.previous_angular_velocity.zero_()
         self.estimator_initialized.zero_()
+        self._estimator_reset_pending = True
         self.last_desired_angular_acceleration.zero_()
         self.last_actual_angular_acceleration.zero_()
 
@@ -784,6 +863,7 @@ class AngularAccelerationCascadePackage:
             "history_mode": "uniform",
             "history_frames": self.history_frames,
             "history_stride_steps": self.history_stride_steps,
+            "control_features_compiled": self.control_features_compiled,
             "required_control_hz": self.required_control_hz,
             "required_simulator_fingerprint": (
                 self.required_simulator_fingerprint

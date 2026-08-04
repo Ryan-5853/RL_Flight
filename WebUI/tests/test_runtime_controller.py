@@ -299,6 +299,11 @@ class RuntimeControllerIntegrationTests(unittest.TestCase):
                     session.status()["controller"]["height_controller"],
                     "shared_altitude_pid",
                 )
+                self.assertEqual(
+                    session.status()["controller"]["height_controller_backend"],
+                    "scalar_b1",
+                )
+                self.assertTrue(session.status()["flush_denormal"])
                 with torch.no_grad():
                     session._step_cpu(inspect_safety=False)
                 command = session.last_controller_output.command
@@ -449,6 +454,20 @@ class RuntimeControllerIntegrationTests(unittest.TestCase):
                     float(session.last_height_controller_output["error_m"][0]),
                     1.0,
                     places=5,
+                )
+                expected_thrust = min(
+                    float(session.controller_parameters["body.mass"][0])
+                    * (9.80665 + 6.0),
+                    session.realtime_height_controller.maximum_thrust,
+                )
+                self.assertAlmostEqual(
+                    float(
+                        session.last_height_controller_output[
+                            "desired_thrust_n"
+                        ][0]
+                    ),
+                    expected_thrust,
+                    places=4,
                 )
                 target_attitude = session.last_reference.target_attitude_q_wb
                 # Positive North acceleration requires negative pitch because

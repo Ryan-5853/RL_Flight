@@ -535,6 +535,135 @@ def _configuration_model_mismatch(
     }
 
 
+class _RealtimeHeightController:
+    """Allocation-free B=1 altitude loop for the neural realtime hot path."""
+
+    def __init__(self, controller: Any, torch: Any) -> None:
+        self.height_kp = controller.height_kp
+        self.height_ki = controller.height_ki
+        self.height_kd = controller.height_kd
+        self.height_integral_limit = controller.height_integral_limit
+        self.minimum_thrust_fraction = controller.minimum_thrust_fraction
+        self.maximum_thrust_fraction = controller.maximum_thrust_fraction
+        self.control_dt = controller.context.control_dt
+        self.gravity = controller.plant.gravity
+        parameters = controller.context.parameters
+        self.mass = float(parameters["body.mass"][0].item())
+        coefficients = parameters["aerodynamics.thrust_coefficients"][0]
+        torque = parameters["motors.torque_coefficient"][0]
+        torque_ratio = math.sqrt(
+            max(float(torque[0].item()), 1e-16)
+            / max(float(torque[1].item()), 1e-16)
+        )
+        self.lower_to_upper_speed_ratio = torque_ratio
+        self.thrust_denominator = max(
+            float(coefficients[0].item())
+            + float(coefficients[1].item()) * torque_ratio * torque_ratio
+            + float(coefficients[2].item()) * torque_ratio,
+            1e-16,
+        )
+        self.minimum_thrust = (
+            self.minimum_thrust_fraction
+            * float(controller.trim.thrust[0].item())
+        )
+        maximum_speed = float(
+            parameters["motors.pwm_to_rpm_table"][0, 0, -1, 1].item()
+        )
+        self.maximum_thrust = (
+            self.maximum_thrust_fraction
+            * self.thrust_denominator
+            * maximum_speed
+            * maximum_speed
+        )
+        self.motor_tables = tuple(
+            tuple(
+                (float(row[0].item()), float(row[1].item()))
+                for row in parameters["motors.pwm_to_rpm_table"][0, motor]
+            )
+            for motor in range(2)
+        )
+        device = controller.context.device
+        dtype = controller.context.dtype
+        self.height_integral = 0.0
+        self.desired_thrust = torch.zeros(1, device=device, dtype=dtype)
+        self.target_speed = torch.zeros((1, 2), device=device, dtype=dtype)
+        self.base_command = torch.zeros((1, 5), device=device, dtype=dtype)
+
+    @staticmethod
+    def _inverse_lookup(
+        value: float, table: tuple[tuple[float, float], ...]
+    ) -> float:
+        value = min(max(value, table[0][1]), table[-1][1])
+        upper = 1
+        while upper < len(table) - 1 and value > table[upper][1]:
+            upper += 1
+        x0, y0 = table[upper - 1]
+        x1, y1 = table[upper]
+        if y1 <= y0:
+            return x1
+        return x0 + (value - y0) * (x1 - x0) / (y1 - y0)
+
+    def _desired_actuator_equilibrium(
+        self,
+        state: Any,
+        reference: Any,
+        active: Any,
+    ) -> tuple[Any, Any, Any]:
+        del active
+        height = -float(state.position_n[0, 2].item())
+        height_target = -float(reference.target_position_n[0, 2].item())
+        vertical_speed = -float(state.velocity_n[0, 2].item())
+        vertical_speed_target = -float(
+            reference.target_velocity_n[0, 2].item()
+        )
+        error = height_target - height
+        speed_error = vertical_speed_target - vertical_speed
+        self.height_integral = min(
+            max(
+                self.height_integral + error * self.control_dt,
+                -self.height_integral_limit,
+            ),
+            self.height_integral_limit,
+        )
+        acceleration_up = (
+            self.height_kp * error
+            + self.height_ki * self.height_integral
+            + self.height_kd * speed_error
+        )
+        qx = float(state.attitude_q_wb[0, 1].item())
+        qy = float(state.attitude_q_wb[0, 2].item())
+        tilt_cosine = max(1.0 - 2.0 * (qx * qx + qy * qy), 0.35)
+        desired_thrust = min(
+            max(
+                self.mass * (self.gravity + acceleration_up) / tilt_cosine,
+                self.minimum_thrust,
+            ),
+            self.maximum_thrust,
+        )
+        upper_speed = math.sqrt(
+            max(desired_thrust, 0.0) / self.thrust_denominator
+        )
+        lower_speed = self.lower_to_upper_speed_ratio * upper_speed
+        upper_pwm = min(
+            max(self._inverse_lookup(upper_speed, self.motor_tables[0]), 0.0),
+            1.0,
+        )
+        lower_pwm = min(
+            max(self._inverse_lookup(lower_speed, self.motor_tables[1]), 0.0),
+            1.0,
+        )
+        self.desired_thrust[0] = desired_thrust
+        self.target_speed[0, 0] = upper_speed
+        self.target_speed[0, 1] = lower_speed
+        self.base_command[0, 0] = upper_pwm
+        self.base_command[0, 1] = lower_pwm
+        return self.desired_thrust, self.target_speed, self.base_command
+
+    def reset(self, reset_mask: Any) -> None:
+        if bool(reset_mask[0].item()):
+            self.height_integral = 0.0
+
+
 class CpuRuntimeSession:
     """Own one CPU simulation/controller loop and its lifecycle."""
 
@@ -565,6 +694,10 @@ class CpuRuntimeSession:
         self.options = parse_runtime_options(self.raw_test)
         self.device = torch.device(self.options.device)
         torch.set_num_threads(self.options.cpu_threads)
+        # Tiny neural activations can enter the subnormal range and cause
+        # severe, data-dependent CPU latency spikes. Flight control values at
+        # this magnitude are physically irrelevant, so flush them to zero.
+        self.flush_denormal = bool(torch.set_flush_denormal(True))
         try:
             torch.set_num_interop_threads(1)
         except RuntimeError:
@@ -744,6 +877,15 @@ class CpuRuntimeSession:
                         "deployment package is incompatible with the selected "
                         "SimEnv dynamics; import the training environment config"
                     )
+                configure_realtime = getattr(
+                    self.inference_package,
+                    "configure_realtime",
+                    None,
+                )
+                if configure_realtime is not None:
+                    configure_realtime(
+                        compile_kernels=self.options.compile_kernels
+                    )
                 neural_model = InferenceModelAdapter(self.inference_package)
                 params.setdefault(
                     "maximum_angular_rate_rad_s",
@@ -786,15 +928,20 @@ class CpuRuntimeSession:
                 neural_model=neural_model,
             )
             if controller_type == "neural" and collective_mode == "hover":
-                # Reuse the exact classical altitude PID and plant mapping.
-                # Only its balanced upper-motor equilibrium is consumed; the
-                # neural policy retains ownership of the remaining channels.
-                self.realtime_height_controller = create_controller(
+                # Build and validate the authoritative classical altitude PID
+                # once, then freeze its B=1 coefficients into the allocation-
+                # free realtime implementation. The neural policy retains
+                # ownership of the remaining channels.
+                height_controller = create_controller(
                     {
                         "type": "pid",
                         "params": dict(controller_config["params"]),
                     },
                     controller_context,
+                )
+                self.realtime_height_controller = _RealtimeHeightController(
+                    height_controller,
+                    torch,
                 )
             self.effective_configuration = {
                 "id": self.configuration_id,
@@ -921,6 +1068,11 @@ class CpuRuntimeSession:
                     "shared_altitude_pid"
                     if self.realtime_height_controller is not None
                     else "manual"
+                )
+                self.controller_description["height_controller_backend"] = (
+                    "scalar_b1"
+                    if self.realtime_height_controller is not None
+                    else None
                 )
             if self.inference_package is not None:
                 self.controller_description["inference_package"] = dict(
@@ -1174,6 +1326,7 @@ class CpuRuntimeSession:
                 "device": str(self.device),
                 "cpu_threads": self.options.cpu_threads,
                 "dtype": str(self.dtype),
+                "flush_denormal": self.flush_denormal,
                 "simulation_backend": "simenv-realtime-single-v1",
                 "simulation_compiled": self.simulation.compiled,
                 "controller_compiled": self.controller_compiled,
