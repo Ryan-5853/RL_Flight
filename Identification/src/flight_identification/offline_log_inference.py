@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -18,6 +19,14 @@ from .sim2real_composite import (
     fit_coefficients_from_step_response,
     merge_adaptive_composite_coefficients,
 )
+
+
+def checkpoint_sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).expanduser().resolve().open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def load_canonical_log_bundle(
@@ -109,6 +118,100 @@ def _flight_information_score(
     return rate_rms + 2.0 * command_movement_rms
 
 
+def _log_quality_metrics(
+    features: torch.Tensor,
+    valid: torch.Tensor,
+    names: Sequence[str],
+    normalized: torch.Tensor,
+) -> dict[str, Any]:
+    if features.ndim != 3 or valid.shape != features.shape[:2]:
+        raise ValueError("quality metrics require [flight,time,feature] logs")
+    if normalized.shape != features.shape:
+        raise ValueError("normalized log shape must match physical features")
+    weights = valid.to(features.dtype)
+    count = weights.sum().clamp_min(1.0)
+    rate_rms = {}
+    for axis in "xyz":
+        index = names.index(f"angular_velocity_b.{axis}")
+        rate_rms[axis] = float(
+            torch.sqrt((features[..., index].square() * weights).sum() / count)
+        )
+    command_indices = [
+        names.index(name)
+        for name in (
+            "command.motor_upper",
+            "command.motor_lower",
+            "command.servo_1",
+            "command.servo_2",
+            "command.servo_3",
+        )
+    ]
+    movement_valid = valid[:, 1:] & valid[:, :-1]
+    movement_count = movement_valid.sum().clamp_min(1).to(features.dtype)
+    movement = (
+        features[:, 1:, command_indices] - features[:, :-1, command_indices]
+    ).square().sum(dim=2)
+    command_movement_rms = float(
+        torch.sqrt((movement * movement_valid).sum() / movement_count)
+    )
+    valid_normalized = normalized[valid]
+    return {
+        "axis_rate_rms_rad_s": rate_rms,
+        "command_movement_rms_per_sample": command_movement_rms,
+        "feature_z_score_abs_p95": float(
+            torch.quantile(valid_normalized.abs(), 0.95)
+        ),
+        "feature_z_score_abs_max": float(valid_normalized.abs().max()),
+    }
+
+
+def _quality_gate(
+    metrics: Mapping[str, Any],
+    selected_flight_count: int,
+    calibration: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    if calibration is None:
+        return {
+            "available": False,
+            "passed_for_independent_validation": False,
+            "reasons": ["quality_calibration_not_provided"],
+        }
+    if calibration.get("artifact_type") != "offline_log_quality_calibration":
+        raise ValueError("quality calibration has an unexpected artifact type")
+    thresholds = calibration["thresholds"]
+    reasons: list[str] = []
+    minimum_flights = int(calibration["minimum_selected_flights"])
+    if selected_flight_count < minimum_flights:
+        reasons.append(
+            f"selected_flight_count_below_{minimum_flights}"
+        )
+    maximum_p95 = float(thresholds["maximum_feature_z_score_abs_p95"])
+    if float(metrics["feature_z_score_abs_p95"]) > maximum_p95:
+        reasons.append("feature_z_score_abs_p95_above_validation_limit")
+    maximum_absolute = float(thresholds["maximum_feature_z_score_abs_max"])
+    if float(metrics["feature_z_score_abs_max"]) > maximum_absolute:
+        reasons.append("feature_z_score_abs_max_above_validation_limit")
+    minimum_movement = float(thresholds["minimum_command_movement_rms_per_sample"])
+    if float(metrics["command_movement_rms_per_sample"]) < minimum_movement:
+        reasons.append("command_movement_below_validation_limit")
+    for axis in "xyz":
+        if float(metrics["axis_rate_rms_rad_s"][axis]) < float(
+            thresholds["minimum_axis_rate_rms_rad_s"][axis]
+        ):
+            reasons.append(f"angular_rate_{axis}_coverage_below_validation_limit")
+    return {
+        "available": True,
+        "passed_for_independent_validation": not reasons,
+        "reasons": reasons,
+        "minimum_selected_flights": minimum_flights,
+        "thresholds": thresholds,
+        "meaning": (
+            "Passing only permits independent simulation and HIL validation. "
+            "It never accepts a gain for flight."
+        ),
+    }
+
+
 def _build_model(checkpoint: Mapping[str, Any], device: torch.device) -> torch.nn.Module:
     model = build_offline_identifier(
         str(checkpoint.get("architecture", "mlp")),
@@ -189,6 +292,28 @@ def infer(args: argparse.Namespace) -> Mapping[str, Any]:
     device = torch.device(args.device)
     prediction, normalized, selected_valid = _predict_logs(
         checkpoint, features, valid, selected, device
+    )
+    selected_features = features[selected]
+    quality_metrics = _log_quality_metrics(
+        selected_features, selected_valid, feature_names, normalized
+    )
+    quality_calibration = None
+    quality_calibration_path = None
+    if args.quality_calibration:
+        quality_calibration_path = Path(args.quality_calibration).expanduser().resolve()
+        quality_calibration = json.loads(
+            quality_calibration_path.read_text(encoding="utf-8")
+        )
+        expected_digest = str(quality_calibration.get("checkpoint_sha256", ""))
+        actual_digest = checkpoint_sha256(checkpoint_path)
+        if expected_digest != actual_digest:
+            raise ValueError(
+                "quality calibration checkpoint digest does not match the primary checkpoint"
+            )
+        if tuple(quality_calibration["feature_names"]) != feature_names:
+            raise ValueError("quality calibration feature schema differs from checkpoint")
+    quality_gate = _quality_gate(
+        quality_metrics, len(selected), quality_calibration
     )
     secondary_checkpoint_path = None
     secondary_output_axes: tuple[str, ...] = ()
@@ -300,7 +425,6 @@ def infer(args: argparse.Namespace) -> Mapping[str, Any]:
     if not 0.0 <= blend_fraction <= 1.0:
         raise ValueError("analysis-gain-blend must be between zero and one")
     analysis_gain = nominal_gain + blend_fraction * (predicted_gain - nominal_gain)
-    z_score = normalized[selected_valid]
     report = {
         "schema_version": 1,
         "checkpoint": str(checkpoint_path),
@@ -318,8 +442,11 @@ def infer(args: argparse.Namespace) -> Mapping[str, Any]:
         "selected_flight_indices": selected.tolist(),
         "selected_information_scores": score[selected].tolist(),
         "selected_valid_fractions": valid_fraction[selected].tolist(),
-        "feature_z_score_abs_p95": float(torch.quantile(z_score.abs(), 0.95)),
-        "feature_z_score_abs_max": float(z_score.abs().max()),
+        **quality_metrics,
+        "quality_calibration": (
+            None if quality_calibration_path is None else str(quality_calibration_path)
+        ),
+        "identification_quality_gate": quality_gate,
         "response_snapshot_times_s": snapshot_times,
         "predicted_response": None if response is None else response.tolist(),
         "predicted_composite_coefficients": predicted_coefficients.tolist(),
@@ -348,6 +475,10 @@ def infer(args: argparse.Namespace) -> Mapping[str, Any]:
                 "output": str(output),
                 "selected_flights": len(selected),
                 "feature_z_score_abs_p95": report["feature_z_score_abs_p95"],
+                "quality_gate_passed_for_independent_validation": quality_gate[
+                    "passed_for_independent_validation"
+                ],
+                "quality_gate_reasons": quality_gate["reasons"],
                 "analysis_gain_blend_fraction": blend_fraction,
                 "identified_model_pole_radius": report[
                     "identified_model_pole_radius"
@@ -374,6 +505,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--analysis-gain-blend", type=float, default=0.9)
     parser.add_argument("--minimum-valid-fraction", type=float, default=0.99)
+    parser.add_argument("--quality-calibration")
     return parser
 
 

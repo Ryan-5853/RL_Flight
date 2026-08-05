@@ -101,10 +101,9 @@ def _parameter_stratified_convergence(
     group_count: int,
     repeats: int,
 ) -> Mapping[str, Any]:
-    group_delta = (
-        candidate["converged"].to(torch.float32)
-        - reference["converged"].to(torch.float32)
-    ).reshape(group_count, repeats).mean(dim=1)
+    group_delta = _group_convergence_delta(
+        candidate, reference, group_count, repeats
+    )
     labels = physical_labels.reshape(group_count, repeats, -1)[:, 0].to(torch.float32)
     centered_delta = group_delta - group_delta.mean()
     entries = []
@@ -137,6 +136,18 @@ def _parameter_stratified_convergence(
         "unchanged_group_fraction": float((group_delta == 0).to(torch.float32).mean()),
         "top_parameter_associations": entries[:10],
     }
+
+
+def _group_convergence_delta(
+    candidate: Mapping[str, torch.Tensor],
+    reference: Mapping[str, torch.Tensor],
+    group_count: int,
+    repeats: int,
+) -> torch.Tensor:
+    return (
+        candidate["converged"].to(torch.float32)
+        - reference["converged"].to(torch.float32)
+    ).reshape(group_count, repeats).mean(dim=1)
 
 
 def _legacy_predicted_targets(
@@ -867,6 +878,13 @@ def evaluate(args: argparse.Namespace) -> Mapping[str, Any]:
         "paired_vs_original_nominal": paired_against("original_nominal"),
         "paired_vs_composite_nominal": paired_against("composite_nominal"),
         "parameter_stratified_vs_composite_nominal": parameter_stratified,
+        "per_group_convergence_deltas_vs_composite_nominal": {
+            name: _group_convergence_delta(
+                result, results["composite_nominal"], count, repeats
+            ).tolist()
+            for name, result in results.items()
+            if name != "composite_nominal"
+        },
         "deployment_mode": "research_only",
         "gain_updates_enabled": False,
     }

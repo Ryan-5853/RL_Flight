@@ -316,7 +316,7 @@ def _sample_sim2real_labels(
     while accepted_count < group_count:
         candidate_count = min(4096, max(256, 8 * (group_count - accepted_count)))
         candidates = _draw_sim2real_candidate_labels(
-            candidate_count, config, generator, dtype
+            candidate_count, nominal, config, generator, dtype
         )
         device = nominal["body.mass"].device
         expanded_nominal = {
@@ -361,6 +361,7 @@ def _sample_sim2real_labels(
 
 def _draw_sim2real_candidate_labels(
     group_count: int,
+    nominal: Mapping[str, torch.Tensor],
     config: IdentificationExperimentConfig,
     generator: torch.Generator,
     dtype: torch.dtype,
@@ -382,7 +383,32 @@ def _draw_sim2real_candidate_labels(
     labels = torch.empty(
         group_count, len(SIM2REAL_LABEL_NAMES), dtype=dtype
     )
-    labels[:, 0] = uniform(ranges.mass_kg)
+    # Mass is derived from the fixed measured motor thrust curve and the sampled
+    # thrust-to-weight ratio: mass = T_max / (T/W * g). The thrust curve itself
+    # stays fixed, so different payloads produce the T/W spread.
+    labels[:, 4] = uniform(ranges.thrust_to_weight)
+    labels[:, 5] = log_uniform(ranges.motor_reaction_scale)
+    labels[:, 6] = log_uniform(ranges.motor_reaction_ratio)
+    labels[:, 7] = log_uniform(ranges.motor_time_constant_s)
+    labels[:, 8] = log_uniform(ranges.motor_time_constant_s)
+    torque_nominal = nominal["motors.torque_coefficient"][0].to(dtype)
+    common = labels[:, 5]
+    ratio_root = torch.sqrt(labels[:, 6])
+    torque_upper = torque_nominal[0] * common * ratio_root
+    torque_lower = torque_nominal[1] * common / ratio_root
+    speed_ratio = torch.sqrt(torque_upper / torque_lower.clamp_min(1e-16))
+    max_speed = nominal["motors.pwm_to_rpm_table"][0, :, -1, 1].to(dtype)
+    upper_speed = torch.minimum(max_speed[0], max_speed[1] / speed_ratio)
+    lower_speed = speed_ratio * upper_speed
+    k1, k2, k3 = (
+        nominal["aerodynamics.thrust_coefficients"][0].to(dtype).unbind()
+    )
+    maximum_thrust = (
+        k1 * upper_speed.square()
+        + k2 * lower_speed.square()
+        + k3 * upper_speed * lower_speed
+    )
+    labels[:, 0] = maximum_thrust / (labels[:, 4] * 9.80665)
     labels[:, 1] = labels[:, 0] * log_uniform(
         ranges.inertia_xy_radius_of_gyration_m
     ).square()
@@ -412,11 +438,6 @@ def _draw_sim2real_candidate_labels(
         attempts += 1
         if attempts >= 1000:
             raise RuntimeError("could not sample valid sim2real principal inertias")
-    labels[:, 4] = uniform(ranges.thrust_to_weight)
-    labels[:, 5] = log_uniform(ranges.motor_reaction_scale)
-    labels[:, 6] = log_uniform(ranges.motor_reaction_ratio)
-    labels[:, 7] = log_uniform(ranges.motor_time_constant_s)
-    labels[:, 8] = log_uniform(ranges.motor_time_constant_s)
 
     radius_low, radius_high = ranges.direct_center_xy_radius_m
     radius = torch.sqrt(
@@ -486,10 +507,6 @@ def _apply_effectiveness_labels(
         )
         parameters["motors.torque_coefficient"][:, 1].mul_(
             common / ratio_root
-        )
-        current_twr = _maximum_thrust_to_weight(parameters)
-        parameters["aerodynamics.thrust_coefficients"].mul_(
-            (labels[:, 4] / current_twr)[:, None]
         )
         parameters["motors.time_constant"].copy_(labels[:, 7:9])
         parameters["aerodynamics.direct_thrust_center_b"].copy_(

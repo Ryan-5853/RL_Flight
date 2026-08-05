@@ -405,10 +405,15 @@ CONFIG_NN_CONTROL_BACKEND_LQR=y
 CONFIG_NN_CONTROL_BACKEND_HYBRID=y
 ```
 
-当前默认项是 `NEURAL`。`LQR` 和 `HYBRID` 已有可独立编译的后端文件与完整接口，
-但控制律仍是安全骨架，会拒绝执行器输出；实现分别放在
-`LqrControllerBackend.cpp` 和 `HybridControllerBackend.cpp`，不得在验证完成前把
-`actuatorOutputAllowed()` 改为 `true`。
+当前默认项是 `LQR`。LQR 后端实现为方案 A 的"外部集电 + 4 输出 LQI"：
+上桨归飞手/RC 油门（`rc_throttle` 映射到 `motors[0]`），LQI 控制下桨与三路舵机，
+13 状态全部命令驱动（无 ESC 转速、无舵角反馈），固定 500 Hz（2 ms）时基。
+权重与观察者常量由 `px4_trans/tools/generate_lqi_backend.py` 从
+`Identification` 的标称 K4 合成生成到 `LqiControllerCore.hpp` / `LqiWeights.hpp`，
+并配套黄金向量（`px4_trans/tests/lqi_golden.hpp`）与主机一致性检查
+（`px4_trans/tests/run_lqi_core_check.sh`）。`HYBRID` 仍是未实现骨架，实现放在
+`HybridControllerBackend.cpp`。执行器输出由 `NN_LQI_OUTPUT_EN` 参数门控，
+默认 `0`，在完成台架/HIL 验证前不得置 `1`。
 
 在 `px4/` 目录中执行以下完整命令：
 
@@ -546,10 +551,11 @@ QGC 的 Actuators 页面仍负责底层输出测试与标定。`PWM_MAIN_REV` �
 1000–2000 us 范围内，`0.02` 约等于 `10 us`。这些 trim 同时用于正常控制输出和 QGC
 执行器测试。
 
-当前 Neural 后端使用确定性随机权重，LQR/Hybrid 后端是未实现骨架，三者都通过
-`actuatorOutputAllowed()` 强制保持安全禁止状态。因此即使推理或框架循环正常，
-`actuator_motors` 和 `actuator_servos` 也应显示 `NaN`。接入并验证真实控制器前，不得
-绕过该保护。
+LQR 后端现在计算真实 LQI 输出，但执行器权威仍由 `NN_LQI_OUTPUT_EN` 参数门控
+（默认 `0`，此时 `actuator_motors` 和 `actuator_servos` 显示 `NaN`）。Neural 后端
+仍是随机权重占位，Hybrid 仍是骨架。置 `NN_LQI_OUTPUT_EN=1` 前必须完成无桨台架、
+故障注入、HIL 与执行器映射验证；QGC Actuators 页面负责底层输出方向、端点与中值
+标定，`PWM_MAIN_REV`、`PWM_MAIN_MINx/MAXx`、`NN_SV_TRIMx` 的语义不变。
 
 ### 14.6 常见构建错误
 

@@ -26,6 +26,24 @@ open-loop sweeps, and oracle-gain data collection are explicitly excluded.
 The canonical NPZ adapter and offline analysis CLI produce candidate composite
 gains but never mark them as flight-accepted.
 
+The offline analysis line is complete: MLP (100 Hz), TCN, and bidirectional GRU
+are all retrained on the stratified `lqr_sim2real_micro_offline_logs_v2` data
+with per-flight-count 1/2/4/8 comparisons. The selected hybrid is
+TCN(roll/pitch) + MLP(yaw) (`sim2real_offline_logs_step_response_tcn_500hz_v6`
+and `sim2real_offline_logs_step_response_mlp_v6`). Strict paired nonlinear
+audits on all 860 unseen parameter groups x 8 initial conditions, repeated over
+two evaluation seeds, give +9.5 to +10.1 percentage points convergence over the
+fixed composite nominal LQI with a group-clustered 95% CI excluding zero,
+non-inferior safety, and reduced saturation. Win/loss is positive in every
+log-information and input-OOD quartile. Artifacts remain
+`deployment_mode=research_only` with `gain_updates_enabled=false`; the 90%
+analysis blend plus validation-calibrated log-quality thresholds are the
+recommended HIL candidate inputs.
+
+The consolidated conclusions, with deployment-feasibility analysis and the full
+performance comparison, are in
+[OFFLINE_COMPOSITE_IDENTIFICATION_REPORT_zh.md](OFFLINE_COMPOSITE_IDENTIFICATION_REPORT_zh.md).
+
 The reproducible baseline uses 4,096 airframes with eight trials each:
 
 ```bash

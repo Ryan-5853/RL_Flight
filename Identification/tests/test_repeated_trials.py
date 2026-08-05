@@ -27,7 +27,11 @@ from flight_identification.repeated_trial_deployment import (
     RepeatedTrialLQRScheduler,
 )
 from flight_identification.offline_models import build_offline_identifier
-from flight_identification.offline_log_inference import load_canonical_log_bundle
+from flight_identification.offline_log_inference import (
+    _log_quality_metrics,
+    _quality_gate,
+    load_canonical_log_bundle,
+)
 from flight_identification.sim2real_control_evaluation import (
     _cluster_bootstrap_mean_ci,
     _paired_binary_summary,
@@ -66,6 +70,39 @@ SIM2REAL_CONFIG = (
 
 
 class RepeatedTrialIdentifierTests(unittest.TestCase):
+    def test_offline_quality_gate_separates_validation_from_flight_release(self) -> None:
+        features = torch.zeros(4, 3, 8)
+        names = (
+            "angular_velocity_b.x",
+            "angular_velocity_b.y",
+            "angular_velocity_b.z",
+            "command.motor_upper",
+            "command.motor_lower",
+            "command.servo_1",
+            "command.servo_2",
+            "command.servo_3",
+        )
+        features[:, :, :3] = 0.2
+        features[:, 1:, 3:] = 0.1
+        valid = torch.ones(4, 3, dtype=torch.bool)
+        metrics = _log_quality_metrics(features, valid, names, features)
+        calibration = {
+            "artifact_type": "offline_log_quality_calibration",
+            "minimum_selected_flights": 4,
+            "thresholds": {
+                "minimum_axis_rate_rms_rad_s": dict.fromkeys("xyz", 0.1),
+                "minimum_command_movement_rms_per_sample": 0.05,
+                "maximum_feature_z_score_abs_p95": 1.0,
+                "maximum_feature_z_score_abs_max": 1.0,
+            },
+        }
+        result = _quality_gate(metrics, 4, calibration)
+        self.assertTrue(result["passed_for_independent_validation"])
+        self.assertIn("never accepts a gain for flight", result["meaning"])
+        failed = _quality_gate(metrics, 3, calibration)
+        self.assertFalse(failed["passed_for_independent_validation"])
+        self.assertIn("selected_flight_count_below_4", failed["reasons"])
+
     def test_parameter_stratification_finds_directional_control_effect(self) -> None:
         labels = torch.arange(8, dtype=torch.float32)[:, None]
         reference = {"converged": torch.zeros(8, dtype=torch.bool)}

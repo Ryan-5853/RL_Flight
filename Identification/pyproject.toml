@@ -32,8 +32,15 @@ flight-identification-sim2real-parameter-diagnostics = "flight_identification.si
 flight-identification-sim2real-composite-train = "flight_identification.sim2real_composite_training:main"
 flight-identification-sim2real-composite-eval = "flight_identification.sim2real_composite_evaluation:main"
 flight-identification-offline-log-infer = "flight_identification.offline_log_inference:main"
+flight-identification-offline-quality-calibrate = "flight_identification.offline_quality_calibration:main"
+flight-identification-offline-quality-stratify = "flight_identification.offline_quality_stratification:main"
 flight-identification-sim2real-bad-point-screen = "flight_identification.sim2real_bad_point_screening:main"
 flight-identification-sim2real-point-materialize = "flight_identification.sim2real_point_materialization:main"
+flight-identification-lqi-gru-data = "flight_identification.lqi_gru_experiment:data_main"
+flight-identification-lqi-gru-train = "flight_identification.lqi_gru_distillation:train_main"
+flight-identification-lqi-gru-eval = "flight_identification.lqi_gru_distillation:eval_main"
+flight-identification-lqi-gru-closed-loop = "flight_identification.lqi_gru_closed_loop:main"
+flight-identification-lqi-gru-dagger = "flight_identification.lqi_gru_dagger:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

@@ -166,19 +166,27 @@ def load_experiment_config(path: str | Path) -> IdentificationExperimentConfig:
         )
 
     def ordered_range(
-        node: Mapping[str, Any], name: str, *, maximum: float | None = None
+        node: Mapping[str, Any],
+        name: str,
+        *,
+        maximum: float | None = None,
+        signed: bool = False,
     ) -> tuple[float, float]:
         values = tuple(float(v) for v in node.get(name, ()))
+        positivity = all(math.isfinite(v) for v in values) if signed else all(
+            math.isfinite(v) and v > 0.0 for v in values
+        )
         if (
             len(values) != 2
-            or not all(math.isfinite(v) and v > 0.0 for v in values)
+            or not positivity
             or values[0] >= values[1]
             or (maximum is not None and values[1] > maximum)
         ):
             suffix = f" and <= {maximum}" if maximum is not None else ""
+            sign = "signed " if signed else "positive "
             raise ValueError(
                 f"sampling.empirical_ranges.{name} must contain two ordered "
-                f"positive finite values{suffix}"
+                f"{sign}finite values{suffix}"
             )
         return values[0], values[1]
 
@@ -232,7 +240,9 @@ def load_experiment_config(path: str | Path) -> IdentificationExperimentConfig:
             direct_center_xy_radius_m=sim_range(
                 "direct_center_xy_radius_m"
             ),
-            direct_center_z_m=sim_range("direct_center_z_m"),
+            direct_center_z_m=ordered_range(
+                ranges, "direct_center_z_m", signed=True
+            ),
             direct_thrust_fraction=sim_range("direct_thrust_fraction"),
             grid_radius_m=sim_range("grid_radius_m"),
             grid_azimuth_error_rad=tuple(

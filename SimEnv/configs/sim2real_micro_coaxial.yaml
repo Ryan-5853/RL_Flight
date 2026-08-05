@@ -17,7 +17,7 @@ initial_state:
   angular_velocity_b: {value: [0.0, 0.0, 0.0]}
 
 body:
-  mass: {value: 0.300}
+  mass: {value: 0.500}
   center_of_mass_b: {value: [0.0, 0.0, 0.0]}
   inertia_diagonal_b: {value: [0.00075, 0.00075, 0.00110]}
 
@@ -26,7 +26,10 @@ motors:
     name: upper
     pwm_deadzone: {value: 0.08}
     pwm_to_rpm_table:
-      value: [[0.0, 0.0], [0.08, 0.0], [0.5, 900.0], [1.0, 1800.0]]
+      # Fitted from the real single-motor static thrust curve so that
+      # k1 * rpm^2 reproduces the median measurements (see thrust_coefficients):
+      #   30% -> 200 g, 50% -> 370 g, 70% -> 590 g, 90% -> 810 g, 100% -> 850 g
+      value: [[0.0, 0.0], [0.08, 0.0], [0.3, 873.1], [0.5, 1187.6], [0.7, 1499.7], [0.9, 1757.1], [1.0, 1800.0]]
     time_constant: {value: 0.040}
     torque_coefficient: {value: 2.30e-8}
     noise:
@@ -52,21 +55,31 @@ servos:
     name: servo_3
 
 aerodynamics:
-  # At 1800 rad/s these coefficients produce 7.355 N: T/W = 2.5 at 0.3 kg.
-  thrust_coefficients: {value: [9.08e-7, 9.08e-7, 4.54e-7]}
+  # Real single-motor static thrust on the test stand (throttle -> median /
+  # suggested uncertainty): 30% -> 200 g (175-225), 50% -> 370 g (325-410),
+  # 70% -> 590 g (520-650), 90% -> 810 g (720-900), 100% -> 850 g (750-950).
+  # Coaxial counter-rotation is represented by the k3 cross term (k3 = 0.5 * k1,
+  # keeping the previously calibrated coaxial ratio). At 1800 rpm the pair and
+  # cross term produce 20.85 N, i.e. T/W = 4.25 at 0.5 kg; hover (4.90 N) sits
+  # at about 30% throttle, matching the measured 200 g per motor there.
+  thrust_coefficients: {value: [2.5736e-6, 2.5736e-6, 1.2868e-6]}
   neutral_thrust_direction_b: {value: [0.0, 0.0, -1.0]}
-  direct_thrust_center_b: {value: [0.0, 0.0, 0.030]}
+  # FRD body frame (z down, +z = below CoM). Direct thrust acts near the CoM
+  # height; Identification randomizes it +/- 5 cm around zero.
+  direct_thrust_center_b: {value: [0.0, 0.0, 0.0]}
   thrust_partition:
     direct: {value: 0.65}
     grid_1: {value: 0.1166666667}
     grid_2: {value: 0.1166666667}
     grid_3: {value: 0.1166666666}
 
-  # FRD body frame: one grid aft, two grids forward-left/right.
+  # FRD body frame: one grid aft, two grids forward-left/right. Grid thrust
+  # centers sit about 5 cm below the CoM (+z); Identification randomizes
+  # +/- 3 cm around 0.050 m.
   grids:
     - &grid
       name: grid_1
-      aerodynamic_center_b: {value: [-0.050, 0.0, 0.030]}
+      aerodynamic_center_b: {value: [-0.050, 0.0, 0.050]}
       deflection_axis_b: {value: [-1.0, 0.0, 0.0]}
       self_attenuation_curve:
         value: [[0.0, 1.0], [0.35, 0.85]]
@@ -75,11 +88,11 @@ aerodynamics:
         offset: {value: 0.0}
     - <<: *grid
       name: grid_2
-      aerodynamic_center_b: {value: [0.025, 0.04330127, 0.030]}
+      aerodynamic_center_b: {value: [0.025, 0.04330127, 0.050]}
       deflection_axis_b: {value: [0.5, 0.8660254, 0.0]}
     - <<: *grid
       name: grid_3
-      aerodynamic_center_b: {value: [0.025, -0.04330127, 0.030]}
+      aerodynamic_center_b: {value: [0.025, -0.04330127, 0.050]}
       deflection_axis_b: {value: [0.5, -0.8660254, 0.0]}
 
   coupling_attenuation:

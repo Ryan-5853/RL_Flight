@@ -1,0 +1,130 @@
+schema_version: 1
+
+simulator_config: ../../SimEnv/configs/sim2real_micro_coaxial.yaml
+controller_config: ../../Controller/configs/lqi_oracle_distillation_manual.yaml
+
+run:
+  seed: 20260805
+  device: cuda:0
+  dtype: float32
+  parallel_count: 1024
+  output_directory: ../datasets/lqi_gru_oracle_distillation_pilot_v1
+
+observation:
+  measurement_mode: simulated_sensors
+
+sampling:
+  parameterization: sim2real_micro
+  parameter_groups: 8192
+  initial_conditions_per_group: 4
+  episode_duration_s: 6.0
+  sim2real_ranges:
+    mass_kg: [0.15, 0.60]
+    inertia_xy_radius_of_gyration_m: [0.035, 0.075]
+    inertia_z_radius_of_gyration_m: [0.045, 0.080]
+    thrust_to_weight: [1.2, 5.0]
+    motor_reaction_scale: [0.25, 4.0]
+    motor_reaction_ratio: [0.70, 1.40]
+    motor_time_constant_s: [0.015, 0.120]
+    direct_center_xy_radius_m: [0.00001, 0.010]
+    direct_center_z_m: [0.010, 0.050]
+    direct_thrust_fraction: [0.50, 0.80]
+    grid_radius_m: [0.040, 0.060]
+    grid_azimuth_error_rad: [-0.1396263, 0.1396263]
+    grid_center_z_m: [0.010, 0.050]
+    grid_effectiveness_scale: [0.50, 1.50]
+    servo_time_constant_s: [0.010, 0.080]
+    servo_max_speed_rad_s: [5.0, 11.6355]
+    coupling_attenuation: [0.0, 0.40]
+  feasibility:
+    maximum_linear_trim_servo_angle_rad: 0.125
+    maximum_linear_trim_residual_rad_s2: 0.10
+
+initial_state:
+  sampling_design: stratified_multiaxis
+  minimum_tilt_rad: 0.0
+  maximum_tilt_rad: 0.2617994
+  maximum_angular_rate_rad_s: [1.0, 1.0, 1.5]
+
+convergence:
+  maximum_roll_pitch_error_rad: 0.0349066
+  maximum_angular_rate_rad_s: 0.10
+  hold_s: 0.5
+  safety_tilt_rad: 1.0471976
+  safety_angular_rate_rad_s: 10.0
+
+window:
+  length_s: 6.0
+  stride_s: 6.0
+  maximum_start_s: 0.0
+  split_fractions: [0.70, 0.15, 0.15]
+
+command_source:
+  type: "flight_train.commands:VirtualPilotCommandSource"
+  version: "2"
+  seed: 20260806
+  params:
+    throttle:
+      minimum: 0.32
+      maximum: 0.82
+      spool:
+        duration_s: 0.10
+        target_range: [0.48, 0.68]
+      height_controller:
+        observation_source: truth
+        target_m: 0.0
+        initial_throttle_range: [0.48, 0.68]
+        proportional_gain: 0.06
+        integral_gain: 0.03
+        error_limit_m: 5.0
+      slew_rate:
+        rise_per_s: 1.5
+        fall_per_s: 1.0
+    sticks:
+      roll:  {mode: angle, limit_rad: 0.2094395, time_constant_s: 0.18}
+      pitch: {mode: angle, limit_rad: 0.2094395, time_constant_s: 0.18}
+      yaw:   {mode: rate, limit_rad_s: 1.2, time_constant_s: 0.25}
+      target_sampling:
+        distribution: centered
+        center_exponent: 1.5
+        hold_duration_s:
+          range: [0.35, 1.50]
+      reset:
+        filtered_stick: zero
+        initial_target_scale: 1.0
+
+distillation:
+  schema_version: 1
+  control_hz: 500
+  # Preserve the complete 500 Hz causal control stream. Downsampling would
+  # change the actuator-hold contract and confound recurrent capacity with a
+  # slower controller.
+  dataset_stride_steps: 1
+  shard_parameter_groups: 64
+  student_observation:
+    attitude_source: estimator_contract
+    fields:
+      - attitude_q_tilt_estimate
+      - gyro
+      - accelerometer
+      - motor_speed
+      - target_attitude_q_tilt
+      - target_angular_velocity_b
+      - collective_command
+      - previous_actuator_command
+    explicitly_forbidden:
+      - physical_parameter_labels
+      - lqi_gain
+      - truth_servo_angle
+      - truth_angular_acceleration
+      - truth_force_or_moment
+  training:
+    hidden_size: 192
+    recurrent_layers: 2
+    head_sizes: [192, 96]
+    dropout: 0.10
+    batch_size: 64
+    epochs: 80
+    learning_rate: 0.0003
+    command_delta_loss_weight: 0.20
+    hidden_probe_ridge: 0.001
