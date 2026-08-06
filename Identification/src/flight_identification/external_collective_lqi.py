@@ -74,9 +74,8 @@ def synthesize_external_gain(
     materialized = load_and_materialize(
         simulator_config, 1, torch.device("cpu"), torch.float64
     )
-    trim_command = (
-        LocalPlantModel(materialized.parameters).hover_trim().command[0]
-    )
+    trim = LocalPlantModel(materialized.parameters).hover_trim()
+    trim_command = trim.command[0]
     effectiveness, command_slopes, tau = _nominal_actuator_model(
         simulator_config
     )
@@ -106,6 +105,7 @@ def synthesize_external_gain(
         "gain_4_dropped": gain_4_dropped,
         "trim_upper_pwm": float(trim_command[0].item()),
         "trim_lower_pwm": float(trim_command[1].item()),
+        "trim_motor_speed_rad_s": trim.motor_speed[0].detach().numpy().copy(),
         "pole_radius_5": float(np.max(np.abs(np.linalg.eigvals(a - b @ gain_5)))),
         "pole_radius_4": float(
             np.max(np.abs(np.linalg.eigvals(a - b_ls @ gain_4)))

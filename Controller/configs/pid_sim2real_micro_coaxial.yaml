@@ -1,0 +1,21 @@
+type: pid
+params:
+  collective_mode: hover
+  pid:
+    altitude:
+      kp: 4.0
+      ki: 0.8
+      kd: 3.2
+      integral_limit: 2.0
+      minimum_thrust_fraction: 0.20
+      maximum_thrust_fraction: 0.96
+    attitude:
+      roll_pitch_natural_frequency_rad_s: 10.0
+      yaw_rate_bandwidth_rad_s: 8.0
+      damping_ratio: 0.90
+      integral_fraction: [0.15, 0.15, 0.08]
+      integral_limit: [0.40, 0.40, 0.80]
+      maximum_moment_n_m: [0.14, 0.14, 0.08]
+  allocation:
+    input_weights: [1.5, 1.5, 1.0, 1.0, 1.0]
+    damping: 1.0e-5

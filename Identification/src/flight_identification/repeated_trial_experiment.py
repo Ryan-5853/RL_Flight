@@ -398,6 +398,19 @@ def generate_repeated_trial_dataset(
         "initial_state_sampling_design": config.initial_state.sampling_design,
         "controller_semantics": {
             "gain_source": "fixed_nominal_for_all_identification_trials",
+            "collective_mode": str(
+                controller_config.get("params", {}).get(
+                    "collective_mode", "hover"
+                )
+            ),
+            "upper_motor_external": (
+                str(
+                    controller_config.get("params", {}).get(
+                        "collective_mode"
+                    )
+                )
+                == "external_upper"
+            ),
             "roll_pitch_target_rad": [0.0, 0.0],
             "yaw_target": "angular_rate_zero",
             "yaw_angle_feedback": False,

@@ -41,6 +41,12 @@ flight-identification-lqi-gru-train = "flight_identification.lqi_gru_distillatio
 flight-identification-lqi-gru-eval = "flight_identification.lqi_gru_distillation:eval_main"
 flight-identification-lqi-gru-closed-loop = "flight_identification.lqi_gru_closed_loop:main"
 flight-identification-lqi-gru-dagger = "flight_identification.lqi_gru_dagger:main"
+flight-identification-lqi-gru-arch-compare = "flight_identification.lqi_gru_arch_compare:main"
+flight-identification-lqi-gru-hard-dagger = "flight_identification.lqi_gru_hard_dagger:main"
+flight-identification-lqi-gru-safety-screen = "flight_identification.lqi_gru_safety_screen:main"
+flight-identification-lqi-gru-rescue-dagger = "flight_identification.lqi_gru_rescue_dagger:main"
+flight-identification-lqi-gru-verify = "flight_identification.lqi_gru_verification:main"
+flight-identification-lqi-gru-mechanism-round = "flight_identification.lqi_gru_mechanism_round:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

@@ -628,6 +628,53 @@ class RepeatedTrialIdentifierTests(unittest.TestCase):
         self.assertTrue((result.thrust_to_weight_scale > 0).all())
         self.assertTrue(result.synthesis_valid.all())
 
+    def test_external_upper_composite_model_has_four_control_inputs(self) -> None:
+        from flight_identification.control_evaluation import _nominal_actuator_model
+        from flight_identification.sim2real_composite_evaluation import (
+            _composite_actual_radius,
+        )
+
+        experiment = load_experiment_config(SIM2REAL_CONFIG)
+        nominal_effectiveness, command_slopes, nominal_tau = _nominal_actuator_model(
+            experiment.simulator_config
+        )
+        mode_transform = servo_mode_transform(
+            nominal_effectiveness, command_slopes[2:]
+        )
+        coefficients = np.zeros((3, 3, 3))
+        a5, b5 = composite_discrete_model(
+            nominal_effectiveness[:, :2],
+            command_slopes[:2],
+            nominal_tau[:2],
+            coefficients,
+            mode_transform,
+            command_slopes[2:],
+        )
+        a4, b4 = composite_discrete_model(
+            nominal_effectiveness[:, :2],
+            command_slopes[:2],
+            nominal_tau[:2],
+            coefficients,
+            mode_transform,
+            command_slopes[2:],
+            upper_external=True,
+        )
+        self.assertEqual(tuple(b5.shape), (19, 5))
+        self.assertEqual(tuple(b4.shape), (19, 4))
+        np.testing.assert_allclose(b4, b5[:, 1:])
+        gain = np.zeros((4, 19))
+        radius = _composite_actual_radius(
+            np.eye(13) * 0.5,
+            np.zeros((13, 5)),
+            gain,
+            mode_transform,
+            command_slopes[2:],
+            (0.015, 0.04, 0.08),
+            1.0 / 500.0,
+            upper_external=True,
+        )
+        self.assertTrue(np.isfinite(radius))
+
 
 if __name__ == "__main__":
     unittest.main()

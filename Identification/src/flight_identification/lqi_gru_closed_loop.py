@@ -47,6 +47,48 @@ def _summary(value: torch.Tensor) -> dict[str, float]:
     }
 
 
+def _perturbed_yaw_free_attitude(
+    attitude_q_wb: torch.Tensor,
+    noise_deg: float,
+    bias_deg: float,
+    latency_steps: int,
+    buffer: list[torch.Tensor] | None,
+    episode_bias: torch.Tensor,
+) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    """Add roll/pitch estimation noise, per-episode bias, and latency."""
+
+    w, x, y, z = attitude_q_wb.unbind(dim=1)
+    roll = torch.atan2(
+        2.0 * (w * x + y * z), 1.0 - 2.0 * (x.square() + y.square())
+    )
+    pitch = torch.asin((2.0 * (w * y - z * x)).clamp(-1.0, 1.0))
+    if noise_deg > 0.0:
+        noise = torch.randn_like(roll[:, None].expand(-1, 2)) * torch.deg2rad(
+            torch.tensor(noise_deg, device=roll.device)
+        )
+    else:
+        noise = torch.zeros_like(roll[:, None].expand(-1, 2))
+    roll = roll + episode_bias[:, 0] + noise[:, 0]
+    pitch = pitch + episode_bias[:, 1] + noise[:, 1]
+    half_roll = 0.5 * roll
+    half_pitch = 0.5 * pitch
+    estimate = torch.stack(
+        (
+            torch.cos(half_roll) * torch.cos(half_pitch),
+            torch.sin(half_roll) * torch.cos(half_pitch),
+            torch.cos(half_roll) * torch.sin(half_pitch),
+            -torch.sin(half_roll) * torch.sin(half_pitch),
+        ),
+        dim=1,
+    )
+    if buffer is None:
+        buffer = []
+    buffer.append(estimate)
+    if latency_steps > 0:
+        estimate = buffer[max(0, len(buffer) - 1 - latency_steps)]
+    return estimate, buffer
+
+
 @torch.no_grad()
 def _simulate(
     mode: str,
@@ -60,6 +102,10 @@ def _simulate(
     checkpoint_path: Path,
     device: torch.device,
     pilot_height_mode: str,
+    attitude_noise_deg: float = 0.0,
+    attitude_bias_deg: float = 0.0,
+    attitude_latency_steps: int = 0,
+    report_segments_s: Sequence[float] = (),
 ) -> Mapping[str, torch.Tensor]:
     from flight_controller import (
         ControllerContext,
@@ -153,6 +199,10 @@ def _simulate(
         pilot.generator.manual_seed(seed + 1)
         active = torch.ones(batch_size, device=device, dtype=torch.bool)
         pilot.reset(active)
+        episode_bias = torch.randn(
+            batch_size, 2, device=device, dtype=dtype
+        ) * torch.deg2rad(torch.tensor(attitude_bias_deg, device=device, dtype=dtype))
+        attitude_buffer: list[torch.Tensor] | None = None
 
         student = checkpoint = mean = std = None
         student_observation_indices = None
@@ -200,7 +250,23 @@ def _simulate(
         student_state = StudentStepState()
 
         steps = round(duration_s * config.control_hz)
+        segment_boundaries = sorted(report_segments_s)
+        segment_count = len(segment_boundaries)
+        segment_attitude = torch.zeros(
+            segment_count, batch_size, device=device, dtype=dtype
+        )
+        segment_rate = torch.zeros_like(segment_attitude)
+        segment_movement = torch.zeros_like(segment_attitude)
+        segment_survival = torch.zeros(
+            segment_count, batch_size, device=device, dtype=torch.int64
+        )
+        segment_count_steps = torch.zeros_like(segment_attitude)
         survival_steps = torch.zeros(batch_size, device=device, dtype=torch.int64)
+        capture_steps = {
+            min(round(boundary * config.control_hz), steps) - 1
+            for boundary in segment_boundaries
+        }
+        hidden_norm_snapshots: list[float | None] = []
         attitude_squared = torch.zeros(batch_size, device=device, dtype=dtype)
         rate_squared = torch.zeros_like(attitude_squared)
         saturation_steps = torch.zeros_like(attitude_squared)
@@ -208,7 +274,7 @@ def _simulate(
         last_applied = previous_command.clone()
         accumulated_steps = torch.zeros_like(attitude_squared)
 
-        for _ in range(steps):
+        for step in range(steps):
             truth = environment.observe("truth").values
             sensors = environment.observe("sensor").values
             if pilot_height_mode == "training_truth":
@@ -225,7 +291,14 @@ def _simulate(
                 )
             pilot.step(pilot_height, active)
             snapshot = pilot.snapshot()
-            attitude_estimate = _yaw_free_attitude(truth["attitude_q_wb"])
+            attitude_estimate, attitude_buffer = _perturbed_yaw_free_attitude(
+                truth["attitude_q_wb"],
+                attitude_noise_deg,
+                attitude_bias_deg,
+                attitude_latency_steps,
+                attitude_buffer,
+                episode_bias,
+            )
             target_attitude = _yaw_free_attitude(snapshot.target_attitude_q_wb)
             target_rate = torch.cat(
                 (
@@ -284,6 +357,15 @@ def _simulate(
                     student_state,
                     full_context=mode == "gru",
                 )
+                if step in capture_steps and student_state.hidden is not None:
+                    hidden = student_state.hidden
+                    if isinstance(hidden, (tuple, list)):
+                        hidden = hidden[0]
+                    hidden_norm_snapshots.append(
+                        float(hidden.norm(dim=-1).mean().cpu())
+                    )
+                elif step in capture_steps:
+                    hidden_norm_snapshots.append(None)
                 previous_command = command
 
             attitude_error = quaternion_rotation_error(
@@ -301,6 +383,22 @@ def _simulate(
             saturation_steps += saturated.to(dtype) * active_float
             movement_sum += (command - last_applied).square().mean(1).sqrt() * active_float
             accumulated_steps += active_float
+            if segment_count:
+                segment_index = min(
+                    segment_count - 1,
+                    sum(1 for boundary in segment_boundaries if boundary * config.control_hz <= step),
+                )
+                segment_attitude[segment_index] += (
+                    attitude_error.square().sum(1) * active_float
+                )
+                segment_rate[segment_index] += (
+                    rate_error.square().sum(1) * active_float
+                )
+                segment_movement[segment_index] += (
+                    (command - last_applied).square().mean(1).sqrt() * active_float
+                )
+                segment_survival[segment_index] += active.to(torch.int64)
+                segment_count_steps[segment_index] += active_float
             last_applied = command
             result = environment.advance(command, active)
             next_truth = environment.observe("truth").values
@@ -312,7 +410,7 @@ def _simulate(
             survival_steps += active.to(torch.int64)
 
         denominator = accumulated_steps.clamp_min(1.0)
-        return {
+        result = {
             "group_id": group_ids.repeat_interleave(trials),
             "safe": active.cpu(),
             "survival_fraction": (survival_steps.to(dtype) / steps).cpu(),
@@ -321,6 +419,43 @@ def _simulate(
             "saturation_fraction": (saturation_steps / denominator).cpu(),
             "command_movement_mean": (movement_sum / denominator).cpu(),
         }
+        if report_segments_s:
+            segment_report = []
+            for index, boundary in enumerate(segment_boundaries):
+                denominator_segment = segment_count_steps[index].clamp_min(1)
+                segment_report.append(
+                    {
+                        "boundary_s": boundary,
+                        "attitude_rms_rad": torch.sqrt(
+                            segment_attitude[index] / denominator_segment
+                        ).mean()
+                        .cpu()
+                        .item(),
+                        "rate_rms_rad_s": torch.sqrt(
+                            segment_rate[index] / denominator_segment
+                        )
+                        .mean()
+                        .cpu()
+                        .item(),
+                        "movement_mean": (
+                            segment_movement[index] / denominator_segment
+                        )
+                        .mean()
+                        .cpu()
+                        .item(),
+                        "survival_fraction": float(
+                            (
+                                segment_survival[index].to(dtype)
+                                / denominator_segment
+                            )
+                            .mean()
+                            .cpu()
+                        ),
+                    }
+                )
+            result["segments"] = segment_report
+            result["hidden_norms"] = hidden_norm_snapshots
+        return result
     finally:
         environment.close()
 
@@ -338,6 +473,10 @@ def evaluate_closed_loop(
     pilot_height_mode: str,
     split: str = "test",
     variants: Sequence[str] = ("oracle_lqi", "nominal_lqi", "gru", "gru_reset"),
+    attitude_noise_deg: float = 0.0,
+    attitude_bias_deg: float = 0.0,
+    attitude_latency_steps: int = 0,
+    report_segments_s: Sequence[float] = (),
 ) -> Mapping[str, Any]:
     config = load_experiment_config(config_path)
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
@@ -355,6 +494,8 @@ def evaluate_closed_loop(
         variant_results[mode] = _simulate(
             mode, config, raw, labels, accepted, trials, duration_s, seed,
             checkpoint, device, pilot_height_mode,
+            attitude_noise_deg, attitude_bias_deg, attitude_latency_steps,
+            report_segments_s,
         )
     summaries = {}
     for mode, values in variant_results.items():
@@ -405,8 +546,30 @@ def evaluate_closed_loop(
         "teacher_forcing": False,
         "global_rng_reseeded_per_variant": True,
         "pilot_height_mode": pilot_height_mode,
+        "attitude_perturbation": {
+            "noise_deg": attitude_noise_deg,
+            "bias_deg": attitude_bias_deg,
+            "latency_steps": attitude_latency_steps,
+        },
+        "report_segments_s": list(report_segments_s),
         "exogenous_pilot_schedule_identical": pilot_height_mode == "fixed_target",
         "variants": summaries,
+        "segments": (
+            {
+                mode: variant_results[mode].get("segments")
+                for mode in variant_results
+            }
+            if report_segments_s
+            else None
+        ),
+        "hidden_norms": (
+            {
+                mode: variant_results[mode].get("hidden_norms")
+                for mode in variant_results
+            }
+            if report_segments_s
+            else None
+        ),
         "oracle_safe_paired_subset": paired_subsets,
         "gru_vs_oracle": {
             "safe_fraction_delta": gru["safe_fraction"] - oracle["safe_fraction"],
@@ -445,6 +608,10 @@ def main() -> None:
         nargs="*",
         default=("oracle_lqi", "nominal_lqi", "gru", "gru_reset"),
     )
+    parser.add_argument("--attitude-noise-deg", type=float, default=0.0)
+    parser.add_argument("--attitude-bias-deg", type=float, default=0.0)
+    parser.add_argument("--attitude-latency-steps", type=int, default=0)
+    parser.add_argument("--report-segments-s", type=float, nargs="+", default=())
     args = parser.parse_args()
     report = evaluate_closed_loop(
         Path(args.dataset).resolve(), Path(args.config).resolve(),
@@ -452,6 +619,8 @@ def main() -> None:
         torch.device(args.device), args.maximum_groups, args.trials,
         args.duration_s, args.seed, args.pilot_height_mode, args.split,
         tuple(args.variants),
+        args.attitude_noise_deg, args.attitude_bias_deg,
+        args.attitude_latency_steps, tuple(args.report_segments_s),
     )
     print(json.dumps(report, indent=2, sort_keys=True))
 

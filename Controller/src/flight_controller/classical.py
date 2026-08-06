@@ -10,6 +10,7 @@ from scipy.linalg import expm, solve_discrete_are
 from .allocation import WeightedControlAllocator
 from .base import FlightController
 from .math import lookup, quaternion_rotation_error, tilt_cosine
+from .pilot import VirtualPilotHeightController
 from .plant import LocalPlantModel
 from .types import ControllerContext, ControllerOutput, ControllerReference, ControllerState
 
@@ -53,8 +54,11 @@ class ClassicalControllerBase(FlightController):
         super().__init__(context, config)
         config = self.config
         self.collective_mode = str(config.get("collective_mode", "hover"))
-        if self.collective_mode not in {"hover", "manual"}:
-            raise ValueError("collective_mode must be hover or manual")
+        if self.collective_mode not in {"hover", "manual", "external_upper"}:
+            raise ValueError(
+                "collective_mode must be hover, manual or external_upper"
+            )
+        self.upper_external = self.collective_mode == "external_upper"
         self.plant = LocalPlantModel(context.parameters)
         self.trim = self.plant.hover_trim()
         effectiveness = self.plant.control_effectiveness(self.trim.command)
@@ -83,6 +87,15 @@ class ClassicalControllerBase(FlightController):
         self.maximum_thrust_fraction = _number(
             altitude, "maximum_thrust_fraction", 0.96
         )
+        if self.upper_external:
+            virtual_pilot = _node(config, "virtual_pilot")
+            self.pilot = VirtualPilotHeightController(
+                virtual_pilot,
+                context.batch_size,
+                context.device,
+                context.dtype,
+                context.control_dt,
+            )
         inertia = context.parameters["body.inertia_diagonal_b"]
         rp_frequency = _number(attitude, "roll_pitch_natural_frequency_rad_s", 6.0)
         yaw_frequency = _number(attitude, "yaw_rate_bandwidth_rad_s", 5.0)
@@ -125,6 +138,8 @@ class ClassicalControllerBase(FlightController):
             context.batch_size, 3, device=context.device, dtype=context.dtype
         )
         self.last_command = self.trim.command.clone()
+        if self.upper_external:
+            self.last_command[:, 0] = self.pilot.upper_throttle[:, 0]
         self._lqr_gain: torch.Tensor | None = None
         self._lqr_integral_enabled = False
         self._lqr_state_size = 10
@@ -138,9 +153,17 @@ class ClassicalControllerBase(FlightController):
         mask = self._active_mask(reset_mask)
         self.height_integral.masked_fill_(mask, 0.0)
         self.attitude_integral.masked_fill_(mask[:, None], 0.0)
+        if self.upper_external:
+            self.pilot.reset(mask)
         self.last_command.copy_(
             torch.where(mask[:, None], self.trim.command, self.last_command)
         )
+        if self.upper_external:
+            self.last_command[:, 0] = torch.where(
+                mask,
+                self.pilot.upper_throttle[:, 0],
+                self.last_command[:, 0],
+            )
 
     def describe(self) -> dict[str, Any]:
         result = super().describe()
@@ -151,6 +174,8 @@ class ClassicalControllerBase(FlightController):
                 "trim_motor_speed_rad_s": self.trim.motor_speed[0].detach().cpu().tolist(),
             }
         )
+        if self.upper_external:
+            result["upper_motor_external"] = True
         if self._lqr_poles.size:
             result["lqr_closed_loop_pole_radius"] = float(
                 np.max(np.abs(self._lqr_poles))
@@ -161,15 +186,16 @@ class ClassicalControllerBase(FlightController):
         """Install one shared gain or one gain per parallel vehicle."""
         if self._lqr_gain is None:
             raise RuntimeError("LQR gain scheduling requires an LQR controller")
-        expected_shared = (5, self._lqr_state_size)
+        input_count = 4 if self.upper_external else 5
+        expected_shared = (input_count, self._lqr_state_size)
         expected_batched = (
             self.context.batch_size,
-            5,
+            input_count,
             self._lqr_state_size,
         )
         if tuple(gain.shape) not in {expected_shared, expected_batched}:
             raise ValueError(
-                "LQR gain must have shape (5, 10) or "
+                f"LQR gain must have shape ({input_count}, {self._lqr_state_size}) or "
                 f"{expected_batched}, received {tuple(gain.shape)}"
             )
         scheduled = gain.to(device=self.context.device, dtype=self.context.dtype)
@@ -183,6 +209,8 @@ class ClassicalControllerBase(FlightController):
         reference: ControllerReference,
         active: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.collective_mode == "external_upper":
+            return self._virtual_pilot_equilibrium(state, reference, active)
         if self.collective_mode == "manual":
             desired_thrust = self.plant.thrust_from_upper_pwm(
                 reference.collective_command[:, 0].clamp(0.0, 1.0)
@@ -231,6 +259,40 @@ class ClassicalControllerBase(FlightController):
                     device=self.context.device,
                     dtype=self.context.dtype,
                 ),
+            ),
+            dim=1,
+        )
+        return desired_thrust, target_speed, base
+
+    def _virtual_pilot_equilibrium(
+        self,
+        state: ControllerState,
+        reference: ControllerReference,
+        active: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Virtual pilot owns the upper rotor; the LQR owns the other four.
+
+        Height truth is used only by the pilot; the LQR state never receives
+        altitude.
+        """
+        height = -state.position_n[:, 2]
+        vertical_speed = -state.velocity_n[:, 2]
+        upper_pwm = self.pilot.step(height, vertical_speed, active)
+        upper_pwm_1d = upper_pwm.squeeze(-1)
+        desired_thrust = self.plant.thrust_from_upper_pwm(upper_pwm_1d)
+        upper_target_speed = lookup(
+            upper_pwm_1d,
+            self.context.parameters["motors.pwm_to_rpm_table"][:, 0],
+        )[:, None]
+        # The pilot throttle is the coaxial collective: the lower rotor base
+        # follows the upper so the whole T/W envelope can hover, and the LQR
+        # trims the lower differential plus the three servos.
+        target_speed = torch.cat((upper_target_speed, upper_target_speed), dim=1)
+        base = torch.cat(
+            (
+                upper_pwm,
+                upper_pwm,
+                torch.zeros_like(upper_pwm).expand(-1, 3),
             ),
             dim=1,
         )
@@ -339,13 +401,24 @@ class ClassicalControllerBase(FlightController):
             delta = -torch.bmm(
                 self._lqr_gain, lqr_state.unsqueeze(-1)
             ).squeeze(-1)
-        lower = delta.new_tensor([0.0, 0.0, -1.0, -1.0, -1.0])
-        upper = delta.new_tensor([1.0, 1.0, 1.0, 1.0, 1.0])
-        unconstrained_command = base + delta
-        command = unconstrained_command.clamp(lower, upper)
-        saturated = (
-            (unconstrained_command < lower) | (unconstrained_command > upper)
-        ).any(dim=1)
+        if self.upper_external:
+            lower = delta.new_tensor([0.0, -1.0, -1.0, -1.0])
+            upper = delta.new_tensor([1.0, 1.0, 1.0, 1.0])
+            unconstrained = base[:, 1:] + delta
+            constrained = unconstrained.clamp(lower, upper)
+            command = torch.cat((base[:, :1], constrained), dim=1)
+            saturated = (
+                (unconstrained < lower) | (unconstrained > upper)
+            ).any(dim=1)
+        else:
+            lower = delta.new_tensor([0.0, 0.0, -1.0, -1.0, -1.0])
+            upper = delta.new_tensor([1.0, 1.0, 1.0, 1.0, 1.0])
+            unconstrained_command = base + delta
+            command = unconstrained_command.clamp(lower, upper)
+            saturated = (
+                (unconstrained_command < lower)
+                | (unconstrained_command > upper)
+            ).any(dim=1)
         if self._lqr_integral_enabled:
             if previous_integral is None:
                 raise RuntimeError("LQI integral snapshot is unavailable")
@@ -409,7 +482,8 @@ class ClassicalControllerBase(FlightController):
                 torch.zeros(3, dtype=torch.float64, device=self.context.device),
             )
         )
-        u0 = trim.command[0]
+        input_count = 4 if self.upper_external else 5
+        u0 = trim.command[0][1:] if self.upper_external else trim.command[0]
 
         def continuous(x: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
             rates = x[2:5]
@@ -419,11 +493,24 @@ class ClassicalControllerBase(FlightController):
                 motor_speed[None], servo_angle[None]
             )[0, 1:]
             angular_acceleration = moment / inertia
-            motor_target = lookup(u[:2][None], p["motors.pwm_to_rpm_table"])[0]
+            if self.upper_external:
+                motor_target = lookup(
+                    torch.cat((trim.command[0, :1], u[:1]))[None],
+                    p["motors.pwm_to_rpm_table"],
+                )[0]
+                servo_target = lookup(
+                    u[1:][None], p["servos.pwm_angle_table"]
+                )[0]
+            else:
+                motor_target = lookup(
+                    u[:2][None], p["motors.pwm_to_rpm_table"]
+                )[0]
+                servo_target = lookup(
+                    u[2:][None], p["servos.pwm_angle_table"]
+                )[0]
             motor_dot = (
                 motor_target - motor_speed
             ) / p["motors.time_constant"][0]
-            servo_target = lookup(u[2:][None], p["servos.pwm_angle_table"])[0]
             servo_dot = (servo_target - servo_angle) / p["servos.tau"][0]
             return torch.cat((rates[:2], angular_acceleration, motor_dot, servo_dot))
 
@@ -456,7 +543,9 @@ class ClassicalControllerBase(FlightController):
                     [integral_output, np.zeros((3, 3), dtype=np.float64)],
                 ]
             )
-            b = np.vstack((b, np.zeros((3, 5), dtype=np.float64)))
+            b = np.vstack(
+                (b, np.zeros((3, input_count), dtype=np.float64))
+            )
             self._lqr_integral_enabled = True
             self._lqr_state_size = 13
         else:
@@ -464,7 +553,12 @@ class ClassicalControllerBase(FlightController):
         augmented = np.block(
             [
                 [a, b],
-                [np.zeros((5, a.shape[0] + 5), dtype=np.float64)],
+                [
+                    np.zeros(
+                        (input_count, a.shape[0] + input_count),
+                        dtype=np.float64,
+                    )
+                ],
             ]
         )
         discrete = expm(augmented * self.context.control_dt)
@@ -492,8 +586,13 @@ class ClassicalControllerBase(FlightController):
         )
         if self._lqr_integral_enabled:
             state_scales = np.concatenate((state_scales, integral_scales))
+        default_input_scales = (
+            (0.18, 0.45, 0.45, 0.45)
+            if self.upper_external
+            else (0.18, 0.18, 0.45, 0.45, 0.45)
+        )
         input_scales = np.asarray(
-            _vector(config, "input_scales", (0.18, 0.18, 0.45, 0.45, 0.45)),
+            _vector(config, "input_scales", default_input_scales),
             dtype=np.float64,
         )
         q = np.diag(1.0 / state_scales**2)

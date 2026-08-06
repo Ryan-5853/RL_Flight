@@ -86,6 +86,75 @@ def _predict_composite(
     )
 
 
+def _apply_secondary_prediction(
+    prediction: torch.Tensor,
+    checkpoint: Mapping[str, Any],
+    dataset: Path,
+    count: int,
+    split_group_id: torch.Tensor,
+    secondary_path: str,
+    axes_csv: str,
+    device: torch.device,
+    batch_size: int,
+    trial_count: int,
+    used_axes: set[str],
+) -> tuple[set[str], str]:
+    path = Path(secondary_path).expanduser().resolve()
+    secondary = torch.load(path, map_location="cpu", weights_only=False)
+    if secondary.get("artifact_type") != "sim2real_composite_servo_identifier":
+        raise ValueError("secondary checkpoint must be a composite identifier")
+    for name in (
+        "label_names",
+        "adaptive_mode_indices",
+        "basis_time_constants_s",
+        "response_snapshot_times_s",
+    ):
+        if tuple(secondary[name]) != tuple(checkpoint[name]):
+            raise ValueError(f"secondary checkpoint differs in {name}")
+    secondary_split = load_repeated_split(
+        dataset, "test", int(secondary["downsample"])
+    )
+    _retain_converged_trials(secondary_split)
+    secondary_original_count = len(secondary_split["features"])
+    for name, value in tuple(secondary_split.items()):
+        if (
+            isinstance(value, torch.Tensor)
+            and value.ndim
+            and len(value) == secondary_original_count
+        ):
+            secondary_split[name] = value[:count]
+    if not torch.equal(split_group_id, secondary_split["group_id"]):
+        raise ValueError("secondary checkpoint group ordering differs")
+    axes = tuple(
+        value.strip()
+        for value in axes_csv.split(",")
+        if value.strip()
+    )
+    if not axes or any(value not in {"roll", "pitch", "yaw"} for value in axes):
+        raise ValueError("secondary-output-axes must select roll, pitch, or yaw")
+    overlap = used_axes & set(axes)
+    if overlap:
+        raise ValueError(f"secondary output axes overlap: {sorted(overlap)}")
+    secondary_prediction = _predict_composite(
+        secondary,
+        secondary_split,
+        device,
+        trial_count,
+        batch_size,
+    )
+    secondary_prediction = torch.maximum(
+        torch.minimum(secondary_prediction, secondary["label_max"]),
+        secondary["label_min"],
+    )
+    selected_columns = [
+        index
+        for index, name in enumerate(checkpoint["label_names"])
+        if any(f".{axis}." in name for axis in axes)
+    ]
+    prediction[:, selected_columns] = secondary_prediction[:, selected_columns]
+    return used_axes | set(axes), str(path)
+
+
 def _response_nrmse(predicted: torch.Tensor, target: torch.Tensor) -> float:
     return float(
         (predicted - target).square().mean().sqrt()
@@ -179,18 +248,23 @@ def _composite_actual_radius(
     servo_slopes: np.ndarray,
     basis_tau: Sequence[float],
     dt: float,
+    upper_external: bool = False,
 ) -> float:
     latent_count = 3 * len(basis_tau)
+    input_count = 4 if upper_external else 5
     combined_a = np.zeros((13 + latent_count, 13 + latent_count), dtype=np.float64)
-    combined_b = np.zeros((13 + latent_count, 5), dtype=np.float64)
+    combined_b = np.zeros((13 + latent_count, input_count), dtype=np.float64)
     combined_a[:13, :13] = physical_a
-    combined_b[:13] = physical_b
+    combined_b[:13] = physical_b[:, 1:] if upper_external else physical_b
     servo_input = mode_transform @ np.diag(servo_slopes)
     for basis_index, tau in enumerate(basis_tau):
         start = 13 + 3 * basis_index
         decay = np.exp(-dt / tau)
         combined_a[start : start + 3, start : start + 3] = np.eye(3) * decay
-        combined_b[start : start + 3, 2:] = (1.0 - decay) * servo_input
+        servo_start = 1 if upper_external else 2
+        combined_b[start : start + 3, servo_start:] = (
+            (1.0 - decay) * servo_input
+        )
     selection = np.zeros((19, 13 + latent_count), dtype=np.float64)
     selection[:7, :7] = np.eye(7)
     selection[7:16, 13:] = np.eye(latent_count)
@@ -445,6 +519,10 @@ def evaluate(args: argparse.Namespace) -> Mapping[str, Any]:
         raise ValueError("expected a sim2real composite servo checkpoint")
     dataset = Path(args.dataset).expanduser().resolve()
     experiment = load_experiment_config(args.experiment_config)
+    from flight_controller import load_controller_config
+
+    lqr_config = load_controller_config(experiment.controller_config)["params"]["lqr"]
+    upper_external = len(lqr_config["input_scales"]) == 4
     split = load_repeated_split(dataset, "test", int(checkpoint["downsample"]))
     _retain_converged_trials(split)
     count = min(args.maximum_parameter_groups, len(split["features"]))
@@ -465,60 +543,58 @@ def evaluate(args: argparse.Namespace) -> Mapping[str, Any]:
     )
     secondary_checkpoint_path = None
     secondary_output_axes: tuple[str, ...] = ()
+    secondary_checkpoints: list[dict[str, Any]] = []
+    used_axes: set[str] = set()
+    device = torch.device(args.device)
     if args.secondary_checkpoint:
-        secondary_checkpoint_path = Path(args.secondary_checkpoint).expanduser().resolve()
-        secondary = torch.load(
-            secondary_checkpoint_path, map_location="cpu", weights_only=False
-        )
-        if secondary.get("artifact_type") != "sim2real_composite_servo_identifier":
-            raise ValueError("secondary checkpoint must be a composite identifier")
-        for name in (
-            "label_names",
-            "adaptive_mode_indices",
-            "basis_time_constants_s",
-            "response_snapshot_times_s",
-        ):
-            if tuple(secondary[name]) != tuple(checkpoint[name]):
-                raise ValueError(f"secondary checkpoint differs in {name}")
-        secondary_split = load_repeated_split(
-            dataset, "test", int(secondary["downsample"])
-        )
-        _retain_converged_trials(secondary_split)
-        secondary_original_count = len(secondary_split["features"])
-        for name, value in tuple(secondary_split.items()):
-            if (
-                isinstance(value, torch.Tensor)
-                and value.ndim
-                and len(value) == secondary_original_count
-            ):
-                secondary_split[name] = value[:count]
-        if not torch.equal(split["group_id"], secondary_split["group_id"]):
-            raise ValueError("primary and secondary checkpoint group ordering differs")
-        secondary_prediction = _predict_composite(
-            secondary,
-            secondary_split,
-            torch.device(args.device),
-            args.trial_count,
+        used_axes, secondary_checkpoint_path = _apply_secondary_prediction(
+            prediction,
+            checkpoint,
+            dataset,
+            count,
+            split["group_id"],
+            args.secondary_checkpoint,
+            args.secondary_output_axes,
+            device,
             args.batch_size,
-        )
-        secondary_prediction = torch.maximum(
-            torch.minimum(secondary_prediction, secondary["label_max"]),
-            secondary["label_min"],
+            args.trial_count,
+            used_axes,
         )
         secondary_output_axes = tuple(
-            value.strip() for value in args.secondary_output_axes.split(",") if value.strip()
+            value.strip()
+            for value in args.secondary_output_axes.split(",")
+            if value.strip()
         )
-        if not secondary_output_axes or any(
-            value not in {"roll", "pitch", "yaw"}
-            for value in secondary_output_axes
-        ):
-            raise ValueError("secondary-output-axes must select roll, pitch, or yaw")
-        selected_columns = [
-            index
-            for index, name in enumerate(checkpoint["label_names"])
-            if any(f".{axis}." in name for axis in secondary_output_axes)
-        ]
-        prediction[:, selected_columns] = secondary_prediction[:, selected_columns]
+        secondary_checkpoints.append(
+            {
+                "checkpoint": secondary_checkpoint_path,
+                "output_axes": list(secondary_output_axes),
+            }
+        )
+    if args.secondary_checkpoint_2:
+        _, secondary_checkpoint_2 = _apply_secondary_prediction(
+            prediction,
+            checkpoint,
+            dataset,
+            count,
+            split["group_id"],
+            args.secondary_checkpoint_2,
+            args.secondary_output_axes_2,
+            device,
+            args.batch_size,
+            args.trial_count,
+            used_axes,
+        )
+        secondary_checkpoints.append(
+            {
+                "checkpoint": secondary_checkpoint_2,
+                "output_axes": [
+                    value.strip()
+                    for value in args.secondary_output_axes_2.split(",")
+                    if value.strip()
+                ],
+            }
+        )
     basis_tau = tuple(float(value) for value in checkpoint["basis_time_constants_s"])
     mode_indices = tuple(int(value) for value in checkpoint["adaptive_mode_indices"])
     mode_transform = checkpoint["mode_transform"].numpy()
@@ -579,50 +655,58 @@ def evaluate(args: argparse.Namespace) -> Mapping[str, Any]:
     for name, value in tuple(raw_split.items()):
         if isinstance(value, torch.Tensor) and value.ndim and len(value) == raw_count:
             raw_split[name] = value[:count]
-    legacy_scheduler = RepeatedTrialLQRScheduler(
-        args.legacy_checkpoint,
-        experiment.simulator_config,
-        experiment.controller_config,
-        args.device,
-    )
-    legacy_raw_steps = (
-        legacy_scheduler.history_steps * legacy_scheduler.downsample
-    )
-    if raw_split["features"].shape[2] < legacy_raw_steps:
-        raise ValueError(
-            "evaluation histories are shorter than the legacy checkpoint contract"
+    legacy_scheduler = None
+    legacy_raw_steps = 0
+    legacy_synthesis = None
+    legacy_targets = None
+    legacy_response = None
+    legacy_coefficients = None
+    if not upper_external:
+        if not args.legacy_checkpoint:
+            raise ValueError(
+                "--legacy-checkpoint is required for the five-output contract"
+            )
+        legacy_scheduler = RepeatedTrialLQRScheduler(
+            args.legacy_checkpoint,
+            experiment.simulator_config,
+            experiment.controller_config,
+            args.device,
         )
-    legacy_synthesis = legacy_scheduler.synthesize(
-        raw_split["features"][:, :, :legacy_raw_steps],
-        raw_split["valid_mask"][:, :, :legacy_raw_steps],
-        _fixed_trial_mask(raw_split["trial_mask"], args.trial_count),
-    )
-    from simenv.config import load_and_materialize
-    from .experiment import _sim2real_lqr_targets
+        legacy_raw_steps = (
+            legacy_scheduler.history_steps * legacy_scheduler.downsample
+        )
+        if raw_split["features"].shape[2] < legacy_raw_steps:
+            raise ValueError(
+                "evaluation histories are shorter than the legacy checkpoint contract"
+            )
+        legacy_synthesis = legacy_scheduler.synthesize(
+            raw_split["features"][:, :, :legacy_raw_steps],
+            raw_split["valid_mask"][:, :, :legacy_raw_steps],
+            _fixed_trial_mask(raw_split["trial_mask"], args.trial_count),
+        )
+        from simenv.config import load_and_materialize
+        from .experiment import _sim2real_lqr_targets
 
-    nominal_materialized = load_and_materialize(
-        experiment.simulator_config, 1, torch.device("cpu"), torch.float64
-    )
-    nominal_target = _sim2real_lqr_targets(nominal_materialized.parameters)
-    legacy_targets = _legacy_predicted_targets(
-        legacy_scheduler,
-        legacy_synthesis,
-        nominal_target,
-        tuple(split["target_names"]),
-    )
-    legacy_response = true_servo_mode_step_response(
-        legacy_targets, mode_transform, servo_slopes
-    )[..., list(mode_indices)]
-    legacy_coefficients = fit_composite_coefficients(
-        legacy_targets, mode_transform, servo_slopes, basis_tau
-    ).numpy()
+        nominal_materialized = load_and_materialize(
+            experiment.simulator_config, 1, torch.device("cpu"), torch.float64
+        )
+        nominal_target = _sim2real_lqr_targets(nominal_materialized.parameters)
+        legacy_targets = _legacy_predicted_targets(
+            legacy_scheduler,
+            legacy_synthesis,
+            nominal_target,
+            tuple(split["target_names"]),
+        )
+        legacy_response = true_servo_mode_step_response(
+            legacy_targets, mode_transform, servo_slopes
+        )[..., list(mode_indices)]
+        legacy_coefficients = fit_composite_coefficients(
+            legacy_targets, mode_transform, servo_slopes, basis_tau
+        ).numpy()
 
     nominal_effectiveness, command_slopes, nominal_tau = _nominal_actuator_model(
         experiment.simulator_config
     )
-    from flight_controller import load_controller_config
-
-    lqr_config = load_controller_config(experiment.controller_config)["params"]["lqr"]
     q_composite, r_composite = composite_lqr_weights(
         np.asarray(lqr_config["state_scales"], dtype=np.float64),
         np.asarray(lqr_config["integral_state_scales"], dtype=np.float64),
@@ -635,9 +719,12 @@ def evaluate(args: argparse.Namespace) -> Mapping[str, Any]:
             nominal_coefficients, (count, *nominal_coefficients.shape)
         ),
         "composite_predicted": predicted_full,
-        "composite_legacy_physical_model": legacy_coefficients,
         "composite_oracle_all_modes": true_coefficients,
     }
+    if not upper_external:
+        coefficient_variants["composite_legacy_physical_model"] = (
+            legacy_coefficients
+        )
     if set(mode_indices) != {0, 1, 2}:
         coefficient_variants["composite_oracle_selected_modes"] = oracle_selected
     composite_gains = {name: [] for name in coefficient_variants}
@@ -651,6 +738,7 @@ def evaluate(args: argparse.Namespace) -> Mapping[str, Any]:
                 mode_transform,
                 servo_slopes,
                 basis_tau,
+                upper_external=upper_external,
             )
             composite_gains[name].append(_lqr_gain(a, b, q_composite, r_composite))
         composite_gains[name] = np.stack(composite_gains[name])
@@ -677,35 +765,58 @@ def evaluate(args: argparse.Namespace) -> Mapping[str, Any]:
         )
 
     q_original, r_original = _lqr_weights(experiment.controller_config)
-    original_nominal_gain = legacy_synthesis.nominal_gain.numpy()
     original_oracle_gains = []
     true_models = []
     oracle_servo_tau = []
     for target in split["targets"].numpy():
         a, b, tau = _model_from_target(target, command_slopes[2:])
         true_models.append((a, b))
-        original_oracle_gains.append(_lqr_gain(a, b, q_original, r_original))
-        oracle_servo_tau.append(tau[2:])
-    original_oracle_gains = np.stack(original_oracle_gains)
-    oracle_servo_tau = np.stack(oracle_servo_tau)
+        if not upper_external:
+            original_oracle_gains.append(
+                _lqr_gain(a, b, q_original, r_original)
+            )
+            oracle_servo_tau.append(tau[2:])
+    if not upper_external:
+        original_nominal_gain = legacy_synthesis.nominal_gain.numpy()
+        original_oracle_gains = np.stack(original_oracle_gains)
+        oracle_servo_tau = np.stack(oracle_servo_tau)
+    else:
+        original_nominal_gain = None
+        original_oracle_gains = np.zeros((0, 13, 5))
+        oracle_servo_tau = np.zeros((0, 3))
 
     local_radius = {
-        "original_nominal": [],
-        "legacy_predicted": [],
-        "original_oracle": [],
         **{name: [] for name in composite_gains},
+        **(
+            {}
+            if upper_external
+            else {
+                "original_nominal": [],
+                "legacy_predicted": [],
+                "original_oracle": [],
+            }
+        ),
     }
     initial_covariance = np.linalg.inv(q_original)
     for index, (physical_a, physical_b) in enumerate(true_models):
-        for name, gain in (
-            ("original_nominal", original_nominal_gain),
-            ("legacy_predicted", legacy_synthesis.predicted_gain.numpy()[index]),
-            ("original_oracle", original_oracle_gains[index]),
-        ):
-            radius, _ = _closed_loop_result(
-                physical_a, physical_b, gain, q_original, r_original, initial_covariance
-            )
-            local_radius[name].append(radius)
+        if not upper_external:
+            for name, gain in (
+                ("original_nominal", original_nominal_gain),
+                (
+                    "legacy_predicted",
+                    legacy_synthesis.predicted_gain.numpy()[index],
+                ),
+                ("original_oracle", original_oracle_gains[index]),
+            ):
+                radius, _ = _closed_loop_result(
+                    physical_a,
+                    physical_b,
+                    gain,
+                    q_original,
+                    r_original,
+                    initial_covariance,
+                )
+                local_radius[name].append(radius)
         for name, gains in composite_gains.items():
             local_radius[name].append(
                 _composite_actual_radius(
@@ -716,6 +827,7 @@ def evaluate(args: argparse.Namespace) -> Mapping[str, Any]:
                     servo_slopes,
                     basis_tau,
                     1.0 / experiment.control_hz,
+                    upper_external,
                 )
             )
 
@@ -730,38 +842,50 @@ def evaluate(args: argparse.Namespace) -> Mapping[str, Any]:
         torch.float32,
     )
     evaluation_count = len(physical)
-    results = {
-        "original_nominal": _simulate_gain(
-            experiment,
-            physical,
-            attitude,
-            angular_velocity,
-            np.repeat(original_nominal_gain[None], evaluation_count, axis=0),
-            np.repeat(nominal_tau[None, 2:], evaluation_count, axis=0),
-            np.ones(evaluation_count, dtype=np.bool_),
-            args.duration_s,
-        ),
-        "legacy_predicted": _simulate_gain(
-            experiment,
-            physical,
-            attitude,
-            angular_velocity,
-            np.repeat(legacy_synthesis.predicted_gain.numpy(), repeats, axis=0),
-            np.repeat(legacy_synthesis.servo_time_constant_s.numpy(), repeats, axis=0),
-            np.ones(evaluation_count, dtype=np.bool_),
-            args.duration_s,
-        ),
-        "original_oracle": _simulate_gain(
-            experiment,
-            physical,
-            attitude,
-            angular_velocity,
-            np.repeat(original_oracle_gains, repeats, axis=0),
-            np.repeat(oracle_servo_tau, repeats, axis=0),
-            np.ones(evaluation_count, dtype=np.bool_),
-            args.duration_s,
-        ),
-    }
+    results = {}
+    if not upper_external:
+        results.update(
+            {
+                "original_nominal": _simulate_gain(
+                    experiment,
+                    physical,
+                    attitude,
+                    angular_velocity,
+                    np.repeat(
+                        original_nominal_gain[None], evaluation_count, axis=0
+                    ),
+                    np.repeat(nominal_tau[None, 2:], evaluation_count, axis=0),
+                    np.ones(evaluation_count, dtype=np.bool_),
+                    args.duration_s,
+                ),
+                "legacy_predicted": _simulate_gain(
+                    experiment,
+                    physical,
+                    attitude,
+                    angular_velocity,
+                    np.repeat(
+                        legacy_synthesis.predicted_gain.numpy(), repeats, axis=0
+                    ),
+                    np.repeat(
+                        legacy_synthesis.servo_time_constant_s.numpy(),
+                        repeats,
+                        axis=0,
+                    ),
+                    np.ones(evaluation_count, dtype=np.bool_),
+                    args.duration_s,
+                ),
+                "original_oracle": _simulate_gain(
+                    experiment,
+                    physical,
+                    attitude,
+                    angular_velocity,
+                    np.repeat(original_oracle_gains, repeats, axis=0),
+                    np.repeat(oracle_servo_tau, repeats, axis=0),
+                    np.ones(evaluation_count, dtype=np.bool_),
+                    args.duration_s,
+                ),
+            }
+        )
     for name, gains in composite_gains.items():
         results[name] = _simulate_composite_gain(
             experiment,
@@ -830,11 +954,16 @@ def evaluate(args: argparse.Namespace) -> Mapping[str, Any]:
     report = {
         "schema_version": 1,
         "checkpoint": str(checkpoint_path),
-        "legacy_checkpoint": str(Path(args.legacy_checkpoint).resolve()),
+        "legacy_checkpoint": (
+            None
+            if args.legacy_checkpoint is None
+            else str(Path(args.legacy_checkpoint).resolve())
+        ),
         "secondary_checkpoint": (
             None if secondary_checkpoint_path is None else str(secondary_checkpoint_path)
         ),
         "secondary_output_axes": secondary_output_axes,
+        "secondary_checkpoints": secondary_checkpoints,
         "test_parameter_groups": count,
         "trial_count": args.trial_count,
         "evaluation_initial_conditions_per_group": repeats,
@@ -845,19 +974,31 @@ def evaluate(args: argparse.Namespace) -> Mapping[str, Any]:
             "basis_time_constants_s": basis_tau,
             "adaptive_mode_indices": mode_indices,
             "target_representation": target_representation,
-            "legacy_history_steps_used": legacy_raw_steps,
+            "legacy_history_steps_used": (
+                None if upper_external else legacy_raw_steps
+            ),
             "mode_transform": mode_transform.tolist(),
             "state_count": 19,
+            "upper_motor_external": upper_external,
             "note": (
                 "Modes outside adaptive_mode_indices remain nominal. The controller "
                 "observes nine stable command-filter states with known deadzone and "
-                "backlash preprocessing rather than mechanical servo angle."
+                "backlash preprocessing rather than mechanical servo angle. When "
+                "upper_motor_external is true, a virtual pilot height PI owns the "
+                "upper rotor and the LQR gain has four outputs: lower motor and the "
+                "three servos."
             ),
         },
         "response_normalized_rmse": {
             "nominal": _response_nrmse(nominal_response, true_response),
-            "legacy_predicted_physical_model": _response_nrmse(
-                legacy_response, true_response
+            **(
+                {}
+                if upper_external
+                else {
+                    "legacy_predicted_physical_model": _response_nrmse(
+                        legacy_response, true_response
+                    )
+                }
             ),
             "composite_predicted": _response_nrmse(
                 composite_response, true_response
@@ -875,7 +1016,11 @@ def evaluate(args: argparse.Namespace) -> Mapping[str, Any]:
             for name, values in local_radius.items()
         },
         "nonlinear": nonlinear,
-        "paired_vs_original_nominal": paired_against("original_nominal"),
+        **(
+            {}
+            if upper_external
+            else {"paired_vs_original_nominal": paired_against("original_nominal")}
+        ),
         "paired_vs_composite_nominal": paired_against("composite_nominal"),
         "parameter_stratified_vs_composite_nominal": parameter_stratified,
         "per_group_convergence_deltas_vs_composite_nominal": {
@@ -900,9 +1045,11 @@ def build_parser() -> argparse.ArgumentParser:
         description="Evaluate fixed-filter composite servo identification"
     )
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--legacy-checkpoint", required=True)
+    parser.add_argument("--legacy-checkpoint")
     parser.add_argument("--secondary-checkpoint")
     parser.add_argument("--secondary-output-axes", default="roll,pitch")
+    parser.add_argument("--secondary-checkpoint-2")
+    parser.add_argument("--secondary-output-axes-2", default="pitch")
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--experiment-config", required=True)
     parser.add_argument("--output", required=True)

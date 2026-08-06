@@ -33,6 +33,7 @@ GOLDEN_JSON = ROOT / "px4_trans/tests/lqi_golden.json"
 
 DT_S = 0.002
 YAW_RATE_SCALE_RAD_S = 2.0
+RPM_TO_RAD_S = 2.0 * math.pi / 60.0
 
 
 def _f32(value: float) -> np.float32:
@@ -50,10 +51,14 @@ def _load_controller() -> dict[str, np.ndarray]:
     from flight_controller import load_controller_config
 
     cfg = load_controller_config(ctl)["params"]["pid"]["attitude"]
+    trim_speed = synth["trim_motor_speed_rad_s"]
     return {
         "gain_4": synth["gain_4"].astype(np.float32),
         "upper_trim": _f32(synth["trim_upper_pwm"]),
         "lower_trim": _f32(synth["trim_lower_pwm"]),
+        "upper_trim_rad_s": _f32(float(trim_speed[0])),
+        "lower_trim_rad_s": _f32(float(trim_speed[1])),
+        "rpm_to_rad_s": _f32(RPM_TO_RAD_S),
         "slopes": synth["command_slopes"].astype(np.float32),
         "decay": np.exp(_f32(-DT_S) / synth["time_constants"].astype(np.float32)).astype(
             np.float32
@@ -82,6 +87,8 @@ def lqi_step_float32(
     rc_throttle: float,
     rc_yaw: float,
     persistent: np.ndarray,
+    motor_rpm: np.ndarray,
+    motor_rpm_valid: bool,
     weights: dict[str, np.ndarray],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Float32 mirror of LqiControllerCore::stepFromState.
@@ -110,10 +117,24 @@ def lqi_step_float32(
     r1 = _f32(angular_velocity[1])
     r2 = _f32(angular_velocity[2]) - yaw_target
 
+    if motor_rpm_valid:
+        upper_state = (
+            _f32(motor_rpm[0]) * weights["rpm_to_rad_s"]
+            - weights["upper_trim_rad_s"]
+        )
+        lower_state = (
+            _f32(motor_rpm[1]) * weights["rpm_to_rad_s"]
+            - weights["lower_trim_rad_s"]
+        )
+    else:
+        upper_state = persistent[0]
+        lower_state = persistent[1]
+
     x = np.concatenate(
         (
             np.asarray([e0, e1, r0, r1, r2], dtype=np.float32),
-            persistent[:5],
+            np.asarray([upper_state, lower_state], dtype=np.float32),
+            persistent[2:5],
             persistent[5:8],
         )
     ).astype(np.float32)
@@ -169,11 +190,20 @@ def lqi_step_float32(
         ],
         dtype=np.float32,
     )
-    actuator_next = (
-        weights["decay"] * persistent[:5]
-        + weights["slope_eff"] * u_dev
+    if motor_rpm_valid:
+        motor_next = np.asarray([upper_state, lower_state], dtype=np.float32)
+    else:
+        motor_next = (
+            weights["decay"][:2] * persistent[:2]
+            + weights["slope_eff"][:2] * u_dev[:2]
+        ).astype(np.float32)
+    servo_next = (
+        weights["decay"][2:] * persistent[2:5]
+        + weights["slope_eff"][2:] * u_dev[2:]
     ).astype(np.float32)
-    next_persistent = np.concatenate((actuator_next, integral_next)).astype(
+    next_persistent = np.concatenate(
+        (motor_next, servo_next, integral_next)
+    ).astype(
         np.float32
     )
     output = np.concatenate((lower[None], servos)).astype(np.float32)
@@ -188,6 +218,8 @@ def _golden_vectors(weights: dict[str, np.ndarray]) -> list[dict[str, object]]:
             0.0,
             0.0,
             np.zeros(8, dtype=np.float32),
+            np.asarray([0.0, 0.0], dtype=np.float32),
+            False,
         ),
         (
             np.asarray([0.9998, 0.01, 0.0, 0.0], dtype=np.float32),
@@ -195,6 +227,8 @@ def _golden_vectors(weights: dict[str, np.ndarray]) -> list[dict[str, object]]:
             0.5,
             0.25,
             np.zeros(8, dtype=np.float32),
+            np.asarray([11000.0, 11500.0], dtype=np.float32),
+            True,
         ),
         (
             np.asarray([0.9, 0.2, -0.3, 0.1], dtype=np.float32),
@@ -205,6 +239,8 @@ def _golden_vectors(weights: dict[str, np.ndarray]) -> list[dict[str, object]]:
                 [100.0, -50.0, 0.05, -0.02, 0.03, 0.1, -0.2, 0.3],
                 dtype=np.float32,
             ),
+            np.asarray([9800.0, 10200.0], dtype=np.float32),
+            True,
         ),
         (
             np.asarray([-0.9998, -0.01, 0.0, 0.0], dtype=np.float32),
@@ -215,6 +251,8 @@ def _golden_vectors(weights: dict[str, np.ndarray]) -> list[dict[str, object]]:
                 [500.0, 400.0, 0.3, 0.25, 0.2, 0.2, 0.2, 0.4],
                 dtype=np.float32,
             ),
+            np.asarray([0.0, 0.0], dtype=np.float32),
+            False,
         ),
         (
             np.asarray([0.8, 0.4, 0.4, 0.2], dtype=np.float32),
@@ -225,6 +263,8 @@ def _golden_vectors(weights: dict[str, np.ndarray]) -> list[dict[str, object]]:
                 [-300.0, 200.0, -0.3, 0.0, 0.1, -0.25, 0.15, -0.45],
                 dtype=np.float32,
             ),
+            np.asarray([13500.0, 9000.0], dtype=np.float32),
+            True,
         ),
         (
             np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
@@ -235,12 +275,14 @@ def _golden_vectors(weights: dict[str, np.ndarray]) -> list[dict[str, object]]:
                 [700.0, 700.0, 0.34, 0.34, 0.34, 0.0, 0.0, 0.0],
                 dtype=np.float32,
             ),
+            np.asarray([10871.0, 10871.0], dtype=np.float32),
+            True,
         ),
     ]
     vectors = []
-    for attitude_q, rate, throttle, yaw, persistent in cases:
+    for attitude_q, rate, throttle, yaw, persistent, motor_rpm, valid in cases:
         output, next_persistent, upper = lqi_step_float32(
-            attitude_q, rate, throttle, yaw, persistent, weights
+            attitude_q, rate, throttle, yaw, persistent, motor_rpm, valid, weights
         )
         vectors.append(
             {
@@ -249,6 +291,8 @@ def _golden_vectors(weights: dict[str, np.ndarray]) -> list[dict[str, object]]:
                 "rc_throttle": float(throttle),
                 "rc_yaw": float(yaw),
                 "persistent": persistent.tolist(),
+                "motor_rpm": motor_rpm.tolist(),
+                "motor_rpm_valid": bool(valid),
                 "expected_output": output.tolist(),
                 "expected_upper": float(upper),
                 "expected_next_persistent": next_persistent.tolist(),
@@ -277,7 +321,15 @@ def _weights_checksum(weights: dict[str, np.ndarray]) -> int:
     )
     payload += b"".join(
         np.asarray([weights[name]], dtype=np.float32).tobytes()
-        for name in ("upper_trim", "lower_trim", "dt", "yaw_rate_scale")
+        for name in (
+            "upper_trim",
+            "lower_trim",
+            "upper_trim_rad_s",
+            "lower_trim_rad_s",
+            "rpm_to_rad_s",
+            "dt",
+            "yaw_rate_scale",
+        )
     )
     payload += weights["integral_limit"].tobytes()
     return _fnv1a32(payload)
@@ -337,6 +389,22 @@ def write_weights_header(weights: dict[str, np.ndarray]) -> int:
     lines += _format_array("kIntegralLimit", weights["integral_limit"])
     lines.append("")
     lines.append(
+        "static constexpr float kUpperTrimRadS{"
+        + _float_literal(float(weights["upper_trim_rad_s"]))
+        + "};"
+    )
+    lines.append(
+        "static constexpr float kLowerTrimRadS{"
+        + _float_literal(float(weights["lower_trim_rad_s"]))
+        + "};"
+    )
+    lines.append(
+        "static constexpr float kRpmToRadS{"
+        + _float_literal(float(weights["rpm_to_rad_s"]))
+        + "};"
+    )
+    lines.append("")
+    lines.append(
         "static constexpr float kUpperTrim{"
         + _float_literal(float(weights["upper_trim"]))
         + "};"
@@ -347,7 +415,7 @@ def write_weights_header(weights: dict[str, np.ndarray]) -> int:
         + "};"
     )
     lines.append("")
-    lines.append(f"static constexpr uint32_t kWeightBytes{{{296}}};")
+    lines.append(f"static constexpr uint32_t kWeightBytes{{{308}}};")
     lines.append(f"static constexpr uint32_t kChecksum{{0x{checksum:08x}}};")
     lines.append("")
     lines.append("} // namespace lqi_weights")
@@ -374,6 +442,8 @@ def write_golden_files(vectors: list[dict[str, object]]) -> None:
         "\tfloat rc_throttle;",
         "\tfloat rc_yaw;",
         "\tfloat persistent[8];",
+        "\tfloat motor_rpm[2];",
+        "\tbool motor_rpm_valid;",
         "\tfloat expected_output[4];",
         "\tfloat expected_upper;",
         "\tfloat expected_next_persistent[8];",
@@ -389,6 +459,9 @@ def write_golden_files(vectors: list[dict[str, object]]) -> None:
         persistent = ", ".join(
             _float_literal(value) for value in vector["persistent"]
         )
+        motor_rpm = ", ".join(
+            _float_literal(value) for value in vector["motor_rpm"]
+        )
         output = ", ".join(
             _float_literal(value) for value in vector["expected_output"]
         )
@@ -401,6 +474,12 @@ def write_golden_files(vectors: list[dict[str, object]]) -> None:
         lines.append(f"\t\t{_float_literal(vector['rc_throttle'])}, ")
         lines.append(f"\t\t{_float_literal(vector['rc_yaw'])}, ")
         lines.append(f"\t\t{{{persistent}}},")
+        lines.append(f"\t\t{{{motor_rpm}}},")
+        lines.append(
+            "\t\t"
+            + ("true" if vector["motor_rpm_valid"] else "false")
+            + ","
+        )
         lines.append(f"\t\t{{{output}}},")
         lines.append(f"\t\t{_float_literal(vector['expected_upper'])}, ")
         lines.append(f"\t\t{{{next_persistent}}},")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import math
 import unittest
 from pathlib import Path
@@ -131,6 +132,76 @@ class ControllerTests(unittest.TestCase):
             tuple(output.diagnostics["controller.lqr_state"].shape),
             (2, 13),
         )
+
+    def test_external_upper_lqr_has_four_outputs_and_pilot_owns_upper(self) -> None:
+        controller = create_controller(
+            {
+                "type": "lqr",
+                "params": {
+                    "collective_mode": "external_upper",
+                    "virtual_pilot": {
+                        "throttle": {
+                            "minimum": 0.20,
+                            "maximum": 0.85,
+                            "initial": 0.56,
+                            "spool_duration_s": 0.0,
+                        },
+                        "height_controller": {
+                            "target_m": 0.0,
+                            "proportional_gain": 0.08,
+                            "integral_gain": 0.04,
+                            "error_limit_m": 5.0,
+                        },
+                    },
+                    "pid": {"altitude": {}, "attitude": {}},
+                    "lqr": {
+                        "state_scales": [
+                            0.0872665,
+                            0.0872665,
+                            1.0,
+                            1.0,
+                            2.0,
+                            300.0,
+                            300.0,
+                            0.15,
+                            0.15,
+                            0.15,
+                        ],
+                        "integral_state_scales": [0.05, 0.05, 0.30],
+                        "input_scales": [0.16, 0.40, 0.40, 0.40],
+                        "input_weight_scale": 0.10,
+                    },
+                    "allocation": {
+                        "input_weights": [1.5, 1.5, 1.0, 1.0, 1.0],
+                        "damping": 1.0e-5,
+                    },
+                },
+            },
+            self.context,
+        )
+        self.assertTrue(controller.upper_external)
+        self.assertEqual(tuple(controller._lqr_gain.shape), (4, 13))
+        self.assertLess(max(abs(controller._lqr_poles)), 1.0)
+        active = torch.ones(2, dtype=torch.bool)
+        state = self.state_at_trim(controller)
+        reference = self.reference()
+        output = controller.step(state, reference, active)
+        command = output.command
+        self.assertEqual(tuple(command.shape), (2, 5))
+        self.assertTrue((command[:, 0] >= 0.20).all())
+        self.assertTrue((command[:, 0] <= 0.85).all())
+        self.assertTrue(torch.isfinite(command).all())
+        # A positive height error (vehicle below target) must raise the pilot's
+        # upper throttle on the next cycle.
+        below = replace(
+            self.state_at_trim(controller),
+            position_n=torch.tensor(
+                [[0.0, 0.0, 0.1], [0.0, 0.0, 0.1]], dtype=torch.float64
+            ),
+        )
+        first = float(controller.pilot.upper_throttle[0, 0])
+        controller.step(below, reference, active)
+        self.assertGreater(float(controller.pilot.upper_throttle[0, 0]), first)
 
     def test_lqi_freezes_integral_while_actuator_command_is_saturated(self) -> None:
         controller = create_controller(

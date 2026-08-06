@@ -391,17 +391,23 @@ def _draw_sim2real_candidate_labels(
     labels[:, 6] = log_uniform(ranges.motor_reaction_ratio)
     labels[:, 7] = log_uniform(ranges.motor_time_constant_s)
     labels[:, 8] = log_uniform(ranges.motor_time_constant_s)
-    torque_nominal = nominal["motors.torque_coefficient"][0].to(dtype)
+    torque_nominal = nominal["motors.torque_coefficient"][0].to(
+        device=labels.device, dtype=dtype
+    )
     common = labels[:, 5]
     ratio_root = torch.sqrt(labels[:, 6])
     torque_upper = torque_nominal[0] * common * ratio_root
     torque_lower = torque_nominal[1] * common / ratio_root
     speed_ratio = torch.sqrt(torque_upper / torque_lower.clamp_min(1e-16))
-    max_speed = nominal["motors.pwm_to_rpm_table"][0, :, -1, 1].to(dtype)
+    max_speed = nominal["motors.pwm_to_rpm_table"][0, :, -1, 1].to(
+        device=labels.device, dtype=dtype
+    )
     upper_speed = torch.minimum(max_speed[0], max_speed[1] / speed_ratio)
     lower_speed = speed_ratio * upper_speed
     k1, k2, k3 = (
-        nominal["aerodynamics.thrust_coefficients"][0].to(dtype).unbind()
+        nominal["aerodynamics.thrust_coefficients"][0]
+        .to(device=labels.device, dtype=dtype)
+        .unbind()
     )
     maximum_thrust = (
         k1 * upper_speed.square()

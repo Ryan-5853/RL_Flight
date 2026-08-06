@@ -54,15 +54,16 @@ class _WindowedSequenceDataset(Dataset[tuple[torch.Tensor, ...]]):
         self.values = values
         self.window_steps = window_steps
         self.length = values.observations.shape[1]
+        self.count = values.observations.shape[0]
         if window_steps >= self.length:
             raise ValueError("window must be shorter than the sequence")
         self.generator = generator
         self.starts = torch.randint(
-            0, self.length - window_steps + 1, (len(values),), generator=generator
+            0, self.length - window_steps + 1, (self.count,), generator=generator
         )
 
     def __len__(self) -> int:
-        return len(self.values)
+        return self.count
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, ...]:
         start = int(self.starts[index])
@@ -152,7 +153,11 @@ class CausalTransformerEncoder(nn.Module):
             batch_first=True,
         )
         self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
-        causal = torch.tril(torch.ones(context_steps, context_steps, dtype=torch.bool))
+        causal = torch.full(
+            (context_steps, context_steps), float("-inf"), dtype=torch.float32
+        )
+        lower = torch.tril(torch.ones(context_steps, context_steps, dtype=torch.bool))
+        causal[lower] = 0.0
         self.register_buffer("causal_mask", causal)
 
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
@@ -164,8 +169,7 @@ class CausalTransformerEncoder(nn.Module):
             )
         value = self.embed(observations) * math.sqrt(self.d_model)
         value = value + self.position[:, :length]
-        mask = self.causal_mask[:length, :length]
-        return self.encoder(value, mask=mask)
+        return self.encoder(value, mask=self.causal_mask[:length, :length])
 
 
 def select_observations(

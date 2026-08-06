@@ -105,9 +105,51 @@ def _shard_iterations(dataset: Path, split: str) -> set[int]:
     return values
 
 
+def extend_parameter_payload(
+    dataset: Path,
+    extra_labels: torch.Tensor,
+    extra_split: int = 0,
+) -> Mapping[str, Any]:
+    """Append new parameter groups (default train split) to a dataset payload."""
+
+    payload_path = dataset / "parameter_groups_audit_only.pt"
+    payload = torch.load(payload_path, map_location="cpu", weights_only=False)
+    existing = payload["labels_audit_only"].shape[0]
+    if extra_labels.ndim != 2 or extra_labels.shape[1] != payload["labels_audit_only"].shape[1]:
+        raise ValueError("extra labels must match the payload label width")
+    new_ids = torch.arange(existing, existing + extra_labels.shape[0], dtype=torch.int64)
+    payload["labels_audit_only"] = torch.cat(
+        (payload["labels_audit_only"], extra_labels.to(payload["labels_audit_only"].dtype)), 0
+    )
+    payload["split_assignment"] = torch.cat(
+        (
+            payload["split_assignment"],
+            torch.full(
+                (extra_labels.shape[0],),
+                extra_split,
+                dtype=payload["split_assignment"].dtype,
+            ),
+        ),
+        0,
+    )
+    torch.save(payload, payload_path)
+    manifest_path = dataset / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["extended_parameter_groups"] = {
+        "new_group_ids": new_ids.tolist(),
+        "split": ["train", "validation", "test"][extra_split],
+        "extra_count": int(extra_labels.shape[0]),
+    }
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    return {"new_group_ids": new_ids.tolist()}
+
+
 def _save_dagger_shard(
     output: Path,
     shard_index: int,
+    dagger_iteration: int,
     split_assignment: torch.Tensor,
     group_ids: torch.Tensor,
     observations: torch.Tensor,
@@ -139,7 +181,7 @@ def _save_dagger_shard(
                 "action_names": ACTION_NAMES,
                 "label_names": label_names,
                 "leakage_contract": "audit tensors are never student inputs",
-                "dagger_iteration": shard_index,
+                "dagger_iteration": dagger_iteration,
             },
             directory / f"shard_{shard_index:06d}.pt",
         )
@@ -158,7 +200,9 @@ def generate_dagger_shards(
     device: torch.device,
     seed: int,
     shard_index: int | None = None,
+    dagger_iteration: int | None = None,
     pilot_height_mode: str = "training_truth",
+    selected_group_ids: Sequence[int] | None = None,
 ) -> Mapping[str, Any]:
     """One DAgger pass: student closed-loop rollouts labeled by the oracle LQI.
 
@@ -199,15 +243,30 @@ def generate_dagger_shards(
     validation_ids = torch.nonzero(split_assignment == 1).flatten()
     if shard_index is None:
         shard_index = _next_shard_index(output_dataset, "train")
-    if train_groups:
-        start = (shard_index * train_groups) % max(len(train_ids), 1)
-        selected_train = torch.cat(
-            (train_ids[start:], train_ids[: max(start + train_groups - len(train_ids), 0)])
-        )[:train_groups]
+    if dagger_iteration is None:
+        dagger_iteration = shard_index
+    if selected_group_ids is not None:
+        selected_groups = torch.as_tensor(
+            list(selected_group_ids), dtype=torch.int64
+        )
+        if len(selected_groups) == 0:
+            raise ValueError("selected_group_ids must not be empty")
+        if int(selected_groups.max()) >= labels_all.shape[0]:
+            raise ValueError("selected_group_ids exceeds payload group count")
+        selected_train = selected_groups
     else:
-        selected_train = torch.empty(0, dtype=torch.int64)
-    selected_validation = validation_ids[:validation_groups]
-    selected_groups = torch.cat((selected_train, selected_validation))
+        if train_groups:
+            start = (shard_index * train_groups) % max(len(train_ids), 1)
+            selected_train = torch.cat(
+                (
+                    train_ids[start:],
+                    train_ids[: max(start + train_groups - len(train_ids), 0)],
+                )
+            )[:train_groups]
+        else:
+            selected_train = torch.empty(0, dtype=torch.int64)
+        selected_validation = validation_ids[:validation_groups]
+        selected_groups = torch.cat((selected_train, selected_validation))
     if len(selected_groups) == 0:
         raise ValueError("no groups selected for DAgger rollout")
     group_count = len(selected_groups)
@@ -391,6 +450,7 @@ def generate_dagger_shards(
         counts = _save_dagger_shard(
             output_dataset,
             shard_index,
+            int(dagger_iteration),
             split_assignment,
             group_ids,
             observations.cpu(),
@@ -494,6 +554,7 @@ def run_dagger_iterations(
                 trials,
                 device,
                 seed + 1000 * (iteration + 1),
+                dagger_iteration=iteration,
             )
         gate_output = output_root / "gates" / f"gate_iter_{iteration:02d}.json"
         gate = evaluate_closed_loop(
@@ -563,6 +624,8 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument("--seed", type=int, default=20260805)
     parser.add_argument("--shard-index", type=int)
+    parser.add_argument("--dagger-iteration", type=int)
+    parser.add_argument("--groups", type=int, nargs="+")
     parser.add_argument("--exclude-previous-command", action="store_true")
     parser.add_argument(
         "--arch",
@@ -610,6 +673,8 @@ def main() -> None:
             device,
             args.seed,
             args.shard_index,
+            args.dagger_iteration,
+            selected_group_ids=args.groups,
         )
         print(json.dumps(totals, indent=2, sort_keys=True))
         return

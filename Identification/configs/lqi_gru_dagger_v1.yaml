@@ -132,16 +132,16 @@ dagger:
   # closed loop over a rotating subset of training airframes, label every
   # visited state with the per-airframe oracle LQI, and gate on unseen
   # validation airframes in closed loop.
-  iterations: 5
+  iterations: 6
   train_groups_per_iteration: 96
   validation_groups_per_iteration: 0
-  trials_per_group: 2
-  training_epochs: 40
+  trials_per_group: 4
+  training_epochs: 60
   gate_trials_per_group: 4
   gate_duration_s: 6.0
   gate_validation_groups: 24
   arch: gru
   context_steps: null
   exclude_previous_command: false
-  previous_command_noise_std: 0.15
-  previous_command_reset_prob: 0.10
+  previous_command_noise_std: 0.05
+  previous_command_reset_prob: 0.05

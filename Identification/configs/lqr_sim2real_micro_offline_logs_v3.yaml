@@ -1,0 +1,68 @@
+schema_version: 1
+
+simulator_config: ../../SimEnv/configs/sim2real_micro_coaxial.yaml
+controller_config: ../../Controller/configs/lqi_sim2real_micro_coaxial_4out.yaml
+
+run:
+  seed: 20260828
+  device: cuda:0
+  dtype: float32
+  parallel_count: 2048
+  output_directory: ../datasets/lqr_sim2real_micro_offline_logs_v3
+
+observation:
+  measurement_mode: simulated_sensors
+
+sampling:
+  parameterization: sim2real_micro
+  parameter_groups: 8192
+  initial_conditions_per_group: 8
+  # Allow large closed-loop initial disturbances three seconds to settle.
+  episode_duration_s: 3.0
+  sim2real_ranges:
+    # Derived range from the fixed motor thrust curve at 1-5x T/W:
+    # mass = T_max / (T/W * g) -> [T_max/(5g), T_max/g] = [0.425, 2.126] kg.
+    # The sampler derives mass from the sampled T/W; this range is the envelope.
+    mass_kg: [0.425, 2.126]
+    inertia_xy_radius_of_gyration_m: [0.035, 0.075]
+    inertia_z_radius_of_gyration_m: [0.045, 0.080]
+    thrust_to_weight: [1.0, 5.0]
+    motor_reaction_scale: [0.25, 4.0]
+    motor_reaction_ratio: [0.70, 1.40]
+    motor_time_constant_s: [0.015, 0.120]
+    direct_center_xy_radius_m: [0.00001, 0.010]
+    # FRD body frame (z down, +z = below CoM): direct thrust near CoM height,
+    # randomized +/- 5 cm; grids about 5 cm below CoM, randomized +/- 3 cm.
+    direct_center_z_m: [-0.05, 0.05]
+    direct_thrust_fraction: [0.50, 0.80]
+    grid_radius_m: [0.040, 0.060]
+    grid_azimuth_error_rad: [-0.1396263, 0.1396263]
+    grid_center_z_m: [0.02, 0.08]
+    grid_effectiveness_scale: [0.50, 1.50]
+    servo_time_constant_s: [0.010, 0.080]
+    servo_max_speed_rad_s: [5.0, 11.6355]
+    # SimEnv's explicit grid-to-grid attenuation, not a generic coupling scalar.
+    coupling_attenuation: [0.0, 0.40]
+  feasibility:
+    maximum_linear_trim_servo_angle_rad: 0.125
+    maximum_linear_trim_residual_rad_s2: 0.10
+
+initial_state:
+  sampling_design: stratified_multiaxis
+  minimum_tilt_rad: 0.0872665
+  maximum_tilt_rad: 0.4363323
+  maximum_angular_rate_rad_s: [1.5, 1.5, 2.0]
+
+convergence:
+  maximum_roll_pitch_error_rad: 0.0349066
+  maximum_angular_rate_rad_s: 0.10
+  hold_s: 0.5
+  safety_tilt_rad: 1.0471976
+  safety_angular_rate_rad_s: 10.0
+
+window:
+  # Store the complete closed-loop flight log for offline post-flight inference.
+  length_s: 2.0
+  stride_s: 2.0
+  maximum_start_s: 0.0
+  split_fractions: [0.70, 0.15, 0.15]

@@ -40,6 +40,9 @@ int main()
 
 		input.rc_throttle = vector.rc_throttle;
 		input.rc_yaw = vector.rc_yaw;
+		input.motor_rpm[0] = vector.motor_rpm[0];
+		input.motor_rpm[1] = vector.motor_rpm[1];
+		input.motor_rpm_valid = vector.motor_rpm_valid;
 
 		LqiControllerCore::ControlOutput output {};
 		float next_persistent[LqiControllerCore::kPersistentSize] {};

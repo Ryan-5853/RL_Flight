@@ -26,6 +26,18 @@ open-loop sweeps, and oracle-gain data collection are explicitly excluded.
 The canonical NPZ adapter and offline analysis CLI produce candidate composite
 gains but never mark them as flight-accepted.
 
+The angular-velocity neural-controller line (oracle per-airframe LQI distilled
+into a causal student) is documented in
+[DAgger_ANGULAR_VELOCITY_CONTROLLER_REPORT_zh.md](DAgger_ANGULAR_VELOCITY_CONTROLLER_REPORT_zh.md).
+Pure behavior cloning failed in closed loop (safety 34-42%); a DAgger loop that
+relabels student-visited states with the oracle LQI lifts unseen-airframe
+closed-loop safety to 94.6% (oracle LQI 93.9%, fixed nominal LQI 96.0%) with
+0.41 ms/step inference. GRU-192x2 is the recommended deployable candidate;
+GRU/LSTM/Transformer close-loop at the same safety level, while a fixed-window
+TCN lags. Runtime entry points: `flight-identification-lqi-gru-dagger`,
+`flight-identification-lqi-gru-closed-loop`,
+`flight-identification-lqi-gru-arch-compare`.
+
 The offline analysis line is complete: MLP (100 Hz), TCN, and bidirectional GRU
 are all retrained on the stratified `lqr_sim2real_micro_offline_logs_v2` data
 with per-flight-count 1/2/4/8 comparisons. The selected hybrid is
@@ -39,6 +51,16 @@ log-information and input-OOD quartile. Artifacts remain
 `deployment_mode=research_only` with `gain_updates_enabled=false`; the 90%
 analysis blend plus validation-calibrated log-quality thresholds are the
 recommended HIL candidate inputs.
+
+The deployment-contract line now uses the four-output LQR structure: the upper
+rotor is owned by a virtual-pilot altitude hold and the identified LQR gain has
+four outputs (lower motor + three servos). It was trained on
+`lqr_sim2real_micro_offline_logs_v4` with MLP v7 (yaw) + TCN v7 (roll) + BiGRU
+v7b (pitch). On 949 unseen groups x 8 initial conditions x 2 s over two seeds,
+the 80% gain blend reaches 79.1%/78.7% convergence versus 68.5%/68.9% for the
+fixed composite nominal (+10.6/+9.8 pp, clustered 95% CI excluding zero), safety
+non-inferior, and 100% convergence on the 8 s long-duration audit. See
+[OFFLINE_4OUT_COMPOSITE_REPORT_zh.md](OFFLINE_4OUT_COMPOSITE_REPORT_zh.md).
 
 The consolidated conclusions, with deployment-feasibility analysis and the full
 performance comparison, are in

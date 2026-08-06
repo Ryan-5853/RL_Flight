@@ -173,27 +173,35 @@ def composite_discrete_model(
     basis_time_constants_s: Sequence[float] = DEFAULT_BASIS_TIME_CONSTANTS_S,
     dt: float = 1.0 / 500.0,
     integral: bool = True,
+    upper_external: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     basis_count = len(basis_time_constants_s)
     latent_count = 3 * basis_count
     base_state_count = 7 + latent_count
     state_count = base_state_count + (3 if integral else 0)
     a = np.zeros((state_count, state_count), dtype=np.float64)
-    b = np.zeros((state_count, 5), dtype=np.float64)
+    input_count = 4 if upper_external else 5
+    b = np.zeros((state_count, input_count), dtype=np.float64)
     a[0, 2] = 1.0
     a[1, 3] = 1.0
     a[2:5, 5:7] = motor_effectiveness
     a[5:7, 5:7] = np.diag(-1.0 / motor_time_constants_s)
-    b[5:7, :2] = np.diag(
-        motor_command_slopes / motor_time_constants_s
-    )
+    if upper_external:
+        # The upper motor is externally commanded (pilot); only the lower motor
+        # remains a control input.
+        b[6, 0] = motor_command_slopes[1] / motor_time_constants_s[1]
+    else:
+        b[5:7, :2] = np.diag(
+            motor_command_slopes / motor_time_constants_s
+        )
     servo_input = np.asarray(mode_transform) @ np.diag(servo_command_slopes)
     for basis_index, tau in enumerate(basis_time_constants_s):
         start = 7 + 3 * basis_index
         stop = start + 3
         a[2:5, start:stop] = composite_coefficients[basis_index]
         a[start:stop, start:stop] = -np.eye(3) / tau
-        b[start:stop, 2:] = servo_input / tau
+        servo_start = 1 if upper_external else 2
+        b[start:stop, servo_start:] = servo_input / tau
     if integral:
         a[base_state_count, 0] = 1.0
         a[base_state_count + 1, 1] = 1.0
@@ -201,7 +209,12 @@ def composite_discrete_model(
     augmented = np.block(
         [
             [a, b],
-            [np.zeros((5, state_count + 5), dtype=np.float64)],
+            [
+                np.zeros(
+                    (input_count, state_count + input_count),
+                    dtype=np.float64,
+                )
+            ],
         ]
     )
     discrete = expm(augmented * dt)

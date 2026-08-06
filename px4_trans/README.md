@@ -407,7 +407,10 @@ CONFIG_NN_CONTROL_BACKEND_HYBRID=y
 
 当前默认项是 `LQR`。LQR 后端实现为方案 A 的"外部集电 + 4 输出 LQI"：
 上桨归飞手/RC 油门（`rc_throttle` 映射到 `motors[0]`），LQI 控制下桨与三路舵机，
-13 状态全部命令驱动（无 ESC 转速、无舵角反馈），固定 500 Hz（2 ms）时基。
+13 状态中上桨/下桨优先使用双向 DShot 的 `esc_status` 转速反馈（按
+`MOTOR1`/`MOTOR2` 功能号匹配、取绝对值、100 ms 新鲜度），转速不可用时自动
+回退到命令驱动一阶观察者；舵机状态始终命令驱动（无舵角反馈）。固定
+500 Hz（2 ms）时基。
 权重与观察者常量由 `px4_trans/tools/generate_lqi_backend.py` 从
 `Identification` 的标称 K4 合成生成到 `LqiControllerCore.hpp` / `LqiWeights.hpp`，
 并配套黄金向量（`px4_trans/tests/lqi_golden.hpp`）与主机一致性检查
