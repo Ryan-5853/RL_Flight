@@ -32,6 +32,7 @@
           <button class="control-button export-video-control" id="exportVideoButton" type="button">
             <span class="video-icon" aria-hidden="true">▣</span>导出视频
           </button>
+          <button class="control-button" id="openTerminal" type="button">飞控终端</button>
         </div>
 
         <div class="top-status">
@@ -308,11 +309,19 @@
         </footer>
       </section>
     </div>
-    <script src="./config.js?v=cascade-20260803a"></script>
+    <div class="modal-backdrop" id="terminalModal" hidden>
+      <section class="terminal-dialog" role="dialog" aria-modal="true" aria-labelledby="terminalTitle">
+        <header><div><span class="eyebrow">PX4 MAVLINK SHELL</span><h2 id="terminalTitle">飞控终端</h2></div><button type="button" id="closeTerminal" aria-label="关闭">×</button></header>
+        <pre id="terminalOutput" class="terminal-output">请先启动 PX4 HIL 会话。</pre>
+        <form id="terminalForm" class="terminal-form"><input id="terminalCommand" autocomplete="off" maxlength="240" placeholder="输入 PX4 NSH 命令，例如 commander status" /><button type="submit">发送</button></form>
+      </section>
+    </div>
+    <script src="./config.js?v=px4-hil-v3-20260807"></script>
     <script src="./server-config.js?v=controller-20260730b"></script>
     <script src="./app.js?v=spatial-20260731a"></script>
     <script src="./gamepad.js?v=direction-20260731b"></script>
     <script src="./runtime-client.js?v=latency-20260804a"></script>
+    <script src="./terminal.js?v=px4-terminal-20260807a"></script>
     <script src="./video-export.js?v=spatial-20260730a"></script>
     <script src="./latency.js?v=controller-20260730r"></script>
   </body>

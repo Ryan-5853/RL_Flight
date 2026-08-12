@@ -2,6 +2,7 @@ from .base import FlightController
 from .classical import HybridPIDLQRController, LQRController, PIDController
 from .config import load_controller_config
 from .factory import controller_types, create_controller, register_controller
+from .external_upper import compose_external_upper_command
 from .neural import NeuralNetworkController
 from .types import (
     ControllerContext,
@@ -22,6 +23,7 @@ __all__ = [
     "NeuralNetworkController",
     "PIDController",
     "controller_types",
+    "compose_external_upper_command",
     "create_controller",
     "load_controller_config",
     "register_controller",

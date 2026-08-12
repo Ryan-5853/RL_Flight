@@ -159,6 +159,7 @@ class ExternalHeightPilot:
         from flight_controller import load_controller_config
         from flight_controller.plant import LocalPlantModel
 
+        self.context = context
         config = load_controller_config(controller_config_path)["params"]
         altitude = config["pid"]["altitude"]
         self.kp = float(altitude["kp"])
@@ -260,6 +261,7 @@ class ExternalCollectiveLQIController:
             )
         if observer_mode not in {"linear", "nonlinear"}:
             raise ValueError("observer_mode must be linear or nonlinear")
+        self.context = context
         config = load_controller_config(controller_config_path)["params"]
         pid = config["pid"]["attitude"]
         self.control_dt = context.control_dt
@@ -333,6 +335,7 @@ class ExternalCollectiveLQIController:
         reference: Any,
         upper_pwm: torch.Tensor,
         active: torch.Tensor,
+        update_observer: bool = True,
     ) -> torch.Tensor:
         from flight_controller.math import quaternion_rotation_error
 
@@ -401,10 +404,30 @@ class ExternalCollectiveLQIController:
             )
         )
 
-        upper_clamped = upper_pwm.clamp(0.0, 1.0)
-        upper_dev = upper_clamped - self.upper_trim
-        lower_dev = lower - self.lower_trim
         command = torch.cat((lower, servos), dim=1)
+        if update_observer:
+            self.observe_applied_command(upper_pwm, command)
+        command = torch.where(
+            active[:, None], command, self.last_command
+        )
+        self.last_command.copy_(command)
+        return command
+
+    def observe_applied_command(
+        self, upper_pwm: torch.Tensor, controlled_command: torch.Tensor
+    ) -> None:
+        """Advance hidden actuator observers from the command actually applied.
+
+        DAgger uses this explicitly because the expert is queried at a student
+        state but its counterfactual action is not sent to the plant.
+        """
+
+        if controlled_command.shape != (self.context.batch_size, 4):
+            raise ValueError("controlled_command must have shape [batch, 4]")
+        upper_dev = upper_pwm.clamp(0.0, 1.0) - self.upper_trim
+        lower = controlled_command[:, :1].clamp(0.0, 1.0)
+        servos = controlled_command[:, 1:].clamp(-1.0, 1.0)
+        lower_dev = lower - self.lower_trim
         if self.servo_observer is not None:
             self.servo_observer.advance(servos)
         command_dev = torch.cat((upper_dev, lower_dev, servos), dim=1)
@@ -412,11 +435,6 @@ class ExternalCollectiveLQIController:
             self.decay[None] * self.actuator_state
             + self.slopes[None] * (1.0 - self.decay[None]) * command_dev
         )
-        command = torch.where(
-            active[:, None], command, self.last_command
-        )
-        self.last_command.copy_(command)
-        return command
 
 
 @torch.no_grad()

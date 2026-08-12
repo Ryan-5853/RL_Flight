@@ -1,0 +1,18 @@
+schema_version: 1
+
+# Numerical plant and 4x13 LQI source. Paths are relative to the repository root.
+simulator_config: SimEnv/configs/sim2real_micro_coaxial_gain_robust.yaml
+controller_config: Controller/configs/lqi_sim2real_micro_coaxial_4out.yaml
+
+# PX4 manual-control reference contract. These values match the latest
+# virtual-pilot envelope used to exercise the nominal LQI.
+manual_reference:
+  roll:
+    limit_rad: 0.2094395
+    time_constant_s: 0.18
+  pitch:
+    limit_rad: 0.2094395
+    time_constant_s: 0.18
+  yaw:
+    limit_rad_s: 1.2
+    time_constant_s: 0.25

@@ -125,6 +125,7 @@ class RuntimeOptions:
     spin_us: float
     execution_hz: float
     telemetry_hz: float
+    online_log_hz: float
     command_timeout_s: float
     episode_duration_s: float
     max_tilt_rad: float
@@ -179,6 +180,7 @@ def parse_runtime_options(config: Mapping[str, Any]) -> RuntimeOptions:
         spin_us=_number(runtime, "spin_us", 200.0),
         execution_hz=_number(runtime, "execution_hz", 500.0),
         telemetry_hz=_number(runtime, "telemetry_hz", 60.0),
+        online_log_hz=_number(runtime, "online_log_hz", 100.0),
         command_timeout_s=_number(runtime, "command_timeout_ms", 5000.0) / 1000.0,
         episode_duration_s=_number(task, "episode_duration_s", 30.0),
         max_tilt_rad=_number(termination, "max_tilt_rad", 1.3),
@@ -213,6 +215,10 @@ def parse_runtime_options(config: Mapping[str, Any]) -> RuntimeOptions:
     if options.telemetry_hz > options.execution_hz:
         raise RuntimeConfigurationError(
             "runtime.telemetry_hz must not exceed runtime.execution_hz"
+        )
+    if options.online_log_hz < 0:
+        raise RuntimeConfigurationError(
+            "runtime.online_log_hz must be non-negative (0 disables logging)"
         )
     if options.cpu_threads <= 0 or options.cpu_threads > 64:
         raise RuntimeConfigurationError("runtime.cpu_threads must be between 1 and 64")
@@ -686,6 +692,7 @@ class CpuRuntimeSession:
         self.raw_test = yaml.safe_load(test_yaml)
         self.inference_package: RealtimeInferencePackage | None = None
         self.realtime_height_controller: Any | None = None
+        self.controller: Any | None = None
         self.last_height_controller_output: Mapping[str, Any] | None = None
         if not isinstance(self.raw_simenv, Mapping):
             raise RuntimeConfigurationError("SimEnv YAML must contain a mapping")
@@ -711,6 +718,13 @@ class CpuRuntimeSession:
         self.test_path = temp / "controller_test.yaml"
         runtime_log_root = Path(log_root).expanduser().resolve()
         runtime_log_root.mkdir(parents=True, exist_ok=True)
+        self.hil_diagnostic_path: Path | None = None
+        self.online_log_path = runtime_log_root / f"runtime-{self.id}.jsonl"
+        self._online_log_buffer: list[str] = []
+        self._online_log_steps = 0
+        self._online_log_last_flush_at = time.monotonic()
+        self._online_log_finalized = False
+        self._last_termination: dict[str, Any] | None = None
         normalized_simenv = copy.deepcopy(dict(self.raw_simenv))
         logging = normalized_simenv.setdefault("logging", {})
         if not isinstance(logging, dict):
@@ -777,6 +791,12 @@ class CpuRuntimeSession:
             controller_node = self.raw_test.get("controller", {"type": "neural"})
             controller_config = dict(_mapping(controller_node, "controller"))
             controller_type = str(controller_config.get("type", "neural"))
+            runtime_node = _mapping(self.raw_test.get("runtime", {}), "runtime")
+            self.runtime_backend = str(runtime_node.get("backend", "cpu"))
+            if self.runtime_backend not in {"cpu", "px4_hil"}:
+                raise RuntimeConfigurationError(
+                    "runtime.backend must be cpu or px4_hil"
+                )
             params = controller_config.setdefault("params", {})
             if not isinstance(params, dict):
                 raise RuntimeConfigurationError(
@@ -796,18 +816,31 @@ class CpuRuntimeSession:
                 raise RuntimeConfigurationError(
                     "position flight_mode requires collective_mode=hover"
                 )
-            model_parameters = _mapping(
-                params.get("model_parameters", {}),
-                "controller.params.model_parameters",
-            )
-            (
-                self.controller_parameter_source,
-                self.controller_parameters,
-            ) = _controller_model_parameters(
-                self.environment.parameters,
-                model_parameters,
-                torch,
-            )
+            if self.runtime_backend == "px4_hil":
+                # The controller runs on the flight controller, not in this
+                # WebUI process.  The local "manual identification model" is
+                # only meaningful for the CPU controller and must not block
+                # HIL startup when its motor table does not match the SimEnv
+                # config (e.g. example vs sim2real).  Keep a synchronized
+                # snapshot only for status/visualization.
+                self.controller_parameter_source = "synchronized"
+                self.controller_parameters = {
+                    name: value.detach().clone()
+                    for name, value in self.environment.parameters.items()
+                }
+            else:
+                model_parameters = _mapping(
+                    params.get("model_parameters", {}),
+                    "controller.params.model_parameters",
+                )
+                (
+                    self.controller_parameter_source,
+                    self.controller_parameters,
+                ) = _controller_model_parameters(
+                    self.environment.parameters,
+                    model_parameters,
+                    torch,
+                )
             position = _mapping(
                 params.get("position", {}),
                 "controller.params.position",
@@ -835,7 +868,7 @@ class CpuRuntimeSession:
                     "must be positive, and maximum tilt must be inside (0,pi/2)"
                 )
             neural_model = None
-            if controller_type == "neural":
+            if controller_type == "neural" and self.runtime_backend == "cpu":
                 if checkpoint_path is None:
                     raise RuntimeConfigurationError(
                         "neural controller requires a deployment package path"
@@ -922,12 +955,31 @@ class CpuRuntimeSession:
                 control_dt=self.control_period,
                 parameters=self.controller_parameters,
             )
-            self.controller = create_controller(
-                controller_config,
-                controller_context,
-                neural_model=neural_model,
-            )
-            if controller_type == "neural" and collective_mode == "hover":
+            if self.runtime_backend == "px4_hil":
+                from hil_runtime import HilOptions, Px4HilController
+
+                self.hil_diagnostic_path = (
+                    runtime_log_root / f"hil-startup-{self.id}.jsonl"
+                )
+                self.controller = Px4HilController(
+                    HilOptions.parse(runtime_node),
+                    torch_module=torch,
+                    device=self.device,
+                    dtype=self.dtype,
+                    control_dt=self.control_period,
+                    diagnostic_path=self.hil_diagnostic_path,
+                )
+            else:
+                self.controller = create_controller(
+                    controller_config,
+                    controller_context,
+                    neural_model=neural_model,
+                )
+            if (
+                controller_type == "neural"
+                and self.runtime_backend == "cpu"
+                and collective_mode == "hover"
+            ):
                 # Build and validate the authoritative classical altitude PID
                 # once, then freeze its B=1 coefficients into the allocation-
                 # free realtime implementation. The neural policy retains
@@ -947,13 +999,17 @@ class CpuRuntimeSession:
                 "id": self.configuration_id,
                 "simulation_backend": "simenv-realtime-single-v1",
                 "controller_parameter_source": (
-                    "deployment_package"
-                    if controller_type == "neural"
-                    else self.controller_parameter_source
+                    "px4_firmware"
+                    if self.runtime_backend == "px4_hil"
+                    else (
+                        "deployment_package"
+                        if controller_type == "neural"
+                        else self.controller_parameter_source
+                    )
                 ),
                 "controller_auxiliary_parameter_source": (
                     self.controller_parameter_source
-                    if controller_type == "neural"
+                    if controller_type == "neural" and self.runtime_backend == "cpu"
                     else None
                 ),
                 "controller_model": _configuration_model_summary(
@@ -1010,7 +1066,7 @@ class CpuRuntimeSession:
             self._filter_alpha = 1.0 - torch.exp(-torch.tensor(
                 self.control_period, device=self.device, dtype=self.dtype
             ) / torch.tensor(self.options.stick_time_constants, device=self.device, dtype=self.dtype))
-            if self.options.compile_kernels:
+            if self.options.compile_kernels and self.runtime_backend == "cpu":
                 if self.controller.controller_type != "neural":
                     self.controller.step = torch.compile(
                         self.controller.step,
@@ -1062,7 +1118,7 @@ class CpuRuntimeSession:
                 ),
                 "maximum_tilt_rad": self.position_maximum_tilt,
             }
-            if controller_type == "neural":
+            if controller_type == "neural" and self.runtime_backend == "cpu":
                 self.controller_description["collective_mode"] = collective_mode
                 self.controller_description["height_controller"] = (
                     "shared_altitude_pid"
@@ -1081,6 +1137,11 @@ class CpuRuntimeSession:
         except Exception:
             if self.inference_package is not None:
                 self.inference_package.close()
+            if (
+                self.controller is not None
+                and getattr(self, "runtime_backend", "cpu") == "px4_hil"
+            ):
+                self.controller.close()
             self.simulation.close()
             self._tempdir.cleanup()
             raise
@@ -1234,11 +1295,14 @@ class CpuRuntimeSession:
                     raise RuntimeError(
                         "the controller frame supplied to start is stale"
                     )
-            if time.monotonic() - self._command_received > self.options.command_timeout_s:
+            command_timeout_s = self._pilot_command_timeout_s()
+            if time.monotonic() - self._command_received > command_timeout_s:
                 raise RuntimeError("a fresh controller frame is required before start")
             self._fault = None
             self._state = "running"
             self._started_at = self._started_at or time.monotonic()
+            if self.runtime_backend == "px4_hil":
+                self.controller.start()
         self._wake.set()
         return accepted
 
@@ -1246,6 +1310,8 @@ class CpuRuntimeSession:
         with self._lock:
             if self._state != "closed":
                 self._state = "paused"
+                if self.runtime_backend == "px4_hil":
+                    self.controller.pause()
 
     def reset(self) -> None:
         with self._lock:
@@ -1279,7 +1345,8 @@ class CpuRuntimeSession:
                     raise RuntimeError(
                         "the controller frame supplied to single-step is stale"
                     )
-            if time.monotonic() - self._command_received > self.options.command_timeout_s:
+            command_timeout_s = self._pilot_command_timeout_s()
+            if time.monotonic() - self._command_received > command_timeout_s:
                 raise RuntimeError("a fresh controller frame is required before single-step")
             self._state = "paused"
             self._step_requests += 1
@@ -1300,6 +1367,13 @@ class CpuRuntimeSession:
         )
         self.effective_configuration = updated
 
+    def _pilot_command_timeout_s(self) -> float:
+        if self.runtime_backend != "px4_hil":
+            return self.options.command_timeout_s
+        if self.controller.options.pilot_source == "rc":
+            return math.inf
+        return self.controller.options.pilot_timeout_s
+
     def close(self) -> None:
         with self._lock:
             if self._state == "closed":
@@ -1314,8 +1388,21 @@ class CpuRuntimeSession:
             if self.inference_package is not None:
                 self.inference_package.close()
         finally:
-            self.simulation.close()
-            self._tempdir.cleanup()
+            try:
+                self._finalize_online_log()
+            finally:
+                try:
+                    if self.runtime_backend == "px4_hil":
+                        self.controller.close()
+                finally:
+                    self.simulation.close()
+                    self._tempdir.cleanup()
+
+    def terminal_command(self, command: str) -> str:
+        with self._lock:
+            if self.runtime_backend != "px4_hil":
+                raise RuntimeError("飞控终端仅适用于 px4_hil 后端")
+            return self.controller.terminal_command(command)
 
     def status(self) -> dict[str, Any]:
         with self._lock:
@@ -1328,6 +1415,7 @@ class CpuRuntimeSession:
                 "dtype": str(self.dtype),
                 "flush_denormal": self.flush_denormal,
                 "simulation_backend": "simenv-realtime-single-v1",
+                "controller_backend": self.runtime_backend,
                 "simulation_compiled": self.simulation.compiled,
                 "controller_compiled": self.controller_compiled,
                 "simulation_warmup_s": self.warmup_seconds,
@@ -1337,6 +1425,9 @@ class CpuRuntimeSession:
                 "target_execution_hz": self.execution_hz,
                 "effective_execution_hz": self._effective_execution_hz,
                 "control_steps": self._control_steps,
+                "online_log_path": str(self.online_log_path),
+                "online_log_hz": self.options.online_log_hz,
+                "online_log_steps": self._online_log_steps,
                 "episode_id": self.episode_id,
                 "episode_step": self.episode_step,
                 "flight_mode": self.flight_mode,
@@ -1370,7 +1461,9 @@ class CpuRuntimeSession:
                 ),
                 "log_directory": self.log_directory,
                 "controller": copy.deepcopy(
-                    self.controller_description
+                    self.controller.describe()
+                    if self.runtime_backend == "px4_hil"
+                    else self.controller_description
                 ),
             }
 
@@ -1417,8 +1510,9 @@ class CpuRuntimeSession:
                     if single_step:
                         self._step_requests -= 1
                     command_age = time.monotonic() - self._command_received
+                    command_timeout_s = self._pilot_command_timeout_s()
                     input_stale = (
-                        command_age > self.options.command_timeout_s
+                        command_age > command_timeout_s
                     )
                     if input_stale and not self._input_stale:
                         self._input_timeout_events += 1
@@ -1440,6 +1534,10 @@ class CpuRuntimeSession:
                     self._wake.clear()
                     next_deadline_ns = time.perf_counter_ns()
                     continue
+                if input_stale and self.runtime_backend == "px4_hil":
+                    raise RuntimeError(
+                        "PX4 HIL stopped because the pilot command timed out"
+                    )
                 step_started_ns_perf = time.perf_counter_ns()
                 step_started_ns = time.time_ns()
                 for index, value in enumerate(command):
@@ -1448,7 +1546,16 @@ class CpuRuntimeSession:
                 with torch.no_grad():
                     step_timing = self._step_cpu(
                         inspect_safety=publish_due,
+                        reset_on_termination=self.runtime_backend != "px4_hil",
                         capture_timing=publish_due or command_trace is not None,
+                    )
+                if (
+                    self.runtime_backend == "px4_hil"
+                    and step_timing["termination"] is not None
+                ):
+                    raise RuntimeError(
+                        "PX4 HIL safety stop: "
+                        f"{step_timing['termination']['reason']}"
                     )
                 step_finished_ns = time.time_ns()
                 step_trace = command_trace or {
@@ -1505,13 +1612,36 @@ class CpuRuntimeSession:
                     if remaining_ns < -period_ns:
                         next_deadline_ns = time.perf_counter_ns()
         except Exception as error:
+            if self.runtime_backend == "px4_hil":
+                try:
+                    self.controller.fault()
+                except Exception:
+                    pass
+            fault_text = f"{type(error).__name__}: {error}"
             with self._lock:
-                self._fault = f"{type(error).__name__}: {error}"
+                self._fault = fault_text
                 self._state = "faulted"
                 self._telemetry_ready.notify_all()
+            diagnostic_suffix = (
+                f"; diagnostic log: {self.hil_diagnostic_path}"
+                if self.hil_diagnostic_path is not None
+                else ""
+            )
+            print(
+                f"[runtime {self.id}] FAULTED {fault_text}{diagnostic_suffix}",
+                flush=True,
+            )
         finally:
             if gc_was_enabled:
                 gc.enable()
+            try:
+                self._finalize_online_log()
+            except Exception as error:
+                print(
+                    f"[runtime {self.id}] WARNING cannot finalize online log: "
+                    f"{error}",
+                    flush=True,
+                )
 
     def _step_cpu(
         self,
@@ -1719,6 +1849,8 @@ class CpuRuntimeSession:
             time.perf_counter_ns() if capture_timing else 0
         )
         controller_started_ns = time.time_ns() if capture_timing else 0
+        if self.runtime_backend == "px4_hil":
+            self.controller.set_sample(truth, sensor, self.input_tensor)
         controller_output = self.controller.step(state, reference)
         controller_finished_ns = time.time_ns() if capture_timing else 0
         controller_elapsed_ns = (
@@ -1784,6 +1916,26 @@ class CpuRuntimeSession:
                     result.error_code[0].item()
                 ),
             }
+            try:
+                self._append_online_log(
+                    state=state,
+                    reference=reference,
+                    controller_output=controller_output,
+                    result=result,
+                    step_timing={
+                        "controller_elapsed_ns": controller_elapsed_ns,
+                        "environment_elapsed_ns": environment_elapsed_ns,
+                        "post_step_finished_ns": (
+                            time.time_ns() if capture_timing else 0
+                        ),
+                    },
+                    termination=termination,
+                )
+            except Exception as error:
+                print(
+                    f"[runtime {self.id}] WARNING online log failed: {error}",
+                    flush=True,
+                )
             if reset_on_termination:
                 self._record_reset(reason, termination)
                 if episode_timeout:
@@ -1816,6 +1968,27 @@ class CpuRuntimeSession:
                 self.last_position_controller_output = None
                 self.episode_step = 0
                 self.episode_id += 1
+        else:
+            try:
+                self._append_online_log(
+                    state=state,
+                    reference=reference,
+                    controller_output=controller_output,
+                    result=result,
+                    step_timing={
+                        "controller_elapsed_ns": controller_elapsed_ns,
+                        "environment_elapsed_ns": environment_elapsed_ns,
+                        "post_step_finished_ns": (
+                            time.time_ns() if capture_timing else 0
+                        ),
+                    },
+                    termination=None,
+                )
+            except Exception as error:
+                print(
+                    f"[runtime {self.id}] WARNING online log failed: {error}",
+                    flush=True,
+                )
         return {
             "preparation_started_ns": preparation_started_ns,
             "controller_started_ns": controller_started_ns,
@@ -2093,6 +2266,194 @@ class CpuRuntimeSession:
                 .tolist(),
             }
         return frame
+
+    def _online_log_enabled(self) -> bool:
+        """Online detailed logging is active only for interactive steps."""
+
+        return (
+            self.options.online_log_hz > 0
+            and not self._online_log_finalized
+            and getattr(self, "_state", None) in {"running", "paused"}
+        )
+
+    def _append_online_log(
+        self,
+        *,
+        state: Any,
+        reference: Any,
+        controller_output: Any,
+        result: Any,
+        step_timing: Mapping[str, Any],
+        termination: Mapping[str, Any] | None,
+    ) -> None:
+        """Record one detailed online-simulation step into the JSONL buffer."""
+
+        if not self._online_log_enabled():
+            return
+        log_stride = max(1, round(self.control_hz / self.options.online_log_hz))
+        if termination is None and self.episode_step % log_stride != 0:
+            return
+
+        truth_fields = (
+            "position_n", "velocity_n", "attitude_q_wb", "angular_velocity_b",
+            "linear_acceleration_n", "motor_speed", "servo_angle",
+        )
+        post_truth = dict(zip(
+            truth_fields,
+            self.simulation.state_views("truth", truth_fields),
+        ))
+        sensor_fields = self.simulation.observation_layout["sensor"]
+        post_sensor = dict(zip(
+            sensor_fields,
+            self.simulation.state_views("sensor", sensor_fields),
+        ))
+
+        def lists(values: Any) -> list[float]:
+            return values.detach().cpu().tolist()
+
+        input_values = self.input_tensor[0].detach().cpu().tolist()
+        command_values = controller_output.command.detach().cpu().tolist()[0]
+        diagnostics: dict[str, Any] = {}
+        raw_diagnostics = getattr(controller_output, "diagnostics", None)
+        if isinstance(raw_diagnostics, Mapping):
+            try:
+                from flight_controller import tensor_diagnostics_to_python
+                diagnostics = tensor_diagnostics_to_python(raw_diagnostics)
+            except Exception:
+                for key, value in raw_diagnostics.items():
+                    try:
+                        diagnostics[key] = float(value.detach().cpu().item())
+                    except Exception:
+                        diagnostics[key] = None
+
+        record: dict[str, Any] = {
+            "type": "step",
+            "session_id": self.id,
+            "episode_id": self.episode_id,
+            "step": self.episode_step,
+            "sim_time_s": float(result.sim_time_s[0].item()),
+            "monotonic_s": time.monotonic(),
+            "epoch_ms": time.time() * 1000.0,
+            "input": {
+                name: value
+                for name, value in zip(
+                    ("roll", "pitch", "yaw", "throttle"),
+                    input_values,
+                )
+            },
+            "truth": {
+                name: lists(value) for name, value in post_truth.items()
+            },
+            "sensor": {
+                name: lists(value) for name, value in post_sensor.items()
+            },
+            "reference": {
+                "target_position_n": lists(reference.target_position_n),
+                "target_velocity_n": lists(reference.target_velocity_n),
+                "target_attitude_q_wb": lists(reference.target_attitude_q_wb),
+                "target_angular_velocity_b": lists(
+                    reference.target_angular_velocity_b
+                ),
+                "collective_command": lists(reference.collective_command),
+            },
+            "controller": {
+                "backend": self.runtime_backend,
+                "command": command_values,
+                "diagnostics": diagnostics,
+            },
+            "timing_ms": {
+                "controller": step_timing.get("controller_elapsed_ns", 0) / 1e6,
+                "environment": step_timing.get("environment_elapsed_ns", 0) / 1e6,
+                "post_step": step_timing.get("post_step_finished_ns", 0) / 1e6,
+            },
+            "simenv": {
+                "valid": bool(result.valid[0].item()),
+                "error_code": int(result.error_code[0].item()),
+                "physics_step": int(result.physics_step[0].item()),
+            },
+        }
+        if termination is not None:
+            self._last_termination = dict(termination)
+            record["termination"] = dict(termination)
+
+        if self._online_log_steps == 0:
+            self._online_log_buffer.append(
+                json.dumps(
+                    {
+                        "type": "session",
+                        "session_id": self.id,
+                        "backend": self.runtime_backend,
+                        "control_hz": self.control_hz,
+                        "physics_hz": self.physics_hz,
+                        "online_log_hz": self.options.online_log_hz,
+                        "configuration": copy.deepcopy(
+                            self.effective_configuration
+                        ),
+                        "created_epoch_ms": time.time() * 1000.0,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+        self._online_log_steps += 1
+        self._online_log_buffer.append(
+            json.dumps(
+                record,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
+        if (
+            len(self._online_log_buffer) >= 256
+            or time.monotonic() - self._online_log_last_flush_at >= 1.0
+        ):
+            self._flush_online_log()
+
+    def _flush_online_log(self) -> None:
+        if not self._online_log_buffer:
+            return
+        try:
+            self.online_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.online_log_path.open("a", encoding="utf-8") as stream:
+                stream.writelines(self._online_log_buffer)
+                stream.flush()
+            self._online_log_buffer.clear()
+            self._online_log_last_flush_at = time.monotonic()
+        except OSError as error:
+            print(
+                f"[runtime {self.id}] WARNING cannot write online log "
+                f"{self.online_log_path}: {error}",
+                flush=True,
+            )
+
+    def _finalize_online_log(self) -> None:
+        """Write the final summary and close the per-session JSONL file."""
+
+        if self._online_log_finalized:
+            return
+        self._online_log_finalized = True
+        self._online_log_buffer.append(
+            json.dumps(
+                {
+                    "type": "summary",
+                    "session_id": self.id,
+                    "state": getattr(self, "_state", None),
+                    "fault": getattr(self, "_fault", None),
+                    "termination": copy.deepcopy(self._last_termination),
+                    "control_steps": self._control_steps,
+                    "episode_id": self.episode_id,
+                    "episode_step": self.episode_step,
+                    "online_log_steps": self._online_log_steps,
+                    "finalized_epoch_ms": time.time() * 1000.0,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
+        self._flush_online_log()
 
     def _reset_cpu(self) -> None:
         torch = self._torch

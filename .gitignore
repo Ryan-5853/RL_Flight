@@ -53,8 +53,10 @@ compile_commands.json
 /Identification/datasets/
 /Identification/artifacts/
 /Identification/runs/
+/Identification/outputs/
 /WebUI/runtime-runs/
 logs/
+*.log
 wandb/
 mlruns/
 tensorboard/

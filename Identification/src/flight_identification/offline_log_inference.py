@@ -414,6 +414,7 @@ def infer(args: argparse.Namespace) -> Mapping[str, Any]:
             checkpoint["mode_transform"].numpy(),
             servo_slopes,
             basis_tau,
+            upper_external=True,
         )
         value = _lqr_gain(a, b, q, r)
         radius = float(np.max(np.abs(np.linalg.eigvals(a - b @ value))))

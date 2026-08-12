@@ -1,5 +1,8 @@
 # RL Flight WebUI
 
+PX4 飞控板 HIL 后端的协议、参数和操作步骤见
+[`Docs/PX4_HIL_WEBUI_zh.md`](../Docs/PX4_HIL_WEBUI_zh.md)。
+
 轻量化飞行仿真可视化控制台。浏览器负责读取 Windows 电脑上的手柄，远程
 Python 服务负责在 CPU 上串联统一 Controller、单实例 SimEnv 和低频遥测。
 Controller 可以选择 PID、LQR、PID+LQR 混合控制器，或由部署层加载的神经网络
@@ -50,10 +53,12 @@ PID 增益。bundle 要求的 `control_hz` 与 SimEnv 不一致时会拒绝启�
 误判为动力学不兼容。
 
 交互仿真默认使用 SimEnv 的 `RealtimeSimulationEnvironment`：固定单环境 CPU
-执行、编译动力学和传感器内核，并关闭 500 Hz 热路径中的持久化日志。上传配置中的
+执行、编译动力学和传感器内核，并关闭 SimEnv 自身的 500 Hz 持久化日志。上传配置中的
 `logging.directory` 不会被交互会话采用，session status 中
-`persistent_logging=false`、`log_directory=null`。`--runtime-log-root` 仍作为服务端
-管理的兼容目录参数保留，但默认实时会话不会在其中创建时间线文件。
+`persistent_logging=false`、`log_directory=null`。服务端另写一份独立的在线详细日志：
+`WebUI/runtime-runs/runtime-<session-id>.jsonl`，默认 100 Hz 记录输入、真值/传感器、
+参考、执行器命令、时序与终止原因；缓冲后约每秒落盘，会话结束/故障时写 `summary`
+最终存盘。频率由 `runtime.online_log_hz` 配置，设为 `0` 可关闭。
 
 ## 当前能力
 
@@ -226,7 +231,8 @@ session status 还会返回：
 - `simulation_backend: simenv-realtime-single-v1`；
 - `simulation_compiled`：实时内核是否已安装编译包装；
 - `simulation_warmup_s`：创建会话时的首次编译和预热耗时；
-- `persistent_logging: false`：确认实时热路径没有磁盘日志。
+- `persistent_logging: false`：确认 SimEnv 自身的持久化日志仍关闭；服务端在线
+  详细日志独立写入 `WebUI/runtime-runs/runtime-<session-id>.jsonl`。
 
 可在目标机器上先绕过浏览器，测量完整“控制器 + SimEnv + 60 Hz 遥测打包”链路：
 

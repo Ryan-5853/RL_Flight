@@ -158,6 +158,36 @@
     return JSON.stringify([configuration.simenv.config, test]);
   }
 
+  async function ensureSession(configuration, controllerFrame = null) {
+    if (controllerFrame?.connected) {
+      latestControllerFrame = controllerFrame;
+      usingVirtualInput = false;
+    }
+    if (!latestControllerFrame?.connected) refreshVirtualInput();
+    const nextKey = configurationKey(configuration);
+    if (sessionId && sessionKey !== nextKey) await closeSession();
+    if (!sessionId) {
+      const checkpointPath = configuration.test.config.runtime?.checkpoint_path;
+      const data = await request('/api/runtime/sessions', {
+        method: 'POST',
+        body: JSON.stringify({
+          simenv_yaml: configuration.simenv.yaml,
+          test_yaml: configuration.test.yaml,
+          checkpoint_path: checkpointPath,
+          replace_existing: true
+        })
+      });
+      sessionId = data.session.session_id;
+      sessionKey = nextKey;
+      transportSequence = 0;
+      lastTelemetrySequence = -1;
+      controlInFlight.clear();
+      window.RLFlightLatency?.reset();
+    }
+    if (pendingTargetPosition) await sendPositionTarget();
+    return sessionId;
+  }
+
   async function failRuntime(error) {
     if (failurePending) return;
     failurePending = true;
@@ -173,36 +203,7 @@
     creating = true;
     setConnection('CPU CONNECT', 'ready');
     try {
-      if (controllerFrame?.connected) {
-        latestControllerFrame = controllerFrame;
-        usingVirtualInput = false;
-      }
-      if (!latestControllerFrame?.connected) {
-        refreshVirtualInput();
-      }
-      const nextKey = configurationKey(configuration);
-      if (sessionId && sessionKey !== nextKey) await closeSession();
-      if (!sessionId) {
-        const checkpointPath = configuration.test.config.runtime?.checkpoint_path;
-        const data = await request('/api/runtime/sessions', {
-          method: 'POST',
-          body: JSON.stringify({
-            simenv_yaml: configuration.simenv.yaml,
-            test_yaml: configuration.test.yaml,
-            checkpoint_path: checkpointPath,
-            // The server owns one interactive slot. Reclaim it atomically
-            // after refreshes or browser exits whose unload cleanup was lost.
-            replace_existing: true
-          })
-        });
-        sessionId = data.session.session_id;
-        sessionKey = nextKey;
-        transportSequence = 0;
-        lastTelemetrySequence = -1;
-        controlInFlight.clear();
-        window.RLFlightLatency?.reset();
-      }
-      if (pendingTargetPosition) await sendPositionTarget();
+      await ensureSession(configuration, controllerFrame);
       await sendControllerAction(singleStep ? 'step' : 'start');
       if (singleStep) {
         const data = await request(`/api/runtime/sessions/${sessionId}/telemetry?after=${lastTelemetrySequence}&timeout=1`);
@@ -582,6 +583,11 @@
     getStatus: () => sessionId ? request(`/api/runtime/sessions/${sessionId}/status`) : Promise.resolve(null),
     getClockSync: () => ({ offsetMs: clockOffsetMs, rttMs: clockSyncRttMs }),
     close: closeSession
+    ,connect: async configuration => {
+      creating = true;
+      try { return await ensureSession(configuration); }
+      finally { creating = false; }
+    }
   };
   initializeRuntimeUi();
 })();

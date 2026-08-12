@@ -11,6 +11,7 @@ from flight_controller import (
     ControllerContext,
     ControllerReference,
     ControllerState,
+    compose_external_upper_command,
     create_controller,
 )
 from simenv.config import load_and_materialize
@@ -36,6 +37,18 @@ class ControllerTests(unittest.TestCase):
             control_dt=1.0 / 500.0,
             parameters=cls.materialized.parameters,
         )
+
+    def test_external_upper_arbiter_preserves_pilot_channel(self) -> None:
+        upper = torch.tensor([[0.31], [0.77]], dtype=torch.float64)
+        controlled = torch.tensor(
+            [[0.40, -0.2, 0.1, 0.3], [0.60, 0.4, -0.5, 0.2]],
+            dtype=torch.float64,
+        )
+        command = compose_external_upper_command(upper, controlled)
+        torch.testing.assert_close(command[:, :1], upper)
+        torch.testing.assert_close(command[:, 1:], controlled)
+        with self.assertRaisesRegex(ValueError, "shape"):
+            compose_external_upper_command(upper, torch.zeros(2, 5))
 
     def state_at_trim(self, controller) -> ControllerState:
         zeros = torch.zeros(2, 3, dtype=torch.float64)

@@ -36,10 +36,10 @@ params:
       maximum_moment_n_m: [0.08, 0.08, 0.04]
   lqr:
     state_scales: [0.0872665, 0.0872665, 1.0, 1.0, 2.0, 300.0, 300.0, 0.15, 0.15, 0.15]
-    integral_state_scales: [0.05, 0.05, 0.30]
+    integral_state_scales: [0.04, 0.04, 0.25]
     # Four controlled inputs: lower_motor, servo_1, servo_2, servo_3.
     input_scales: [0.16, 0.40, 0.40, 0.40]
-    input_weight_scale: 0.05
+    input_weight_scale: 0.08
   allocation:
     input_weights: [1.5, 1.5, 1.0, 1.0, 1.0]
     damping: 1.0e-5

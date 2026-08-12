@@ -23,6 +23,7 @@ from .lqi_gru_distillation import StudentStepState, load_student, step_student, 
 from .lqi_gru_experiment import (
     ACTION_NAMES,
     OBSERVATION_NAMES,
+    _action_names,
     _oracle_gains,
     _raw_config,
     _node,
@@ -159,6 +160,7 @@ def _save_dagger_shard(
     lqi_gains: torch.Tensor,
     label_names: tuple[str, ...],
     observation_names: Sequence[str],
+    action_names: Sequence[str] = ACTION_NAMES,
 ) -> dict[str, int]:
     counts: dict[str, int] = {}
     for split_index, split_name in enumerate(("train", "validation")):
@@ -178,7 +180,7 @@ def _save_dagger_shard(
                 "oracle_lqi_gain_audit_only": lqi_gains[selected].contiguous(),
                 "group_id": group_ids[selected].contiguous(),
                 "observation_names": tuple(observation_names),
-                "action_names": ACTION_NAMES,
+                "action_names": tuple(action_names),
                 "label_names": label_names,
                 "leakage_contract": "audit tensors are never student inputs",
                 "dagger_iteration": dagger_iteration,
@@ -216,10 +218,10 @@ def generate_dagger_shards(
         ControllerContext,
         ControllerReference,
         ControllerState,
+        compose_external_upper_command,
         create_controller,
         load_controller_config,
     )
-    from flight_train.commands import VirtualPilotCommandSource
     from flight_train.config import _virtual_pilot
     from simenv import SimulationEnvironment
     from simenv.config import load_and_materialize
@@ -278,6 +280,13 @@ def generate_dagger_shards(
     dtype = torch.float32 if config.dtype == "float32" else torch.float64
     nominal = load_and_materialize(config.simulator_config, 1, device, dtype)
     controller_config = dict(load_controller_config(config.controller_config))
+    collective_mode = str(
+        _node(controller_config, "params").get("collective_mode", "hover")
+    )
+    if collective_mode not in {"manual", "external_upper"}:
+        raise ValueError("DAgger requires manual or external_upper collective mode")
+    external_upper = collective_mode == "external_upper"
+    action_names = _action_names(controller_config)
     nominal_parameters = _expand_mapping(nominal.parameters, batch_size)
     actual_parameters = _apply_effectiveness_labels(
         nominal_parameters, episode_labels.to(device), config.parameterization
@@ -311,23 +320,36 @@ def generate_dagger_shards(
         materialized, batch_size, device, dtype, logging_enabled=False
     )
     try:
-        oracle = create_controller(
-            controller_config,
-            ControllerContext(
-                batch_size=batch_size,
-                device=device,
-                dtype=dtype,
-                control_dt=1.0 / config.control_hz,
-                parameters=actual_parameters,
-            ),
+        oracle_context = ControllerContext(
+            batch_size=batch_size,
+            device=device,
+            dtype=dtype,
+            control_dt=1.0 / config.control_hz,
+            parameters=actual_parameters,
         )
-        oracle.schedule_lqr_gain(episode_gains)
+        if external_upper:
+            from .external_collective_lqi import ExternalCollectiveLQIController
+
+            oracle = ExternalCollectiveLQIController(
+                oracle_context,
+                config.controller_config,
+                config.simulator_config,
+                episode_gains,
+                "nonlinear",
+            )
+        else:
+            oracle = create_controller(controller_config, oracle_context)
+            oracle.schedule_lqr_gain(episode_gains)
         _set_initial_observation_state(
             environment, oracle.trim.motor_speed, initial_state["angular_velocity_b"]
         )
 
         student, checkpoint = load_student(checkpoint_path, device)
         student.eval()
+        if tuple(checkpoint["action_names"]) != tuple(action_names):
+            raise ValueError(
+                "student action schema does not match the controller ownership contract"
+            )
         mean = checkpoint["normalization"]["mean"].to(device)
         std = checkpoint["normalization"]["std"].to(device)
         full_name_to_index = {
@@ -350,8 +372,10 @@ def generate_dagger_shards(
         ).reshape(1, 5).expand(batch_size, -1).clone()
 
         pilot_config = _virtual_pilot(_node(raw, "command_source"))
-        pilot = VirtualPilotCommandSource(
-            pilot_config, batch_size, device, dtype, config.control_hz
+        from .external_pilot import make_external_pilot
+
+        pilot = make_external_pilot(
+            pilot_config, raw, batch_size, device, dtype, config.control_hz
         )
         pilot.generator.manual_seed(seed + 1)
         active = torch.ones(batch_size, device=device, dtype=torch.bool)
@@ -364,7 +388,7 @@ def generate_dagger_shards(
             batch_size, stored_steps, observation_width, device=device, dtype=dtype
         )
         teacher_actions = torch.zeros(
-            batch_size, stored_steps, len(ACTION_NAMES), device=device, dtype=dtype
+            batch_size, stored_steps, len(action_names), device=device, dtype=dtype
         )
         valid_mask = torch.zeros(batch_size, stored_steps, device=device, dtype=torch.bool)
         survival_steps = torch.zeros(batch_size, device=device, dtype=torch.int64)
@@ -402,7 +426,17 @@ def generate_dagger_shards(
                 motor_speed=truth["motor_speed"],
                 servo_angle=truth["servo_angle"],
             )
-            oracle_output = oracle.step(state, reference, active)
+            oracle_action = (
+                oracle.step(
+                    state,
+                    reference,
+                    command_snapshot.upper_throttle,
+                    active,
+                    update_observer=False,
+                )
+                if external_upper
+                else oracle.step(state, reference, active).command
+            )
             student_observation = torch.cat(
                 (
                     attitude_estimate,
@@ -431,10 +465,21 @@ def generate_dagger_shards(
                     torch.zeros_like(student_observation),
                 )
             )
-            teacher_actions[:, step].copy_(oracle_output.command)
+            teacher_actions[:, step].copy_(oracle_action)
             valid_mask[:, step].copy_(active)
-            previous_command = student_command
-            result = environment.advance(student_command, active)
+            applied_command = (
+                compose_external_upper_command(
+                    command_snapshot.upper_throttle, student_command
+                )
+                if external_upper
+                else student_command
+            )
+            if external_upper:
+                oracle.observe_applied_command(
+                    command_snapshot.upper_throttle, student_command
+                )
+            previous_command = applied_command
+            result = environment.advance(applied_command, active)
             next_truth = environment.observe("truth").values
             tilt = torch.acos(
                 (2.0 * truth["attitude_q_wb"][:, 0].square()
@@ -460,6 +505,7 @@ def generate_dagger_shards(
             episode_gains.cpu(),
             label_names,
             checkpoint_names,
+            action_names,
         )
         totals = {
             "iteration": shard_index,
@@ -501,6 +547,8 @@ def run_dagger_iterations(
     gate_duration_s: float,
     gate_groups: int,
     start_iteration: int = 0,
+    initial_checkpoint: Path | None = None,
+    update_epochs: int | None = None,
 ) -> Mapping[str, Any]:
     """Train -> DAgger-rollout -> closed-loop gate loop."""
 
@@ -519,6 +567,11 @@ def run_dagger_iterations(
     else:
         prepare_dagger_dataset(base_dataset, merged, observation_names)
     results: list[Mapping[str, Any]] = []
+    previous_checkpoint = initial_checkpoint
+    if previous_checkpoint is None and start_iteration > 0:
+        candidate = output_root / "students" / f"iter_{start_iteration - 1:02d}" / "student.pt"
+        if candidate.exists():
+            previous_checkpoint = candidate
     for iteration in range(start_iteration, iterations):
         student_dir = output_root / "students" / f"iter_{iteration:02d}"
         if student_dir.exists() and any(student_dir.iterdir()):
@@ -528,12 +581,18 @@ def run_dagger_iterations(
                 "resumed_existing": True,
             }
         else:
+            iteration_epochs = (
+                epochs
+                if iteration == 0 and previous_checkpoint is None
+                else (update_epochs or epochs)
+            )
             train_result = train(
                 merged,
                 config_path,
                 student_dir,
                 device,
-                epochs_override=epochs,
+                epochs_override=iteration_epochs,
+                resume_checkpoint=previous_checkpoint,
                 exclude_previous_command=exclude_previous_command,
                 arch=arch,
                 context_steps=context_steps,
@@ -541,6 +600,7 @@ def run_dagger_iterations(
                 previous_command_reset_prob=previous_command_reset_prob,
             )
             checkpoint = Path(train_result["checkpoint"])
+        previous_checkpoint = checkpoint
         if iteration in _shard_iterations(merged, "train"):
             rollout = {"skipped_existing": True, "iteration": iteration}
         else:
@@ -584,6 +644,11 @@ def run_dagger_iterations(
             },
             "gate_report": str(gate_output),
             "checkpoint": str(checkpoint),
+            "parent_checkpoint": (
+                None
+                if train_result.get("parent_checkpoint") is None
+                else train_result.get("parent_checkpoint")
+            ),
         }
         results.append(entry)
         summary_path = output_root / "dagger_summary.json"
@@ -605,7 +670,58 @@ def run_dagger_iterations(
             encoding="utf-8",
         )
         print(json.dumps(entry, indent=2, sort_keys=True))
-    return {"arch": arch, "iterations": results}
+    # The last rollout is newly aggregated data. Fit one final student after
+    # the loop so the deployable checkpoint has actually seen every DAgger
+    # shard (iteration checkpoints intentionally precede their own rollout).
+    final_dir = output_root / "students" / "final"
+    if final_dir.exists() and any(final_dir.iterdir()):
+        final_checkpoint = final_dir / "student.pt"
+        final_train = {
+            "checkpoint": str(final_checkpoint),
+            "resumed_existing": True,
+        }
+    else:
+        final_train = train(
+            merged,
+            config_path,
+            final_dir,
+            device,
+            epochs_override=update_epochs or epochs,
+            resume_checkpoint=previous_checkpoint,
+            exclude_previous_command=exclude_previous_command,
+            arch=arch,
+            context_steps=context_steps,
+            previous_command_noise_std=previous_command_noise_std,
+            previous_command_reset_prob=previous_command_reset_prob,
+        )
+        final_checkpoint = Path(final_train["checkpoint"])
+    final_gate_path = output_root / "gates" / "gate_final.json"
+    final_gate = evaluate_closed_loop(
+        merged,
+        config_path,
+        final_checkpoint,
+        final_gate_path,
+        device,
+        maximum_groups=gate_groups,
+        trials=gate_trials,
+        duration_s=gate_duration_s,
+        seed=seed + 100_007,
+        pilot_height_mode="fixed_target",
+        split="validation",
+        variants=("oracle_lqi", "nominal_lqi", "gru", "gru_reset"),
+    )
+    summary = {
+        "arch": arch,
+        "iterations": results,
+        "final_train": final_train,
+        "final_checkpoint": str(final_checkpoint),
+        "final_gate": str(final_gate_path),
+        "final_gate_summary": final_gate["variants"],
+    }
+    (output_root / "dagger_summary.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    return summary
 
 
 def main() -> None:
@@ -639,6 +755,12 @@ def main() -> None:
     parser.add_argument("--gate-duration-s", type=float, default=6.0)
     parser.add_argument("--gate-groups", type=int, default=24)
     parser.add_argument("--start-iteration", type=int, default=0)
+    parser.add_argument("--initial-checkpoint")
+    parser.add_argument(
+        "--update-epochs",
+        type=int,
+        help="epochs for warm-started DAgger iterations and the final fit",
+    )
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
@@ -700,6 +822,10 @@ def main() -> None:
         args.gate_duration_s,
         args.gate_groups,
         args.start_iteration,
+        None
+        if args.initial_checkpoint is None
+        else Path(args.initial_checkpoint).resolve(),
+        args.update_epochs,
     )
     print(json.dumps(summary, indent=2, sort_keys=True))
 

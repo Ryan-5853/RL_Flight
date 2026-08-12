@@ -5,12 +5,15 @@
   const field = (config, path, label, value, unit = '', type = 'number', extra = {}) => ({ config, path, label, value, unit, type, ...extra });
   const sim = (path, label, value, unit = '', type = 'number', extra = {}) => field('simenv', path, label, value, unit, type, extra);
   const test = (path, label, value, unit = '', type = 'number', extra = {}) => field('test', path, label, value, unit, type, extra);
-  const defaultMotorTable = [[0, 0], [0.08, 0], [0.5, 900], [1, 1800]];
+  const defaultMotorTable = [
+    [0, 0], [0.08, 0], [0.3, 873.1], [0.5, 1187.6],
+    [0.7, 1499.7], [0.9, 1757.1], [1, 1800]
+  ];
   const defaultServoTable = [[-1, -0.35], [0, 0], [1, 0.35]];
   const defaultGridGeometry = [
-    [[0.10, 0, 0.25], [1, 0, 0]],
-    [[-0.05, 0.087, 0.25], [-0.5, 0.8660254, 0]],
-    [[-0.05, -0.087, 0.25], [-0.5, -0.8660254, 0]]
+    [[-0.05, 0, 0.05], [-1, 0, 0]],
+    [[0.025, 0.04330127, 0.05], [0.5, 0.8660254, 0]],
+    [[0.025, -0.04330127, 0.05], [0.5, -0.8660254, 0]]
   ];
 
   const sections = [
@@ -22,16 +25,16 @@
         sim('timing.control_hz.value', '控制器频率', 500, 'Hz', 'integer'),
         sim('initial_state.position_n.value', '初始位置 NED', [0, 0, 0], 'm', 'vector'),
         sim('initial_state.velocity_n.value', '初始速度 NED', [0, 0, 0], 'm/s', 'vector'),
-        sim('initial_state.attitude_q_wb.value', '初始姿态四元数', [0.99619693, 0.06966088, -0.05220847, 0.00365077], '', 'vector'),
-        sim('initial_state.angular_velocity_b.value', '初始机体系角速度', [0.05, -0.04, 0], 'rad/s', 'vector')
+        sim('initial_state.attitude_q_wb.value', '初始姿态四元数', [1, 0, 0, 0], '', 'vector'),
+        sim('initial_state.angular_velocity_b.value', '初始机体系角速度', [0, 0, 0], 'rad/s', 'vector')
       ]
     },
     {
       title: '机体参数', subtitle: 'SIMENV / BODY', open: true,
       fields: [
-        sim('body.mass.value', '整机质量', 2.4, 'kg'),
-        sim('body.center_of_mass_b.value', '质心 FRD [x前 y右 z下+]', [0, 0, 0.08], 'm', 'vector'),
-        sim('body.inertia_diagonal_b.value', '三轴转动惯量', [0.030, 0.028, 0.012], 'kg·m²', 'vector'),
+        sim('body.mass.value', '整机质量', 0.5, 'kg'),
+        sim('body.center_of_mass_b.value', '质心 FRD [x前 y右 z下+]', [0, 0, 0], 'm', 'vector'),
+        sim('body.inertia_diagonal_b.value', '三轴转动惯量', [0.00075, 0.00075, 0.00110], 'kg·m²', 'vector'),
         sim('body.mass.randomization.distribution', '质量随机分布', 'normal', '', 'select', { options: ['none', 'normal', 'uniform'] }),
         sim('body.mass.randomization.mode', '质量随机模式', 'relative', '', 'select', { options: ['relative', 'absolute'] }),
         sim('body.mass.randomization.mean', '质量随机均值', 0),
@@ -44,8 +47,8 @@
       fields: [
         sim(`motors.${index}.pwm_deadzone.value`, 'PWM 死区', 0.08),
         sim(`motors.${index}.pwm_to_rpm_table.value`, 'PWM—转速表', defaultMotorTable, 'rad/s', 'matrix'),
-        sim(`motors.${index}.time_constant.value`, '一阶时间常数', index ? 0.050 : 0.030, 's'),
-        sim(`motors.${index}.torque_coefficient.value`, '反扭矩系数', index ? 1.10e-7 : 9.8765432e-8, 'N·m/(rad/s)²'),
+        sim(`motors.${index}.time_constant.value`, '一阶时间常数', index ? 0.050 : 0.040, 's'),
+        sim(`motors.${index}.torque_coefficient.value`, '反扭矩系数', 2.30e-8, 'N·m/(rad/s)²'),
         sim(`motors.${index}.noise.distribution`, '转速噪声分布', 'normal', '', 'select', { options: ['normal'] }),
         sim(`motors.${index}.noise.stddev.value`, '转速噪声标准差', 5, 'rad/s')
       ]
@@ -54,23 +57,23 @@
       title: '三路舵机', subtitle: 'SIMENV / SERVOS',
       fields: [0, 1, 2].flatMap(index => [
         sim(`servos.${index}.pwm_angle_table.value`, `舵机 ${index + 1} PWM—角度表`, defaultServoTable, 'rad', 'matrix'),
-        sim(`servos.${index}.tau.value`, `舵机 ${index + 1} 时间常数`, 0.020, 's'),
-        sim(`servos.${index}.max_speed.value`, `舵机 ${index + 1} 最大速度`, 8.0, 'rad/s'),
-        sim(`servos.${index}.backlash.value`, `舵机 ${index + 1} 回差`, 0.010, 'rad'),
+        sim(`servos.${index}.tau.value`, `舵机 ${index + 1} 时间常数`, 0.030, 's'),
+        sim(`servos.${index}.max_speed.value`, `舵机 ${index + 1} 最大速度`, 11.6355, 'rad/s'),
+        sim(`servos.${index}.backlash.value`, `舵机 ${index + 1} 回差`, 0.008, 'rad'),
         sim(`servos.${index}.deadzone.value`, `舵机 ${index + 1} 死区`, 0.015)
       ])
     },
     {
       title: '推力与气动分配', subtitle: 'SIMENV / AERODYNAMICS',
       fields: [
-        sim('aerodynamics.thrust_coefficients.value', '总推力系数 [k1,k2,k3]', [4e-6, 4e-6, 2e-6], 'N/(rad/s)²', 'vector'),
+        sim('aerodynamics.thrust_coefficients.value', '总推力系数 [k1,k2,k3]', [2.5736e-6, 2.5736e-6, 1.2868e-6], 'N/(rad/s)²', 'vector'),
         sim('aerodynamics.neutral_thrust_direction_b.value', '中立推力方向 FRD', [0, 0, -1], '', 'vector'),
-        sim('aerodynamics.direct_thrust_center_b.value', '直接推力作用点 FRD', [0, 0, 0.20], 'm', 'vector'),
-        sim('aerodynamics.thrust_partition.direct.value', '直接推力占比', 0.40),
-        sim('aerodynamics.thrust_partition.grid_1.value', '格栅 1 推力占比', 0.20),
-        sim('aerodynamics.thrust_partition.grid_2.value', '格栅 2 推力占比', 0.20),
-        sim('aerodynamics.thrust_partition.grid_3.value', '格栅 3 推力占比', 0.20),
-        sim('aerodynamics.coupling_attenuation.value', '格栅耦合衰减矩阵', [[0, 0.1, 0.1], [0.1, 0, 0.1], [0.1, 0.1, 0]], '', 'matrix')
+        sim('aerodynamics.direct_thrust_center_b.value', '直接推力作用点 FRD', [0, 0, 0], 'm', 'vector'),
+        sim('aerodynamics.thrust_partition.direct.value', '直接推力占比', 0.65),
+        sim('aerodynamics.thrust_partition.grid_1.value', '格栅 1 推力占比', 0.1166666667),
+        sim('aerodynamics.thrust_partition.grid_2.value', '格栅 2 推力占比', 0.1166666667),
+        sim('aerodynamics.thrust_partition.grid_3.value', '格栅 3 推力占比', 0.1166666666),
+        sim('aerodynamics.coupling_attenuation.value', '格栅耦合衰减矩阵', [[0, 0.15, 0.15], [0.15, 0, 0.15], [0.15, 0.15, 0]], '', 'matrix')
       ]
     },
     {
@@ -88,9 +91,9 @@
     {
       title: '传感器', subtitle: 'SIMENV / SENSORS',
       fields: [
-        ['gyro', '陀螺仪', [0.002, 0.002, 0.002], [0, 0, 0], 0.001],
-        ['accelerometer', '加速度计', [0.02, 0.02, 0.02], [0, 0, 0], 0.001],
-        ['motor_speed', '电机转速', [2, 2], [0, 0], 0]
+        ['gyro', '陀螺仪', [0.003, 0.003, 0.003], [0, 0, 0], 0.002],
+        ['accelerometer', '加速度计', [0.03, 0.03, 0.03], [0, 0, 0], 0.002],
+        ['motor_speed', '电机转速', [3, 3], [0, 0], 0]
       ].flatMap(([key, label, noise, bias, delay]) => [
         sim(`sensors.${key}.sample_hz.value`, `${label}采样率`, 500, 'Hz', 'integer'),
         sim(`sensors.${key}.noise.distribution`, `${label}噪声分布`, 'normal', '', 'select', { options: ['normal'] }),
@@ -115,12 +118,24 @@
         test('run.device', '运行设备', 'cpu', '', 'select', { options: ['cpu'] }),
         test('run.dtype', '张量类型', 'float32', '', 'select', { options: ['float32', 'float64'] }),
         test('environment.observation_source', '观测来源', 'truth', '', 'select', { options: ['truth', 'sensor'] }),
+        test('runtime.backend', '控制器运行后端', 'cpu', '', 'select', { options: ['cpu', 'px4_hil'] }),
+        test('runtime.hil.connection', 'PX4 HIL 连接', '/dev/ttyACM0', '', 'text'),
+        test('runtime.hil.baud', 'PX4 HIL 串口波特率', 2000000, 'baud', 'integer'),
+        test('runtime.hil.heartbeat_timeout_s', 'PX4 心跳超时', 5, 's'),
+        test('runtime.hil.startup_timeout_s', 'PX4 首帧启动超时', 5, 's'),
+        test('runtime.hil.actuator_timeout_ms', '执行器帧超时', 50, 'ms'),
+        test('runtime.hil.pilot_timeout_ms', 'HIL 飞手输入超时', 250, 'ms'),
+        test('runtime.hil.auto_start_px4', '自动配置并启动 PX4 HIL', true, '', 'boolean'),
+        test('runtime.hil.px4_mavlink_device', 'PX4 侧 MAVLink 设备', '/dev/ttyACM0', '', 'text'),
+        test('runtime.hil.pilot_source', 'HIL 飞手输入源', 'webui', '', 'select', { options: ['webui', 'rc'] }),
+        test('runtime.hil.auto_arm', '启动时自动解锁（仅 HIL）', true, '', 'boolean'),
         test('runtime.checkpoint_path', '推理包路径（服务器）', '', '', 'select', { options: [''] }),
         test('runtime.compile_kernels', '编译实时仿真内核', true, '', 'boolean'),
         test('runtime.warmup_steps', '实时内核预热步数', 3, '', 'integer'),
         test('runtime.spin_us', '截止时间自旋窗口', 200, 'μs'),
         test('runtime.execution_hz', '墙钟执行频率', 500, 'Hz'),
         test('runtime.telemetry_hz', '前端遥测频率', 60, 'Hz'),
+        test('runtime.online_log_hz', '在线详细日志频率（0=关闭）', 100, 'Hz'),
         test('runtime.command_timeout_ms', '手柄失联安全切换', 5000, 'ms'),
         test('runtime.cpu_threads', 'CPU 推理线程数', 1, '', 'integer'),
         test('model.type', '控制器模型', 'gru_actor_critic', '', 'select', { options: ['gru_actor_critic', 'mlp_actor_critic'] }),
@@ -156,20 +171,20 @@
       title: '控制器辨识模型', subtitle: 'CONTROLLER / IDENTIFIED PLANT', syncAction: true,
       fields: [
         test('controller.params.model_parameters.source', '参数来源', 'manual', '', 'select', { options: ['manual', 'synchronized'] }),
-        test('controller.params.model_parameters.manual.body.mass', '辨识质量', 2.4, 'kg'),
-        test('controller.params.model_parameters.manual.body.center_of_mass_b', '辨识质心 FRD', [0, 0, 0.08], 'm', 'vector'),
-        test('controller.params.model_parameters.manual.body.inertia_diagonal_b', '辨识三轴惯量', [0.030, 0.028, 0.012], 'kg·m²', 'vector'),
-        test('controller.params.model_parameters.manual.motors.time_constant', '辨识电机时间常数 [上,下]', [0.030, 0.050], 's', 'vector'),
-        test('controller.params.model_parameters.manual.motors.torque_coefficient', '辨识电机反扭矩系数 [上,下]', [9.8765432e-8, 1.10e-7], 'N·m/(rad/s)²', 'vector'),
+        test('controller.params.model_parameters.manual.body.mass', '辨识质量', 0.5, 'kg'),
+        test('controller.params.model_parameters.manual.body.center_of_mass_b', '辨识质心 FRD', [0, 0, 0], 'm', 'vector'),
+        test('controller.params.model_parameters.manual.body.inertia_diagonal_b', '辨识三轴惯量', [0.00075, 0.00075, 0.00110], 'kg·m²', 'vector'),
+        test('controller.params.model_parameters.manual.motors.time_constant', '辨识电机时间常数 [上,下]', [0.040, 0.050], 's', 'vector'),
+        test('controller.params.model_parameters.manual.motors.torque_coefficient', '辨识电机反扭矩系数 [上,下]', [2.30e-8, 2.30e-8], 'N·m/(rad/s)²', 'vector'),
         test('controller.params.model_parameters.manual.motors.upper_pwm_to_rpm_table', '辨识上桨 PWM—转速表', defaultMotorTable, 'rad/s', 'matrix'),
         test('controller.params.model_parameters.manual.motors.lower_pwm_to_rpm_table', '辨识下桨 PWM—转速表', defaultMotorTable, 'rad/s', 'matrix'),
-        test('controller.params.model_parameters.manual.servos.tau', '辨识舵机时间常数', [0.020, 0.020, 0.020], 's', 'vector'),
+        test('controller.params.model_parameters.manual.servos.tau', '辨识舵机时间常数', [0.030, 0.030, 0.030], 's', 'vector'),
         ...[1, 2, 3].map(index => test(`controller.params.model_parameters.manual.servos.servo_${index}_pwm_angle_table`, `辨识舵机 ${index} PWM—角度表`, defaultServoTable, 'rad', 'matrix')),
-        test('controller.params.model_parameters.manual.aerodynamics.thrust_coefficients', '辨识总推力系数 [k1,k2,k3]', [4e-6, 4e-6, 2e-6], 'N/(rad/s)²', 'vector'),
+        test('controller.params.model_parameters.manual.aerodynamics.thrust_coefficients', '辨识总推力系数 [k1,k2,k3]', [2.5736e-6, 2.5736e-6, 1.2868e-6], 'N/(rad/s)²', 'vector'),
         test('controller.params.model_parameters.manual.aerodynamics.neutral_thrust_direction_b', '辨识中立推力方向 FRD', [0, 0, -1], '', 'vector'),
-        test('controller.params.model_parameters.manual.aerodynamics.direct_thrust_center_b', '辨识直接推力作用点 FRD', [0, 0, 0.20], 'm', 'vector'),
-        test('controller.params.model_parameters.manual.aerodynamics.thrust_partition', '辨识推力占比 [直接,格栅1,2,3]', [0.40, 0.20, 0.20, 0.20], '', 'vector'),
-        test('controller.params.model_parameters.manual.aerodynamics.coupling_attenuation', '辨识格栅耦合衰减矩阵', [[0, 0.1, 0.1], [0.1, 0, 0.1], [0.1, 0.1, 0]], '', 'matrix'),
+        test('controller.params.model_parameters.manual.aerodynamics.direct_thrust_center_b', '辨识直接推力作用点 FRD', [0, 0, 0], 'm', 'vector'),
+        test('controller.params.model_parameters.manual.aerodynamics.thrust_partition', '辨识推力占比 [直接,格栅1,2,3]', [0.65, 0.1166666667, 0.1166666667, 0.1166666666], '', 'vector'),
+        test('controller.params.model_parameters.manual.aerodynamics.coupling_attenuation', '辨识格栅耦合衰减矩阵', [[0, 0.15, 0.15], [0.15, 0, 0.15], [0.15, 0.15, 0]], '', 'matrix'),
         test('controller.params.model_parameters.manual.aerodynamics.grids.aerodynamic_center_b', '辨识三格栅气动中心', defaultGridGeometry.map(item => item[0]), 'm', 'matrix'),
         test('controller.params.model_parameters.manual.aerodynamics.grids.deflection_axis_b', '辨识三格栅偏转轴', defaultGridGeometry.map(item => item[1]), '', 'matrix'),
         ...[1, 2, 3].map(index => test(`controller.params.model_parameters.manual.aerodynamics.grids.grid_${index}_self_attenuation_curve`, `辨识格栅 ${index} 自衰减曲线`, [[0, 1], [0.35, 0.85]], '', 'matrix')),
@@ -567,7 +582,10 @@
     if (testConfig.controller.params.flight_mode === 'position' && testConfig.controller.params.collective_mode !== 'hover') {
       throw new Error('position 位置模式要求总推力模式为 hover。');
     }
-    if (testConfig.controller.type === 'neural' && !String(testConfig.runtime.checkpoint_path || '').trim()) {
+    if (testConfig.runtime.backend === 'px4_hil' && !String(testConfig.runtime.hil.connection || '').trim()) {
+      throw new Error('PX4 HIL 后端必须配置串口或 UDP 连接。');
+    }
+    if (testConfig.runtime.backend === 'cpu' && testConfig.controller.type === 'neural' && !String(testConfig.runtime.checkpoint_path || '').trim()) {
       throw new Error('神经网络控制器必须选择服务器部署推理包。');
     }
     document.querySelectorAll('[data-config]').forEach(input => {

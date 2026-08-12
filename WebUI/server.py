@@ -170,7 +170,7 @@ class WebUIHandler(SimpleHTTPRequestHandler):
         }:
             self._rollout_create()
             return
-        runtime_match = re.fullmatch(r"/api/runtime/sessions/([0-9a-f-]+)/(control|start|pause|step|reset|target|close)", parsed.path)
+        runtime_match = re.fullmatch(r"/api/runtime/sessions/([0-9a-f-]+)/(control|start|pause|step|reset|target|terminal|close)", parsed.path)
         if runtime_match:
             self._runtime_post(
                 runtime_match.group(1),
@@ -376,11 +376,15 @@ class WebUIHandler(SimpleHTTPRequestHandler):
             if not isinstance(controller, Mapping):
                 raise ValueError("controller must be a mapping")
             controller_type = str(controller.get("type", "neural"))
+            runtime = parsed_test.get("runtime", {})
+            if not isinstance(runtime, Mapping):
+                raise ValueError("runtime must be a mapping")
+            runtime_backend = str(runtime.get("backend", "cpu"))
             replace_existing = body.get("replace_existing", False)
             if not isinstance(replace_existing, bool):
                 raise ValueError("replace_existing must be a boolean")
             checkpoint: Path | None = None
-            if controller_type == "neural":
+            if controller_type == "neural" and runtime_backend == "cpu":
                 checkpoint = self._resolve_inference_package(
                     str(body.get("checkpoint_path", ""))
                 )
@@ -641,6 +645,11 @@ class WebUIHandler(SimpleHTTPRequestHandler):
                 session.update_target_position(
                     body.get("target_position_n")
                 )
+            elif action == "terminal":
+                body = self._request_json(8 * 1024)
+                output = session.terminal_command(str(body.get("command", "")))
+                self._json({"output": output})
+                return
             if action in {"start", "step"}:
                 # Start/step already accepted the input atomically. Respond
                 # before any status serialization so the browser can begin its

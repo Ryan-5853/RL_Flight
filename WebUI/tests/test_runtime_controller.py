@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import tempfile
 import time
 import unittest
@@ -872,6 +873,24 @@ class RuntimeControllerIntegrationTests(unittest.TestCase):
                 session.pause()
             finally:
                 session.close()
+            online_log = Path(log_root) / f"runtime-{session.id}.jsonl"
+            self.assertTrue(online_log.exists())
+            records = [
+                json.loads(line)
+                for line in online_log.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(records[0]["type"], "session")
+            self.assertIn("step", {record["type"] for record in records})
+            self.assertEqual(records[-1]["type"], "summary")
+            step_record = next(
+                record for record in records if record["type"] == "step"
+            )
+            self.assertIn("truth", step_record)
+            self.assertIn("controller", step_record)
+            self.assertEqual(
+                len(step_record["controller"]["command"]), 5
+            )
 
     def test_manual_controller_model_is_independent_from_simulation_parameters(
         self,

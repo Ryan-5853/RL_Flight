@@ -302,6 +302,11 @@ def train(args: argparse.Namespace) -> Mapping[str, Any]:
         ),
         batch_size=args.batch_size,
     )
+    micro_batch_size = (
+        args.batch_size if args.micro_batch_size is None else args.micro_batch_size
+    )
+    if micro_batch_size <= 0 or micro_batch_size > args.batch_size:
+        raise ValueError("micro-batch-size must be in [1, batch-size]")
     loss_function = nn.HuberLoss(delta=1.0)
     if (
         args.direct_response_loss_weight < 0.0
@@ -321,48 +326,53 @@ def train(args: argparse.Namespace) -> Mapping[str, Any]:
         model.train()
         train_sum = 0.0
         for batch_histories, batch_labels, available in train_loader:
-            batch_histories = batch_histories.to(device)
-            batch_labels = batch_labels.to(device)
-            available = available.to(device)
-            trial_mask = _random_trial_mask(available)
             optimizer.zero_grad(set_to_none=True)
-            loss = _supervised_loss(
-                model(batch_histories, trial_mask),
-                batch_labels,
-                label_mean_device,
-                label_std_device,
-                args.target_representation,
-                len(adaptive_mode_indices),
-                float(np.mean(command_slopes[2:])),
-                args.direct_response_loss_weight,
-                args.projected_response_loss_weight,
-                loss_function,
-            )
-            loss.backward()
+            effective_batch_size = len(batch_histories)
+            for start in range(0, effective_batch_size, micro_batch_size):
+                stop = min(start + micro_batch_size, effective_batch_size)
+                micro_histories = batch_histories[start:stop].to(device)
+                micro_labels = batch_labels[start:stop].to(device)
+                micro_available = available[start:stop].to(device)
+                trial_mask = _random_trial_mask(micro_available)
+                loss = _supervised_loss(
+                    model(micro_histories, trial_mask),
+                    micro_labels,
+                    label_mean_device,
+                    label_std_device,
+                    args.target_representation,
+                    len(adaptive_mode_indices),
+                    float(np.mean(command_slopes[2:])),
+                    args.direct_response_loss_weight,
+                    args.projected_response_loss_weight,
+                    loss_function,
+                )
+                (loss * ((stop - start) / effective_batch_size)).backward()
+                train_sum += float(loss.detach()) * (stop - start)
             nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             optimizer.step()
-            train_sum += float(loss.detach()) * len(batch_histories)
         model.eval()
         validation_sum = 0.0
         with torch.no_grad():
             for batch_histories, batch_labels, available in validation_loader:
-                batch_histories = batch_histories.to(device)
-                batch_labels = batch_labels.to(device)
-                available = available.to(device)
-                validation_sum += float(
-                    _supervised_loss(
-                        model(batch_histories, available),
-                        batch_labels,
-                        label_mean_device,
-                        label_std_device,
-                        args.target_representation,
-                        len(adaptive_mode_indices),
-                        float(np.mean(command_slopes[2:])),
-                        args.direct_response_loss_weight,
-                        args.projected_response_loss_weight,
-                        loss_function,
-                    )
-                ) * len(batch_histories)
+                for start in range(0, len(batch_histories), micro_batch_size):
+                    stop = min(start + micro_batch_size, len(batch_histories))
+                    micro_histories = batch_histories[start:stop].to(device)
+                    micro_labels = batch_labels[start:stop].to(device)
+                    micro_available = available[start:stop].to(device)
+                    validation_sum += float(
+                        _supervised_loss(
+                            model(micro_histories, micro_available),
+                            micro_labels,
+                            label_mean_device,
+                            label_std_device,
+                            args.target_representation,
+                            len(adaptive_mode_indices),
+                            float(np.mean(command_slopes[2:])),
+                            args.direct_response_loss_weight,
+                            args.projected_response_loss_weight,
+                            loss_function,
+                        )
+                    ) * (stop - start)
         train_loss = train_sum / len(histories["train"])
         validation_loss = validation_sum / len(histories["validation"])
         scheduler.step(validation_loss)
@@ -399,7 +409,7 @@ def train(args: argparse.Namespace) -> Mapping[str, Any]:
                 histories[split_name],
                 split["trial_mask"],
                 device,
-                args.batch_size,
+                micro_batch_size,
                 trial_count,
             )
             prediction = (
@@ -432,6 +442,8 @@ def train(args: argparse.Namespace) -> Mapping[str, Any]:
         "trial_hidden_sizes": trial_hidden,
         "head_hidden_sizes": head_hidden,
         "architecture": args.architecture,
+        "batch_size": args.batch_size,
+        "micro_batch_size": micro_batch_size,
         "temporal_channels": temporal_channels,
         "recurrent_hidden_size": args.recurrent_hidden_size,
         "recurrent_layers": args.recurrent_layers,
@@ -540,6 +552,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--direct-response-loss-weight", type=float, default=1.0)
     parser.add_argument("--projected-response-loss-weight", type=float, default=0.0)
     parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument(
+        "--micro-batch-size",
+        type=int,
+        help="GPU micro-batch size; gradients still accumulate over --batch-size",
+    )
     parser.add_argument("--epochs", type=int, default=240)
     parser.add_argument("--patience", type=int, default=35)
     parser.add_argument("--learning-rate", type=float, default=3e-4)

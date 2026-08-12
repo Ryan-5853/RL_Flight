@@ -15,9 +15,10 @@
 
 上层总体方案见 [`../Docs/目标：使用循环神经网络替代传统飞控中的controller+alloc.txt`](../Docs/%E7%9B%AE%E6%A0%87%EF%BC%9A%E4%BD%BF%E7%94%A8%E5%BE%AA%E7%8E%AF%E7%A5%9E%E7%BB%8F%E7%BD%91%E7%BB%9C%E6%9B%BF%E4%BB%A3%E4%BC%A0%E7%BB%9F%E9%A3%9E%E6%8E%A7%E4%B8%AD%E7%9A%84controller%2Balloc.txt)。
 
-> 当前基线：完整的 PX4 仓库以子模块形式位于 `px4/`，使用项目 fork
-> `Ryan-5853/PX4-Autopilot` 的 `teleai/v1.16.2` 分支，基于 PX4
-> `v1.16.2`。目标飞控板已经确定为 MicoAir H743 V2，项目固件 target 为
+> 当前基线：完整的 PX4 仓库以子模块形式位于 `px4/`，来源为项目 fork
+> `Ryan-5853/PX4-Autopilot`，基于 PX4 `v1.16.2`。实际构建版本以大仓库记录的
+> `px4_trans/px4` gitlink commit 为准，不使用 `git submodule update --remote` 跟随分支。
+> 目标飞控板已经确定为 MicoAir H743 V2，项目固件 target 为
 > `micoair_h743-v2_nncontrol`。2026-07-23 已使用 ARM GCC 10.3.1 完成
 > NuttX 硬件固件全量编译验证。
 
@@ -324,6 +325,9 @@ px4_trans/
 
 ## 14. PX4 v1.16.2 / MicoAir H743 V2 编译指南
 
+除非特别说明，本章所有命令都从大仓库根目录 `RL_Flight/` 执行，而不是从
+`px4_trans/` 或 `px4_trans/px4/` 执行。本文中的 `/path/to/RL_Flight` 需要替换成实际路径。
+
 本项目只使用以下硬件固件 target：
 
 ```text
@@ -333,42 +337,61 @@ micoair_h743-v2_nncontrol
 该 target 包含传感器、EKF2、日志、遥控输入、Commander 和安全保护，以及项目自定义的
 `nn_control` 模块；传统 PX4 多旋翼/固定翼控制器、Flight Mode Manager 和 Control
 Allocator 均不参与构建。不要再使用 `micoair_h743-v2_default` 或通用 Pixhawk target
-编译本项目固件。
+编译本项目固件。虽然 Control Allocator 不参与构建，`nn_control/module.yaml` 仍会为
+QGC 生成两路电机 `[0,1]` 和三路舵机 `[-1,1]` 的执行器元数据。
 
 ### 14.1 检查源码版本与子模块
 
-从大仓库根目录进入 PX4 子模块：
+首次克隆后，或者切换了大仓库 commit 后，初始化 PX4 及其递归子模块：
 
 ```bash
-cd px4
+cd /path/to/RL_Flight
 
-git describe --tags --always --dirty
-git branch --show-current
-git status --short
-git submodule status --recursive
-```
-
-当前版本应以 `v1.16.2` 为基线，开发分支为 `teleai/v1.16.2`。`dirty` 表示本地包含本项目
-尚未提交的板级配置或控制器代码，并不等于版本错误。
-
-若递归子模块尚未检出，执行：
-
-```bash
 git submodule sync --recursive
-git submodule update --init --recursive
+git submodule update --init --recursive px4_trans/px4
 ```
 
-### 14.2 准备独立 Python 环境
+确认 PX4 已检出大仓库锁定的 commit：
+
+```bash
+RL_PX4_EXPECTED="$(git rev-parse :px4_trans/px4)"
+RL_PX4_ACTUAL="$(git -C px4_trans/px4 rev-parse HEAD)"
+printf 'expected: %s\nactual:   %s\n' "$RL_PX4_EXPECTED" "$RL_PX4_ACTUAL"
+test "$RL_PX4_EXPECTED" = "$RL_PX4_ACTUAL"
+
+git -C px4_trans/px4 describe --tags --always --dirty
+git -C px4_trans/px4 status --short
+git -C px4_trans/px4 submodule status --recursive
+```
+
+最后一条命令中，行首为 `-` 表示该递归子模块尚未初始化，行首为 `+` 表示其 commit
+与 PX4 锁定值不一致；这两种情况都应重新执行前面的递归更新命令。子模块处于 detached
+HEAD 是正常现象。`dirty` 表示包含本项目尚未提交的 PX4 修改，不应通过切换分支或
+`git reset` 擅自清除。
+
+### 14.2 安装系统工具和独立 Python 环境
+
+推荐环境是 Ubuntu 22.04 或 WSL2 Ubuntu。首次配置机器时，可用 PX4 脚本安装 ARM
+交叉编译器和系统依赖：
+
+```bash
+bash px4_trans/px4/Tools/setup/ubuntu.sh --no-sim-tools
+```
+
+该脚本会使用网络、系统包管理器和 `sudo`。执行完成后重新打开终端，再回到
+`RL_Flight/` 根目录。
 
 不要让当前 Conda 环境中的 Python 3.13 参与 PX4 构建。项目使用仓库内的 Python 3.10
-虚拟环境：
+虚拟环境 `RL_Flight/.venv`：
 
 ```bash
-cd px4
+cd /path/to/RL_Flight
 
 python3.10 -m venv .venv
 .venv/bin/python -m pip install --upgrade pip
-.venv/bin/python -m pip install -r Tools/setup/requirements.txt ninja "setuptools<81"
+.venv/bin/python -m pip install \
+  -r px4_trans/px4/Tools/setup/requirements.txt \
+  ninja "setuptools<81"
 ```
 
 `setuptools<81` 用于保留 PX4 v1.16.2 的 DroneCAN DSDL 编译器需要的
@@ -378,26 +401,16 @@ python3.10 -m venv .venv
 .venv/bin/python --version
 .venv/bin/python -c 'import menuconfig, kconfiglib, pkg_resources; print("PX4 Python dependencies OK")'
 .venv/bin/ninja --version
-```
-
-再确认 ARM 交叉编译器：
-
-```bash
 arm-none-eabi-gcc --version
 ```
 
-若系统没有 ARM 工具链，可在 PX4 仓库中运行：
-
-```bash
-bash ./Tools/setup/ubuntu.sh --no-sim-tools
-```
-
-该安装脚本会使用系统包管理器、网络和 `sudo`。
+以上四条都成功后再开始构建。如果系统没有 `python3.10`，应先安装 Python 3.10；不要用
+Python 3.13 创建同名 `.venv`。
 
 ### 14.3 选择控制器后端并编译固件
 
 框架输入和执行器输出接口固定，构建时只编入一个控制器后端。在
-`px4/boards/micoair/h743-v2/nncontrol.px4board` 中保留下列三项之一：
+`px4_trans/px4/boards/micoair/h743-v2/nncontrol.px4board` 中只能启用下列三项之一：
 
 ```text
 CONFIG_NN_CONTROL_BACKEND_NEURAL=y
@@ -405,20 +418,27 @@ CONFIG_NN_CONTROL_BACKEND_LQR=y
 CONFIG_NN_CONTROL_BACKEND_HYBRID=y
 ```
 
-当前默认项是 `LQR`。LQR 后端实现为方案 A 的"外部集电 + 4 输出 LQI"：
+当前工程可用的默认项是 `LQR`。`NEURAL` 仍使用占位模型，`HYBRID` 仍是未实现骨架，
+不能用于真机飞行。LQR 后端实现为方案 A 的“外部集电 + 4 输出 LQI”：
 上桨归飞手/RC 油门（`rc_throttle` 映射到 `motors[0]`），LQI 控制下桨与三路舵机，
-13 状态中上桨/下桨优先使用双向 DShot 的 `esc_status` 转速反馈（按
+下桨的集体基准跟随上桨开度，再叠加 LQI 修正。13 状态中上桨/下桨优先使用
+双向 DShot 的 `esc_status` 转速反馈（按
 `MOTOR1`/`MOTOR2` 功能号匹配、取绝对值、100 ms 新鲜度），转速不可用时自动
-回退到命令驱动一阶观察者；舵机状态始终命令驱动（无舵角反馈）。固定
+回退到命令驱动一阶观察者；舵机状态始终命令驱动（无舵角反馈）。安全限制：飞手
+油门为零时 LQI 不工作、五路执行器全部输出零，只有油门非零后才开始输出；下桨
+归一化开度始终限制在上桨开度 ±0.2（20 个百分点）以内。固定
 500 Hz（2 ms）时基。
-权重与观察者常量由 `px4_trans/tools/generate_lqi_backend.py` 从
-`Identification` 的标称 K4 合成生成到 `LqiControllerCore.hpp` / `LqiWeights.hpp`，
-并配套黄金向量（`px4_trans/tests/lqi_golden.hpp`）与主机一致性检查
+部署模型清单位于 `px4_trans/configs/lqi_nominal_deployment.yaml`。权重、命令尺度、
+电机标定表与观察器常量由 `px4_trans/tools/generate_lqi_backend.py` 生成到
+`LqiNominalModel.hpp`；通用算法在 `LqiControllerCore.hpp`，两者不再相互包含，
+后续换权重只需修改部署清单并重新生成。参考系与接口契约详见
+`px4_trans/LQI_NOMINAL_PORT_zh.md`。生成器同时维护
+黄金向量（`px4_trans/tests/lqi_golden.hpp`）与主机一致性检查
 （`px4_trans/tests/run_lqi_core_check.sh`）。`HYBRID` 仍是未实现骨架，实现放在
 `HybridControllerBackend.cpp`。执行器输出由 `NN_LQI_OUTPUT_EN` 参数门控，
 默认 `0`，在完成台架/HIL 验证前不得置 `1`。
 
-在 `px4/` 目录中执行以下完整命令：
+从 `RL_Flight/` 根目录执行以下完整命令：
 
 ```bash
 env \
@@ -426,7 +446,7 @@ env \
   MAKEFLAGS= \
   PATH="$PWD/.venv/bin:$PATH" \
   PYTHON_EXECUTABLE="$PWD/.venv/bin/python" \
-  make micoair_h743-v2_nncontrol
+  make -C px4_trans/px4 micoair_h743-v2_nncontrol
 ```
 
 这里有三项必须保留：
@@ -439,7 +459,40 @@ env \
 编译成功后固件位于：
 
 ```text
-build/micoair_h743-v2_nncontrol/micoair_h743-v2_nncontrol.px4
+px4_trans/px4/build/micoair_h743-v2_nncontrol/micoair_h743-v2_nncontrol.px4
+```
+
+确认固件存在并记录校验和：
+
+```bash
+test -s px4_trans/px4/build/micoair_h743-v2_nncontrol/micoair_h743-v2_nncontrol.px4
+sha256sum px4_trans/px4/build/micoair_h743-v2_nncontrol/micoair_h743-v2_nncontrol.px4
+```
+
+同时检查这次修复涉及的 QGC 执行器元数据。下面的检查必须输出
+`actuator metadata OK`：
+
+```bash
+.venv/bin/python - <<'PY'
+import json
+
+path = "px4_trans/px4/build/micoair_h743-v2_nncontrol/actuators.json"
+with open(path, encoding="utf-8") as stream:
+    mixer = json.load(stream)["mixer_v1"]
+
+motor = mixer["actuator-types"]["motor"]
+servo = mixer["actuator-types"]["servo"]
+assert (motor["function-min"], motor["function-max"]) == (101, 112)
+assert (motor["values"]["min"], motor["values"]["max"]) == (0, 1)
+assert (servo["function-min"], servo["function-max"]) == (201, 208)
+assert (servo["values"]["min"], servo["values"]["max"]) == (-1, 1)
+config = next(item for item in mixer["config"] if item["option"] == "SYS_AUTOSTART==22001")
+assert [(item["actuator-type"], item["count"]) for item in config["actuators"]] == [
+    ("motor", 2),
+    ("servo", 3),
+]
+print("actuator metadata OK")
+PY
 ```
 
 2026-07-23 的已验证结果为：
@@ -454,12 +507,15 @@ RAM 占用，不能只检查是否生成了 `.px4` 文件。
 
 ### 14.4 增量编译、清理与上传
 
-源码修改后，重复第 14.3 节的完整命令即可增量编译。
-
-确实需要清理全部 PX4 构建产物时，在 `px4/` 中执行：
+源码修改后，重复第 14.3 节的完整命令即可增量编译。修改 `CMakeLists.txt`、Kconfig、
+`*.px4board` 或 `module.yaml` 后，CMake 会自动重新配置；仍怀疑缓存过期时再执行目标清理：
 
 ```bash
-make clean
+env \
+  MAKEFLAGS= \
+  PATH="$PWD/.venv/bin:$PATH" \
+  PYTHON_EXECUTABLE="$PWD/.venv/bin/python" \
+  make -C px4_trans/px4 micoair_h743-v2_nncontrol clean
 ```
 
 连接 MicoAir H743 V2、进入 Bootloader 后，可使用同一环境直接编译并上传：
@@ -470,13 +526,13 @@ env \
   MAKEFLAGS= \
   PATH="$PWD/.venv/bin:$PATH" \
   PYTHON_EXECUTABLE="$PWD/.venv/bin/python" \
-  make micoair_h743-v2_nncontrol upload
+  make -C px4_trans/px4 micoair_h743-v2_nncontrol upload
 ```
 
 也可以在 QGroundControl 中选择“自定义固件”，手动上传：
 
 ```text
-build/micoair_h743-v2_nncontrol/micoair_h743-v2_nncontrol.px4
+px4_trans/px4/build/micoair_h743-v2_nncontrol/micoair_h743-v2_nncontrol.px4
 ```
 
 ### 14.5 烧录后的模块检查
@@ -565,10 +621,13 @@ LQR 后端现在计算真实 LQI 输出，但执行器权威仍由 `NN_LQI_OUTPU
 | 提示或错误 | 原因 | 处理方式 |
 | --- | --- | --- |
 | `No module named 'menuconfig'` | CMake 使用了 Conda 或系统 Python | 使用第 14.3 节的完整命令，并在 `.venv` 中安装 requirements |
-| `kconfiglib is not installed` | 当前构建 Python 缺少 Kconfig 依赖 | 用 `.venv/bin/python` 安装 `Tools/setup/requirements.txt` |
+| `kconfiglib is not installed` | 当前构建 Python 缺少 Kconfig 依赖 | 用 `.venv/bin/python` 安装 `px4_trans/px4/Tools/setup/requirements.txt` |
 | `No module named 'pkg_resources'` | 虚拟环境缺少兼容的 setuptools | 执行 `.venv/bin/python -m pip install "setuptools<81"` |
 | `Could not initialize jobserver: Invalid file descriptors` | 外层 `make -j` 参数被传给 Ninja | 去掉 `-j"$(nproc)"` 并设置 `MAKEFLAGS=` |
-| `arm-none-eabi-gcc: command not found` | ARM/NuttX 工具链未安装 | 运行 `Tools/setup/ubuntu.sh --no-sim-tools` |
+| NuttX、MAVLink 或 DroneCAN 文件缺失 | PX4 的递归子模块未初始化 | 执行 `git submodule update --init --recursive px4_trans/px4` |
+| `arm-none-eabi-gcc: command not found` | ARM/NuttX 工具链未安装 | 运行 `bash px4_trans/px4/Tools/setup/ubuntu.sh --no-sim-tools` |
+| `actuators.json` 中只有 `DEFAULT [0,1]` | 构建缓存未包含 `nn_control/module.yaml`，或构建了错误 target | 清理并重新编译 `micoair_h743-v2_nncontrol`，再执行第 14.3 节元数据检查 |
+| QGC 仍把舵机显示为 `[0,1]` | QGC 仍缓存旧固件的 actuator metadata | 确认新 `actuators.json` 检查通过，刷入新 `.px4`，完全退出 QGC 后重新打开 |
 | `BOARD_UAVCAN_INTERFACES ... got the value ''` | 基础板声明 UAVCAN 接口，但裁剪配置关闭了 UAVCAN | 当前配置中的预期警告，不影响固件生成 |
 
 排错时优先处理日志中的第一个致命错误。CMake 配置失败后出现的“构建目录不存在”等信息

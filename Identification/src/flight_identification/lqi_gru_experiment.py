@@ -59,6 +59,18 @@ ACTION_NAMES = (
     "command.servo_3",
 )
 
+EXTERNAL_UPPER_ACTION_NAMES = (
+    "command.motor_lower",
+    "command.servo_1",
+    "command.servo_2",
+    "command.servo_3",
+)
+
+
+def _action_names(controller_config: Mapping[str, Any]) -> tuple[str, ...]:
+    mode = str(_node(controller_config, "params").get("collective_mode", "hover"))
+    return EXTERNAL_UPPER_ACTION_NAMES if mode == "external_upper" else ACTION_NAMES
+
 
 def _raw_config(path: Path) -> Mapping[str, Any]:
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -97,8 +109,14 @@ def _oracle_gains(
                 parameters=point,
             ),
         )
-        if not controller._lqr_integral_enabled or controller._lqr_gain.shape != (5, 13):
-            raise RuntimeError("oracle controller must synthesize a 5x13 LQI gain")
+        input_count = 4 if controller.upper_external else 5
+        if (
+            not controller._lqr_integral_enabled
+            or controller._lqr_gain.shape != (input_count, 13)
+        ):
+            raise RuntimeError(
+                f"oracle controller must synthesize a {input_count}x13 LQI gain"
+            )
         gains.append(controller._lqr_gain)
     return torch.stack(gains, dim=0)
 
@@ -114,6 +132,7 @@ def _save_shard(
     labels: torch.Tensor,
     lqi_gains: torch.Tensor,
     label_names: tuple[str, ...],
+    action_names: tuple[str, ...] = ACTION_NAMES,
 ) -> dict[str, int]:
     counts: dict[str, int] = {}
     for split_index, split_name in enumerate(("train", "validation", "test")):
@@ -137,7 +156,7 @@ def _save_shard(
                 "oracle_lqi_gain_audit_only": lqi_gains[selected].contiguous(),
                 "group_id": group_ids[selected].contiguous(),
                 "observation_names": OBSERVATION_NAMES,
-                "action_names": ACTION_NAMES,
+                "action_names": action_names,
                 "label_names": label_names,
                 "leakage_contract": "audit tensors are never student inputs",
             },
@@ -154,10 +173,10 @@ def generate_lqi_gru_dataset(
         ControllerContext,
         ControllerReference,
         ControllerState,
+        compose_external_upper_command,
         create_controller,
         load_controller_config,
     )
-    from flight_train.commands import VirtualPilotCommandSource
     from flight_train.config import _virtual_pilot
     from simenv import SimulationEnvironment
     from simenv.config import load_and_materialize
@@ -189,8 +208,15 @@ def generate_lqi_gru_dataset(
     controller_config = dict(load_controller_config(config.controller_config))
     if str(controller_config.get("type")) != "lqr":
         raise ValueError("oracle controller must be LQR/LQI")
-    if _node(controller_config, "params").get("collective_mode") != "manual":
-        raise ValueError("oracle distillation requires manual collective mode")
+    collective_mode = str(
+        _node(controller_config, "params").get("collective_mode", "hover")
+    )
+    if collective_mode not in {"manual", "external_upper"}:
+        raise ValueError(
+            "oracle distillation requires manual or external_upper collective mode"
+        )
+    external_upper = collective_mode == "external_upper"
+    action_names = _action_names(controller_config)
     pilot_config = _virtual_pilot(_node(raw, "command_source"))
     # The first recurrent input must not reveal the airframe-specific oracle
     # trim. Use one public nominal command for every parameter group. Later
@@ -270,22 +296,33 @@ def generate_lqi_gru_dataset(
             materialized, batch_size, device, dtype, logging_enabled=False
         )
         try:
-            oracle = create_controller(
-                controller_config,
-                ControllerContext(
-                    batch_size=batch_size,
-                    device=device,
-                    dtype=dtype,
-                    control_dt=1.0 / config.control_hz,
-                    parameters=actual_parameters,
-                ),
+            oracle_context = ControllerContext(
+                batch_size=batch_size,
+                device=device,
+                dtype=dtype,
+                control_dt=1.0 / config.control_hz,
+                parameters=actual_parameters,
             )
-            oracle.schedule_lqr_gain(episode_gains)
+            if external_upper:
+                from .external_collective_lqi import ExternalCollectiveLQIController
+
+                oracle = ExternalCollectiveLQIController(
+                    oracle_context,
+                    config.controller_config,
+                    config.simulator_config,
+                    episode_gains,
+                    "nonlinear",
+                )
+            else:
+                oracle = create_controller(controller_config, oracle_context)
+                oracle.schedule_lqr_gain(episode_gains)
             _set_initial_observation_state(
                 environment, oracle.trim.motor_speed, initial_state["angular_velocity_b"]
             )
-            pilot = VirtualPilotCommandSource(
-                pilot_config, batch_size, device, dtype, config.control_hz
+            from .external_pilot import make_external_pilot
+
+            pilot = make_external_pilot(
+                pilot_config, raw, batch_size, device, dtype, config.control_hz
             )
             pilot.generator.manual_seed(pilot_config.seed + group_start)
             active = torch.ones(batch_size, device=device, dtype=torch.bool)
@@ -297,7 +334,7 @@ def generate_lqi_gru_dataset(
                 batch_size, stored_steps, len(OBSERVATION_NAMES), device=device, dtype=dtype
             )
             teacher_actions = torch.zeros(
-                batch_size, stored_steps, len(ACTION_NAMES), device=device, dtype=dtype
+                batch_size, stored_steps, len(action_names), device=device, dtype=dtype
             )
             valid_mask = torch.zeros(batch_size, stored_steps, device=device, dtype=torch.bool)
             write_index = 0
@@ -331,7 +368,18 @@ def generate_lqi_gru_dataset(
                     motor_speed=truth["motor_speed"],
                     servo_angle=truth["servo_angle"],
                 )
-                oracle_output = oracle.step(state, reference, active)
+                oracle_action = (
+                    oracle.step(state, reference, command.upper_throttle, active)
+                    if external_upper
+                    else oracle.step(state, reference, active).command
+                )
+                applied_command = (
+                    compose_external_upper_command(
+                        command.upper_throttle, oracle_action
+                    )
+                    if external_upper
+                    else oracle_action
+                )
                 if step % stride == 0:
                     student_observation = torch.cat(
                         (
@@ -349,11 +397,11 @@ def generate_lqi_gru_dataset(
                     observations[:, write_index].copy_(
                         torch.where(active[:, None], student_observation, torch.zeros_like(student_observation))
                     )
-                    teacher_actions[:, write_index].copy_(oracle_output.command)
+                    teacher_actions[:, write_index].copy_(oracle_action)
                     valid_mask[:, write_index].copy_(active)
                     write_index += 1
-                previous_command = oracle_output.command
-                result = environment.advance(oracle_output.command, active)
+                previous_command = applied_command
+                result = environment.advance(applied_command, active)
                 tilt = torch.acos(
                     (2.0 * truth["attitude_q_wb"][:, 0].square()
                      + 2.0 * truth["attitude_q_wb"][:, 3].square() - 1.0).clamp(-1.0, 1.0)
@@ -373,6 +421,7 @@ def generate_lqi_gru_dataset(
                 episode_labels,
                 episode_gains.cpu(),
                 label_names,
+                action_names,
             )
             totals["groups"] += group_count
             totals["episodes"] += batch_size
@@ -390,9 +439,15 @@ def generate_lqi_gru_dataset(
         "stored_hz": config.control_hz // stride,
         "episode_steps": stored_steps,
         "observation_names": OBSERVATION_NAMES,
-        "action_names": ACTION_NAMES,
+        "action_names": action_names,
         "split_semantics": "disjoint fixed-airframe parameter groups",
-        "expert_contract": "one truth-parameter LQI and truth state per random airframe",
+        "expert_contract": (
+            "one truth-parameter 4-output LQI; upper rotor is external"
+            if external_upper
+            else "one truth-parameter 5-output LQI and truth state per random airframe"
+        ),
+        "upper_rotor_owner": "external_pilot" if external_upper else "student_teacher",
+        "external_pilot_profiles": list(pilot.profile_names),
         "student_contract": "causal observations only; no parameters, gains, or truth servo state",
         "initial_previous_command": fixed_initial_previous_command.detach().cpu().tolist(),
         "initial_previous_command_semantics": "one fixed nominal command shared by every airframe",

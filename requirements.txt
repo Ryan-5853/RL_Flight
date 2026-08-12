@@ -11,6 +11,8 @@ torchrl>=0.5,<1.0
 gymnasium>=0.29,<1.1
 numpy>=1.26,<3.0
 scipy>=1.11,<2.0
+pymavlink==2.4.49
+pyserial==3.5
 
 wandb>=0.16,<1.0
 tensorboard>=2.16,<3.0

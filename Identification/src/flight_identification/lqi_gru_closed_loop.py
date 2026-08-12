@@ -18,7 +18,7 @@ from .experiment import (
     _yaw_free_attitude,
 )
 from .lqi_gru_distillation import StudentStepState, load_student, step_student
-from .lqi_gru_experiment import OBSERVATION_NAMES, _oracle_gains
+from .lqi_gru_experiment import OBSERVATION_NAMES, _action_names, _oracle_gains
 
 
 def _node(root: Mapping[str, Any], name: str) -> Mapping[str, Any]:
@@ -45,6 +45,15 @@ def _summary(value: torch.Tensor) -> dict[str, float]:
         "p90": float(torch.quantile(value, 0.90)),
         "p99": float(torch.quantile(value, 0.99)),
     }
+
+
+def _gap_recovery(
+    nominal: float, student: float, oracle: float, *, higher_is_better: bool
+) -> float | None:
+    denominator = (oracle - nominal) if higher_is_better else (nominal - oracle)
+    numerator = (student - nominal) if higher_is_better else (nominal - student)
+    meaningful = max(1e-6, abs(nominal) * 1e-3)
+    return None if denominator <= meaningful else numerator / denominator
 
 
 def _perturbed_yaw_free_attitude(
@@ -106,16 +115,18 @@ def _simulate(
     attitude_bias_deg: float = 0.0,
     attitude_latency_steps: int = 0,
     report_segments_s: Sequence[float] = (),
+    pilot_profiles: Sequence[str] = (),
+    task_mode: str = "tracking",
 ) -> Mapping[str, torch.Tensor]:
     from flight_controller import (
         ControllerContext,
         ControllerReference,
         ControllerState,
+        compose_external_upper_command,
         create_controller,
         load_controller_config,
     )
     from flight_controller.math import quaternion_rotation_error, tilt_cosine
-    from flight_train.commands import VirtualPilotCommandSource
     from flight_train.config import _virtual_pilot
     from simenv import SimulationEnvironment
     from simenv.config import load_and_materialize
@@ -129,6 +140,11 @@ def _simulate(
     dtype = torch.float32
     nominal = load_and_materialize(config.simulator_config, 1, device, dtype)
     controller_config = dict(load_controller_config(config.controller_config))
+    collective_mode = str(
+        _node(controller_config, "params").get("collective_mode", "hover")
+    )
+    external_upper = collective_mode == "external_upper"
+    action_names = _action_names(controller_config)
     group_count = len(labels)
     batch_size = group_count * trials
     episode_labels = labels.repeat_interleave(trials, dim=0).to(device)
@@ -154,38 +170,61 @@ def _simulate(
         materialized, batch_size, device, dtype, logging_enabled=False
     )
     try:
-        actual_controller = create_controller(
-            controller_config,
-            ControllerContext(
-                batch_size=batch_size,
-                device=device,
-                dtype=dtype,
-                control_dt=1.0 / config.control_hz,
-                parameters=actual_parameters,
-            ),
+        actual_context = ControllerContext(
+            batch_size=batch_size,
+            device=device,
+            dtype=dtype,
+            control_dt=1.0 / config.control_hz,
+            parameters=actual_parameters,
         )
+        actual_controller = create_controller(controller_config, actual_context)
         initial_motor_speed = actual_controller.trim.motor_speed
         controller = None
         if mode == "oracle_lqi":
-            controller = actual_controller
             group_parameters = {
                 name: value[::trials] for name, value in actual_parameters.items()
             }
             gains = _oracle_gains(
                 controller_config, group_parameters, 1.0 / config.control_hz
             ).repeat_interleave(trials, dim=0)
-            controller.schedule_lqr_gain(gains)
+            if external_upper:
+                from .external_collective_lqi import ExternalCollectiveLQIController
+
+                controller = ExternalCollectiveLQIController(
+                    actual_context,
+                    config.controller_config,
+                    config.simulator_config,
+                    gains,
+                    "nonlinear",
+                )
+            else:
+                controller = actual_controller
+                controller.schedule_lqr_gain(gains)
         elif mode == "nominal_lqi":
-            controller = create_controller(
-                controller_config,
-                ControllerContext(
-                    batch_size=batch_size,
-                    device=device,
-                    dtype=dtype,
-                    control_dt=1.0 / config.control_hz,
-                    parameters=nominal_parameters,
-                ),
+            nominal_context = ControllerContext(
+                batch_size=batch_size,
+                device=device,
+                dtype=dtype,
+                control_dt=1.0 / config.control_hz,
+                parameters=nominal_parameters,
             )
+            if external_upper:
+                from .external_collective_lqi import ExternalCollectiveLQIController
+
+                nominal_gain = _oracle_gains(
+                    controller_config,
+                    {name: value[:1] for name, value in nominal_parameters.items()},
+                    1.0 / config.control_hz,
+                )[0]
+                controller = ExternalCollectiveLQIController(
+                    nominal_context,
+                    config.controller_config,
+                    config.simulator_config,
+                    nominal_gain,
+                    "nonlinear",
+                )
+            else:
+                controller = create_controller(controller_config, nominal_context)
         elif mode not in {"gru", "gru_reset"}:
             raise ValueError(f"unknown closed-loop mode {mode!r}")
         _set_initial_observation_state(
@@ -193,11 +232,23 @@ def _simulate(
         )
 
         pilot_config = _virtual_pilot(_node(raw, "command_source"))
-        pilot = VirtualPilotCommandSource(
-            pilot_config, batch_size, device, dtype, config.control_hz
+        from .external_pilot import make_external_pilot
+
+        pilot = make_external_pilot(
+            pilot_config,
+            raw,
+            batch_size,
+            device,
+            dtype,
+            config.control_hz,
+            profile_names=pilot_profiles or None,
         )
         pilot.generator.manual_seed(seed + 1)
         active = torch.ones(batch_size, device=device, dtype=torch.bool)
+        if task_mode == "regulation":
+            pilot.base.set_curriculum_scale(0.0)
+        elif task_mode != "tracking":
+            raise ValueError("task_mode must be tracking or regulation")
         pilot.reset(active)
         episode_bias = torch.randn(
             batch_size, 2, device=device, dtype=dtype
@@ -209,6 +260,10 @@ def _simulate(
         if mode in {"gru", "gru_reset"}:
             student, checkpoint = load_student(checkpoint_path, device)
             student.eval()
+            if tuple(checkpoint["action_names"]) != tuple(action_names):
+                raise ValueError(
+                    "student action schema does not match external-upper ownership"
+                )
             mean = checkpoint["normalization"]["mean"].to(device)
             std = checkpoint["normalization"]["std"].to(device)
             full_name_to_index = {
@@ -241,7 +296,7 @@ def _simulate(
                         parameters=nominal.parameters,
                     ),
                 )
-            initial_previous = nominal_controller.trim.command[0]
+                initial_previous = nominal_controller.trim.command[0]
             previous_command = torch.as_tensor(
                 initial_previous, device=device, dtype=dtype
             ).reshape(1, 5).expand(batch_size, -1).clone()
@@ -273,6 +328,17 @@ def _simulate(
         movement_sum = torch.zeros_like(attitude_squared)
         last_applied = previous_command.clone()
         accumulated_steps = torch.zeros_like(attitude_squared)
+        settled_count = torch.zeros(
+            batch_size, device=device, dtype=torch.int64
+        )
+        converged = torch.zeros(
+            batch_size, device=device, dtype=torch.bool
+        )
+        required_settled_steps = max(
+            1, round(config.convergence.hold_s * config.control_hz)
+        )
+        final_attitude_error = torch.full_like(attitude_squared, torch.inf)
+        final_rate_error = torch.full_like(attitude_squared, torch.inf)
 
         for step in range(steps):
             truth = environment.observe("truth").values
@@ -324,7 +390,20 @@ def _simulate(
                     motor_speed=truth["motor_speed"],
                     servo_angle=truth["servo_angle"],
                 )
-                command = controller.step(state, reference, active).command
+                controlled_command = (
+                    controller.step(
+                        state, reference, snapshot.upper_throttle, active
+                    )
+                    if external_upper
+                    else controller.step(state, reference, active).command
+                )
+                command = (
+                    compose_external_upper_command(
+                        snapshot.upper_throttle, controlled_command
+                    )
+                    if external_upper
+                    else controlled_command
+                )
             else:
                 if (
                     student is None
@@ -350,12 +429,19 @@ def _simulate(
                     1, student_observation_indices
                 )
                 normalized = (observation - mean) / std
-                command, student_state = step_student(
+                controlled_command, student_state = step_student(
                     student,
                     checkpoint,
                     normalized,
                     student_state,
                     full_context=mode == "gru",
+                )
+                command = (
+                    compose_external_upper_command(
+                        snapshot.upper_throttle, controlled_command
+                    )
+                    if external_upper
+                    else controlled_command
                 )
                 if step in capture_steps and student_state.hidden is not None:
                     hidden = student_state.hidden
@@ -372,6 +458,27 @@ def _simulate(
                 attitude_estimate, target_attitude
             )[:, :2]
             rate_error = truth["angular_velocity_b"] - target_rate
+            attitude_error_norm = attitude_error.norm(dim=1)
+            rate_error_norm = rate_error.norm(dim=1)
+            within_tolerance = active & (
+                attitude_error_norm
+                <= config.convergence.maximum_roll_pitch_error_rad
+            ) & (
+                rate_error_norm
+                <= config.convergence.maximum_angular_rate_rad_s
+            )
+            settled_count = torch.where(
+                within_tolerance,
+                settled_count + 1,
+                torch.zeros_like(settled_count),
+            )
+            converged |= settled_count >= required_settled_steps
+            final_attitude_error = torch.where(
+                active, attitude_error_norm, final_attitude_error
+            )
+            final_rate_error = torch.where(
+                active, rate_error_norm, final_rate_error
+            )
             active_float = active.to(dtype)
             attitude_squared += attitude_error.square().sum(1) * active_float
             rate_squared += rate_error.square().sum(1) * active_float
@@ -418,6 +525,10 @@ def _simulate(
             "rate_tracking_rms_rad_s": torch.sqrt(rate_squared / denominator).cpu(),
             "saturation_fraction": (saturation_steps / denominator).cpu(),
             "command_movement_mean": (movement_sum / denominator).cpu(),
+            "converged": (converged & active).cpu(),
+            "final_attitude_error_rad": final_attitude_error.cpu(),
+            "final_rate_error_rad_s": final_rate_error.cpu(),
+            "pilot_profile_index": pilot.profile_index.cpu(),
         }
         if report_segments_s:
             segment_report = []
@@ -477,6 +588,8 @@ def evaluate_closed_loop(
     attitude_bias_deg: float = 0.0,
     attitude_latency_steps: int = 0,
     report_segments_s: Sequence[float] = (),
+    pilot_profiles: Sequence[str] = (),
+    task_mode: str = "tracking",
 ) -> Mapping[str, Any]:
     config = load_experiment_config(config_path)
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
@@ -495,7 +608,7 @@ def evaluate_closed_loop(
             mode, config, raw, labels, accepted, trials, duration_s, seed,
             checkpoint, device, pilot_height_mode,
             attitude_noise_deg, attitude_bias_deg, attitude_latency_steps,
-            report_segments_s,
+            report_segments_s, pilot_profiles, task_mode,
         )
     summaries = {}
     for mode, values in variant_results.items():
@@ -506,31 +619,40 @@ def evaluate_closed_loop(
             "rate_tracking_rms_rad_s": _summary(values["rate_tracking_rms_rad_s"]),
             "saturation_fraction": _summary(values["saturation_fraction"]),
             "command_movement_mean": _summary(values["command_movement_mean"]),
+            "converged_fraction": float(
+                values["converged"].to(torch.float32).mean()
+            ),
+            "final_attitude_error_rad": _summary(
+                values["final_attitude_error_rad"]
+            ),
+            "final_rate_error_rad_s": _summary(values["final_rate_error_rad_s"]),
         }
-    oracle = summaries["oracle_lqi"]
-    gru = summaries["gru"]
-    oracle_safe_mask = variant_results["oracle_lqi"]["safe"]
+    oracle = summaries.get("oracle_lqi")
+    gru = summaries.get("gru")
+    nominal_summary = summaries.get("nominal_lqi")
     paired_subsets = {}
-    for mode, values in variant_results.items():
-        selected_count = int(oracle_safe_mask.sum())
-        paired_subsets[mode] = {
-            "episodes": selected_count,
-            "safe_fraction_given_oracle_safe": (
-                float(values["safe"][oracle_safe_mask].to(torch.float32).mean())
-                if selected_count
-                else None
-            ),
-            "attitude_tracking_rms_rad_mean": (
-                float(values["attitude_tracking_rms_rad"][oracle_safe_mask].mean())
-                if selected_count
-                else None
-            ),
-            "rate_tracking_rms_rad_s_mean": (
-                float(values["rate_tracking_rms_rad_s"][oracle_safe_mask].mean())
-                if selected_count
-                else None
-            ),
-        }
+    if oracle is not None:
+        oracle_safe_mask = variant_results["oracle_lqi"]["safe"]
+        for mode, values in variant_results.items():
+            selected_count = int(oracle_safe_mask.sum())
+            paired_subsets[mode] = {
+                "episodes": selected_count,
+                "safe_fraction_given_oracle_safe": (
+                    float(values["safe"][oracle_safe_mask].to(torch.float32).mean())
+                    if selected_count
+                    else None
+                ),
+                "attitude_tracking_rms_rad_mean": (
+                    float(values["attitude_tracking_rms_rad"][oracle_safe_mask].mean())
+                    if selected_count
+                    else None
+                ),
+                "rate_tracking_rms_rad_s_mean": (
+                    float(values["rate_tracking_rms_rad_s"][oracle_safe_mask].mean())
+                    if selected_count
+                    else None
+                ),
+            }
     report = {
         "schema_version": 1,
         "comparison": "paired_unseen_airframe_closed_loop",
@@ -546,6 +668,8 @@ def evaluate_closed_loop(
         "teacher_forcing": False,
         "global_rng_reseeded_per_variant": True,
         "pilot_height_mode": pilot_height_mode,
+        "pilot_profiles": list(pilot_profiles) if pilot_profiles else "sampled_from_config",
+        "task_mode": task_mode,
         "attitude_perturbation": {
             "noise_deg": attitude_noise_deg,
             "bias_deg": attitude_bias_deg,
@@ -575,7 +699,33 @@ def evaluate_closed_loop(
             "safe_fraction_delta": gru["safe_fraction"] - oracle["safe_fraction"],
             "attitude_rms_ratio": gru["attitude_tracking_rms_rad"]["mean"] / max(oracle["attitude_tracking_rms_rad"]["mean"], 1e-12),
             "rate_rms_ratio": gru["rate_tracking_rms_rad_s"]["mean"] / max(oracle["rate_tracking_rms_rad_s"]["mean"], 1e-12),
-        },
+        }
+        if oracle is not None and gru is not None
+        else None,
+        "nominal_to_oracle_gap_recovery": (
+            {
+                "attitude_rms": _gap_recovery(
+                    nominal_summary["attitude_tracking_rms_rad"]["mean"],
+                    gru["attitude_tracking_rms_rad"]["mean"],
+                    oracle["attitude_tracking_rms_rad"]["mean"],
+                    higher_is_better=False,
+                ),
+                "rate_rms": _gap_recovery(
+                    nominal_summary["rate_tracking_rms_rad_s"]["mean"],
+                    gru["rate_tracking_rms_rad_s"]["mean"],
+                    oracle["rate_tracking_rms_rad_s"]["mean"],
+                    higher_is_better=False,
+                ),
+                "convergence": _gap_recovery(
+                    nominal_summary["converged_fraction"],
+                    gru["converged_fraction"],
+                    oracle["converged_fraction"],
+                    higher_is_better=True,
+                ),
+            }
+            if nominal_summary is not None and oracle is not None and gru is not None
+            else None
+        ),
     }
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
@@ -612,6 +762,17 @@ def main() -> None:
     parser.add_argument("--attitude-bias-deg", type=float, default=0.0)
     parser.add_argument("--attitude-latency-steps", type=int, default=0)
     parser.add_argument("--report-segments-s", type=float, nargs="+", default=())
+    parser.add_argument(
+        "--pilot-profiles",
+        nargs="*",
+        default=(),
+        help="restrict evaluation to named external_pilot profiles",
+    )
+    parser.add_argument(
+        "--task-mode",
+        choices=("tracking", "regulation"),
+        default="tracking",
+    )
     args = parser.parse_args()
     report = evaluate_closed_loop(
         Path(args.dataset).resolve(), Path(args.config).resolve(),
@@ -621,6 +782,7 @@ def main() -> None:
         tuple(args.variants),
         args.attitude_noise_deg, args.attitude_bias_deg,
         args.attitude_latency_steps, tuple(args.report_segments_s),
+        tuple(args.pilot_profiles), args.task_mode,
     )
     print(json.dumps(report, indent=2, sort_keys=True))
 

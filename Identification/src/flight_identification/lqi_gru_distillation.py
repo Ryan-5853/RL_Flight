@@ -4,6 +4,7 @@ import argparse
 from dataclasses import dataclass
 import json
 import math
+import os
 from pathlib import Path
 import random
 from typing import Any, Iterable, Mapping, Sequence
@@ -198,7 +199,7 @@ def select_observations(
 
 
 class CausalLQIStudent(nn.Module):
-    """Causal recurrent policy from deployable observations to five commands."""
+    """Causal recurrent policy with an explicit deployable action contract."""
 
     def __init__(
         self,
@@ -207,6 +208,8 @@ class CausalLQIStudent(nn.Module):
         recurrent_layers: int,
         head_sizes: Sequence[int],
         dropout: float,
+        action_size: int = 5,
+        motor_action_count: int = 2,
         arch: str = "gru",
         context_steps: int | None = None,
         kernel_size: int = 3,
@@ -217,6 +220,10 @@ class CausalLQIStudent(nn.Module):
         self.hidden_size = hidden_size
         self.recurrent_layers = recurrent_layers
         self.arch = arch
+        if action_size <= 0 or not 0 <= motor_action_count <= action_size:
+            raise ValueError("student action dimensions are invalid")
+        self.action_size = action_size
+        self.motor_action_count = motor_action_count
         if arch in {"tcn", "transformer"} and context_steps is None:
             raise ValueError(f"{arch} requires a context_steps window")
         self.context_steps = context_steps
@@ -251,7 +258,7 @@ class CausalLQIStudent(nn.Module):
             )
         else:
             raise ValueError(f"unknown student architecture {arch!r}")
-        sizes = [hidden_size, *head_sizes, 5]
+        sizes = [hidden_size, *head_sizes, action_size]
         layers: list[nn.Module] = []
         for index, (input_size, output_size) in enumerate(zip(sizes, sizes[1:])):
             layers.append(nn.Linear(input_size, output_size))
@@ -270,7 +277,13 @@ class CausalLQIStudent(nn.Module):
             encoded = self.encoder(observations)
             next_hidden = None
         raw = self.head(encoded)
-        commands = torch.cat((torch.sigmoid(raw[..., :2]), torch.tanh(raw[..., 2:])), dim=-1)
+        commands = torch.cat(
+            (
+                torch.sigmoid(raw[..., : self.motor_action_count]),
+                torch.tanh(raw[..., self.motor_action_count :]),
+            ),
+            dim=-1,
+        )
         return commands, next_hidden, encoded
 
 
@@ -373,7 +386,12 @@ def _masked_loss(
     mask: torch.Tensor,
     delta_weight: float,
 ) -> torch.Tensor:
-    weights = prediction.new_tensor([1.0, 1.0, 0.5, 0.5, 0.5])
+    if prediction.shape != target.shape or prediction.shape[-1] not in {4, 5}:
+        raise ValueError("LQI student loss requires matching four- or five-action tensors")
+    motor_count = prediction.shape[-1] - 3
+    weights = prediction.new_tensor(
+        [1.0] * motor_count + [0.5, 0.5, 0.5]
+    )
     squared = (prediction - target).square() * weights
     point = squared.sum(dim=-1) / weights.sum()
     loss = point[mask].mean()
@@ -578,6 +596,9 @@ def train(
     torch.manual_seed(seed)
     train_set = load_sequences(dataset_directory, "train")
     validation_set = load_sequences(dataset_directory, "validation")
+    dataset_manifest = json.loads(
+        (dataset_directory / "manifest.json").read_text(encoding="utf-8")
+    )
     if exclude_previous_command:
         selected_names = tuple(
             name
@@ -593,6 +614,10 @@ def train(
         int(training["recurrent_layers"]),
         tuple(int(value) for value in training["head_sizes"]),
         float(training["dropout"]),
+        action_size=len(train_set.action_names),
+        motor_action_count=sum(
+            name.startswith("command.motor_") for name in train_set.action_names
+        ),
         arch=arch,
         context_steps=context_steps,
         kernel_size=kernel_size,
@@ -609,9 +634,18 @@ def train(
             raise ValueError("resume checkpoint is not a LQI student")
         if tuple(parent["observation_names"]) != train_set.observation_names:
             raise ValueError("resume checkpoint observation schema differs")
+        if tuple(parent["action_names"]) != train_set.action_names:
+            raise ValueError("resume checkpoint action schema differs")
         model.load_state_dict(parent["model_state"])
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(training["learning_rate"]), weight_decay=1e-5)
-    batch_size = int(training["batch_size"])
+    batch_size = int(
+        os.environ.get(
+            "FLIGHT_IDENTIFICATION_LQI_GRU_BATCH_SIZE",
+            training["batch_size"],
+        )
+    )
+    if batch_size <= 0:
+        raise ValueError("LQI-GRU training batch size must be positive")
     epochs = epochs_override or int(training["epochs"])
     delta_weight = float(training["command_delta_loss_weight"])
     loader_generator = torch.Generator().manual_seed(seed + 2)
@@ -622,15 +656,17 @@ def train(
     ]
     initial_previous_normalized = None
     if previous_indices and previous_command_reset_prob > 0.0:
-        manifest = json.loads((dataset_directory / "manifest.json").read_text(encoding="utf-8"))
         initial_previous = torch.as_tensor(
-            manifest["initial_previous_command"], dtype=torch.float32
+            dataset_manifest["initial_previous_command"], dtype=torch.float32
         )
         initial_previous_normalized = _normalize(
             initial_previous, mean[previous_indices], std[previous_indices]
         )
     windowed = model.arch in {"tcn", "transformer"}
     sequence_length = train_set.observations.shape[1]
+    tbptt_steps = int(training.get("tbptt_steps", sequence_length))
+    if tbptt_steps <= 0:
+        raise ValueError("distillation.training.tbptt_steps must be positive")
     best_state = None
     best_validation = float("inf")
     history = []
@@ -676,14 +712,32 @@ def train(
                         initial_previous_normalized.to(normalized.device),
                         normalized[..., previous_indices],
                     )
-            prediction, _, _ = model(normalized)
-            loss = _masked_loss(prediction, actions.to(device), mask.to(device), delta_weight)
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-            optimizer.step()
-            train_loss += float(loss.detach())
-            batches += 1
+            actions_device = actions.to(device)
+            mask_device = mask.to(device)
+            chunk_size = sequence_length if windowed else tbptt_steps
+            hidden = None
+            for start in range(0, normalized.shape[1], chunk_size):
+                stop = min(start + chunk_size, normalized.shape[1])
+                prediction, hidden, _ = model(
+                    normalized[:, start:stop], hidden
+                )
+                loss = _masked_loss(
+                    prediction,
+                    actions_device[:, start:stop],
+                    mask_device[:, start:stop],
+                    delta_weight,
+                )
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+                optimizer.step()
+                if hidden is not None:
+                    if isinstance(hidden, tuple):
+                        hidden = tuple(value.detach() for value in hidden)
+                    else:
+                        hidden = hidden.detach()
+                train_loss += float(loss.detach())
+                batches += 1
         validation_prediction, _ = _predict(model, validation_set, mean, std, device, batch_size)
         validation_loss = float(
             _masked_loss(validation_prediction, validation_set.actions, validation_set.valid_mask, delta_weight)
@@ -707,14 +761,22 @@ def train(
             "context_steps": context_steps,
             "kernel_size": kernel_size,
             "num_heads": num_heads,
+            "action_size": len(train_set.action_names),
+            "motor_action_count": sum(
+                name.startswith("command.motor_")
+                for name in train_set.action_names
+            ),
         },
         "normalization": {"mean": mean, "std": std},
         "observation_names": train_set.observation_names,
         "action_names": train_set.action_names,
+        "initial_previous_command": dataset_manifest["initial_previous_command"],
         "leakage_contract": "no parameters, gains, or truth-only actuator state in model input",
         "previous_command_input": not exclude_previous_command,
         "previous_command_noise_std": previous_command_noise_std,
         "previous_command_reset_prob": previous_command_reset_prob,
+        "training_batch_size": batch_size,
+        "tbptt_steps": tbptt_steps,
         "source_dataset": str(dataset_directory),
         "parent_checkpoint": (
             None if resume_checkpoint is None else str(resume_checkpoint)
@@ -744,6 +806,10 @@ def load_student(checkpoint_path: Path, device: torch.device) -> tuple[CausalLQI
         int(cfg["recurrent_layers"]),
         tuple(cfg["head_sizes"]),
         float(cfg["dropout"]),
+        action_size=int(
+            cfg.get("action_size", len(checkpoint.get("action_names", ())) or 5)
+        ),
+        motor_action_count=int(cfg.get("motor_action_count", 2)),
         arch=arch,
         context_steps=cfg.get("context_steps"),
         kernel_size=int(cfg.get("kernel_size", 3)),

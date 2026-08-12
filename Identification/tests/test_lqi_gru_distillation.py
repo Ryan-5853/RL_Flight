@@ -23,6 +23,7 @@ from flight_identification.lqi_gru_distillation import (  # noqa: E402
 )
 from flight_identification.lqi_gru_experiment import (  # noqa: E402
     ACTION_NAMES,
+    EXTERNAL_UPPER_ACTION_NAMES,
     OBSERVATION_NAMES,
     _oracle_gains,
 )
@@ -107,6 +108,22 @@ class LQIGRUDistillationTests(unittest.TestCase):
         loss.backward()
         self.assertTrue(any(parameter.grad is not None for parameter in model.parameters()))
 
+    def test_causal_student_supports_native_four_output_contract(self) -> None:
+        model = CausalLQIStudent(
+            len(OBSERVATION_NAMES),
+            16,
+            2,
+            (12,),
+            0.0,
+            action_size=len(EXTERNAL_UPPER_ACTION_NAMES),
+            motor_action_count=1,
+        )
+        prediction, _, _ = model(torch.randn(3, 11, len(OBSERVATION_NAMES)))
+        self.assertEqual(tuple(prediction.shape), (3, 11, 4))
+        self.assertTrue((prediction[..., :1] >= 0.0).all())
+        self.assertTrue((prediction[..., :1] <= 1.0).all())
+        self.assertTrue((prediction[..., 1:].abs() <= 1.0).all())
+
     def test_oracle_designs_one_augmented_gain_per_parameter_row(self) -> None:
         from flight_controller import load_controller_config
         from simenv.config import load_and_materialize
@@ -118,6 +135,21 @@ class LQIGRUDistillationTests(unittest.TestCase):
             load_controller_config(controller), materialized.parameters, 1.0 / 500.0
         )
         self.assertEqual(tuple(gains.shape), (2, 5, 13))
+        self.assertTrue(torch.isfinite(gains).all())
+
+    def test_external_upper_oracle_designs_four_input_gain(self) -> None:
+        from flight_controller import load_controller_config
+        from simenv.config import load_and_materialize
+
+        simulator = ROOT / "SimEnv/configs/sim2real_micro_coaxial.yaml"
+        controller = ROOT / "Controller/configs/lqi_sim2real_micro_coaxial_4out.yaml"
+        materialized = load_and_materialize(
+            simulator, 2, torch.device("cpu"), torch.float64
+        )
+        gains = _oracle_gains(
+            load_controller_config(controller), materialized.parameters, 1.0 / 500.0
+        )
+        self.assertEqual(tuple(gains.shape), (2, 4, 13))
         self.assertTrue(torch.isfinite(gains).all())
 
 
