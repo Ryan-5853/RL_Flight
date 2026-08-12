@@ -438,6 +438,13 @@ CONFIG_NN_CONTROL_BACKEND_HYBRID=y
 `HybridControllerBackend.cpp`。执行器输出由 `NN_LQI_OUTPUT_EN` 参数门控，
 默认 `0`，在完成台架/HIL 验证前不得置 `1`。
 
+2026-08-12 起新增辨识模型版本：真机日志离线辨识的 19 状态复合 LQI
+（`LqiCompositeCore.hpp` + `LqiIdentifiedModel.hpp`），原有 13 状态标称权重
+保持不动，由 `NN_LQI_MODEL`（0=标称，1=辨识）在 `ln` 模块启动时选择。
+详见 `px4_trans/LQI_NOMINAL_PORT_zh.md` 的“辨识模型版本”一节；SimEnv 闭环
+极性检查结果为
+`Identification/datasets/real_logs_26_8_12_v1/polarity_check_identified_lqi.json`。
+
 从 `RL_Flight/` 根目录执行以下完整命令：
 
 ```bash
