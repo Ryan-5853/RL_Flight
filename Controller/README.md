@@ -67,6 +67,6 @@ collective command 解释为上桨 PWM，并自动计算反扭矩平衡的下桨
 ## 测试
 
 ```bash
-PYTHONPATH=src:../SimEnv/src \
+PYTHONPATH=src:../TeleaiTrans_Simenv/src \
 python -m unittest discover -s tests -v
 ```

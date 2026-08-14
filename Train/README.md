@@ -49,7 +49,7 @@ python -m pip install --upgrade pip setuptools wheel
 python -m pip install torch==2.12.1 \
   --index-url https://download.pytorch.org/whl/cu126
 python -m pip install -r requirements.txt
-python -m pip install -e ../SimEnv -e .
+python -m pip install -e ../TeleaiTrans_Simenv -e .
 ```
 
 `requirements.txt` 和 `pyproject.toml` 精确锁定 Python 依赖版本；cu126 wheel 的来源由
@@ -103,7 +103,7 @@ python -m unittest discover -s tests -v
 第 14 节验收标准可单独运行：
 
 ```bash
-PYTHONPATH=src:../SimEnv/src python -m unittest tests.test_acceptance -v
+PYTHONPATH=src:../TeleaiTrans_Simenv/src python -m unittest tests.test_acceptance -v
 ```
 
 SimEnv 已提供版本化完整动态 `state_dict/load_state_dict`，第 7 项会验证连续运行

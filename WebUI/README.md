@@ -237,7 +237,7 @@ session status 还会返回：
 可在目标机器上先绕过浏览器，测量完整“控制器 + SimEnv + 60 Hz 遥测打包”链路：
 
 ```bash
-PYTHONPATH=../SimEnv/src:../Controller/src:../Deploy/src:. \
+PYTHONPATH=../../TeleaiTrans_Simenv/src:../Controller/src:../Deploy/src:. \
 python benchmark_runtime.py \
   ../SimEnv/configs/example.yaml \
   /path/to/controller_test.yaml \

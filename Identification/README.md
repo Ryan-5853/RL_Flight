@@ -70,13 +70,13 @@ The reproducible baseline uses 4,096 airframes with eight trials each:
 
 ```bash
 env PYTHONNOUSERSITE=1 \
-  PYTHONPATH=Identification/src:Controller/src:SimEnv/src \
+  PYTHONPATH=Identification/src:Controller/src:../TeleaiTrans_Simenv/src \
   /home/ryan/miniconda3/envs/rl-flight/bin/python \
   -m flight_identification.repeated_trial_experiment \
   --config Identification/configs/lqr_sim2real_micro_repeated8_v1.yaml
 
 env PYTHONNOUSERSITE=1 \
-  PYTHONPATH=Identification/src:Controller/src:SimEnv/src \
+  PYTHONPATH=Identification/src:Controller/src:../TeleaiTrans_Simenv/src \
   /home/ryan/miniconda3/envs/rl-flight/bin/python \
   -m flight_identification.repeated_trial_training \
   --dataset Identification/datasets/lqr_sim2real_micro_repeated8_v1 \
@@ -84,7 +84,7 @@ env PYTHONNOUSERSITE=1 \
   --device cuda:0 --downsample 5
 
 env PYTHONNOUSERSITE=1 \
-  PYTHONPATH=Identification/src:Controller/src:SimEnv/src \
+  PYTHONPATH=Identification/src:Controller/src:../TeleaiTrans_Simenv/src \
   /home/ryan/miniconda3/envs/rl-flight/bin/python \
   -m flight_identification.sim2real_control_evaluation \
   --checkpoint Identification/runs/sim2real_micro_repeated8_mlp_v3/identifier.pt \
@@ -124,7 +124,7 @@ the manifest states this limitation explicitly.
 From the repository root:
 
 ```bash
-PYTHONPATH=Identification/src:Controller/src:SimEnv/src \
+PYTHONPATH=Identification/src:Controller/src:../TeleaiTrans_Simenv/src \
 python -m flight_identification \
   --config Identification/configs/lqr_zero_attitude_yaw_rate_v1.yaml
 ```
@@ -132,7 +132,7 @@ python -m flight_identification \
 A small pipeline check can be generated without editing the YAML:
 
 ```bash
-PYTHONPATH=Identification/src:Controller/src:SimEnv/src \
+PYTHONPATH=Identification/src:Controller/src:../TeleaiTrans_Simenv/src \
 python -m flight_identification \
   --config Identification/configs/lqr_zero_attitude_yaw_rate_v1.yaml \
   --parameter-groups 16 \
@@ -160,7 +160,7 @@ by absolute path:
 
 ```bash
 env PYTHONNOUSERSITE=1 \
-  PYTHONPATH=Identification/src:Controller/src:SimEnv/src \
+  PYTHONPATH=Identification/src:Controller/src:../TeleaiTrans_Simenv/src \
   /home/ryan/miniconda3/envs/rl-flight/bin/python \
   -m flight_identification \
   --config Identification/configs/lqr_zero_attitude_yaw_rate_v1.yaml \
@@ -251,7 +251,7 @@ reconstructing a gain from its predictions and applying that gain to every true
 test-group linearization:
 
 ```bash
-PYTHONPATH=Identification/src:Controller/src:SimEnv/src \
+PYTHONPATH=Identification/src:Controller/src:../TeleaiTrans_Simenv/src \
 python -m flight_identification.control_evaluation \
   --checkpoint Identification/artifacts/mlp_baseline/identifier.pt \
   --dataset Identification/datasets/lqr_zero_attitude_yaw_rate_v1 \
@@ -318,7 +318,7 @@ Generate and train the 16-trial dataset with:
 
 ```bash
 env PYTHONNOUSERSITE=1 \
-  PYTHONPATH=Identification/src:Controller/src:SimEnv/src \
+  PYTHONPATH=Identification/src:Controller/src:../TeleaiTrans_Simenv/src \
   /home/ryan/miniconda3/envs/rl-flight/bin/python \
   -m flight_identification.repeated_trial_experiment \
   --config Identification/configs/lqr_repeated_trials_wide16_v1.yaml
