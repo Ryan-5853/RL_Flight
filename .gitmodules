@@ -1,4 +1,4 @@
 [submodule "px4_trans/px4"]
 	path = px4_trans/px4
 	url = https://github.com/Ryan-5853/PX4-Autopilot
-	branch = teleai/v1.15.4
+	branch = teleai/v1.16.2
