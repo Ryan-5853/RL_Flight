@@ -102,3 +102,26 @@ LQI。原有 13 状态标称权重（`LqiNominalModel.hpp`、`lqi_golden.*`）�
 检查脚本为 `Identification/scripts/polarity_check_identified_lqi.py`，结果为
 `Identification/datasets/real_logs_26_8_12_v1/polarity_check_identified_lqi.json`
 （四个方向初始角加速度方向正确、4 s 内回正，舵机指令对 ±roll 反对称，输出有界）。
+
+## 2026-08-28 调参：增大积分项与打杆指令比例
+
+针对 `lqi_identified` 真机悬停稳态误差偏大、手动打杆响应不足的问题，保持
+辨识数据和编码器不变，做了两处调整：
+
+- **积分项约翻倍**：离线辨识重新合成增益时把 LQR 积分权重提高 4 倍
+  （`integral_state_scales` 由 `[0.04, 0.04, 0.25]` 减半为
+  `[0.02, 0.02, 0.125]`），新的 `analysis_gain` 中三路积分列约为原来的 2 倍，
+  其余列由 LQR 耦合略增。合成配置在
+  `Controller/configs/lqi_sim2real_micro_coaxial_4out_strong_integral.yaml`，
+  辨识实验配置在
+  `Identification/configs/lqr_sim2real_micro_offline_logs_v4_strong_integral.yaml`；
+  标称 13 状态 4out 配置与权重保持不变。
+- **打杆指令比例提高**：`configs/lqi_nominal_deployment.yaml` 的
+  `manual_reference` 由 roll/pitch 12°、yaw 1.2 rad/s 调整为 roll/pitch 18°、
+  yaw 1.5 rad/s；滤波时间常数不变。该常量为标称/辨识两版共用的摇杆参考契约，
+  标称增益本身未变。
+
+重新生成后的验证：两套主机 golden 检查全部通过；SimEnv 闭环 8 s 扰动回正中
+roll 残差 0.16°→0.13°、pitch 残差 0.08°→0.003°；打杆阶跃 t90 由约 0.44 s
+缩短到约 0.39 s，四个方向极性检查全部正确、输出有界。辨识模型极点半径由
+0.9956 改善到 0.9912。
