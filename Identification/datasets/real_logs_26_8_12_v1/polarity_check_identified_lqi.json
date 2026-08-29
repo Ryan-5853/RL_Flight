@@ -1,0 +1,48 @@
+{
+  "roll_plus": {
+    "initial_error_deg": 12.0,
+    "initial_axis_acceleration_rad_s2": -12.573844194412231,
+    "polarity_sign_ok": true,
+    "outputs_finite_and_bounded": true,
+    "peak_tilt_deg": 12.0,
+    "final_tilt_deg": 0.10167145697955836,
+    "safe": true
+  },
+  "roll_minus": {
+    "initial_error_deg": -12.0,
+    "initial_axis_acceleration_rad_s2": 11.91117838025093,
+    "polarity_sign_ok": true,
+    "outputs_finite_and_bounded": true,
+    "peak_tilt_deg": 12.0,
+    "final_tilt_deg": 0.2529412182479308,
+    "safe": true
+  },
+  "pitch_plus": {
+    "initial_error_deg": 10.0,
+    "initial_axis_acceleration_rad_s2": -13.056696951389313,
+    "polarity_sign_ok": true,
+    "outputs_finite_and_bounded": true,
+    "peak_tilt_deg": 9.999999046325684,
+    "final_tilt_deg": 0.12799385316443246,
+    "safe": true
+  },
+  "pitch_minus": {
+    "initial_error_deg": -10.0,
+    "initial_axis_acceleration_rad_s2": 8.180392533540726,
+    "polarity_sign_ok": true,
+    "outputs_finite_and_bounded": true,
+    "peak_tilt_deg": 9.999999046325684,
+    "final_tilt_deg": 0.2550275265545184,
+    "safe": true
+  },
+  "antisymmetry": {
+    "mean_servo_cmd_sum_deg": 0.017116529867053032,
+    "ok": true
+  },
+  "nominal_agreement": {
+    "nominal_roll_accel_rad_s2": -13.46668004989624,
+    "identified_roll_accel_rad_s2": -12.573844194412231,
+    "ok": true
+  },
+  "polarity_ok": true
+}

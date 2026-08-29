@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "artifact_type": "offline_log_quality_calibration",
+  "checkpoint": "/home/ryan_wsl/RL_Flight/Identification/runs/repro_20260806/sim2real_offline_logs_step_response_mlp_v7/identifier.pt",
+  "checkpoint_sha256": "8dce015b1580d418505802d309a2396135c5250cf204636456866cc18c16d057",
+  "dataset": "/home/ryan_wsl/RL_Flight/Identification/datasets/lqr_sim2real_micro_offline_logs_v4",
+  "split": "validation",
+  "feature_names": [
+    "attitude_q_tilt.w",
+    "attitude_q_tilt.x",
+    "attitude_q_tilt.y",
+    "attitude_q_tilt.z",
+    "angular_velocity_b.x",
+    "angular_velocity_b.y",
+    "angular_velocity_b.z",
+    "motor_speed.upper",
+    "motor_speed.lower",
+    "command.motor_upper",
+    "command.motor_lower",
+    "command.servo_1",
+    "command.servo_2",
+    "command.servo_3"
+  ],
+  "effective_sample_hz": 100.0,
+  "history_steps": 200,
+  "calibration_parameter_groups": 740,
+  "minimum_selected_flights": 4,
+  "lower_quantile": 0.01,
+  "upper_quantile": 0.99,
+  "thresholds": {
+    "minimum_axis_rate_rms_rad_s": {
+      "x": 0.28480829775333405,
+      "y": 0.26634917318820955,
+      "z": 0.20100689351558684
+    },
+    "minimum_command_movement_rms_per_sample": 0.052204238697886464,
+    "maximum_feature_z_score_abs_p95": 3.079722073078156,
+    "maximum_feature_z_score_abs_max": 14.903742151260383
+  },
+  "deployment_mode": "offline_analysis_only",
+  "meaning": "Thresholds use validation closed-loop flights only. Passing permits a candidate to enter independent simulation/HIL validation, not flight."
+}

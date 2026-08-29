@@ -50,12 +50,29 @@ compile_commands.json
 # Training, simulation, and experiment outputs
 /Train/runs/
 /Train/evaluation_runs/
-/Identification/datasets/
 /Identification/artifacts/
-/Identification/runs/
 /Identification/outputs/
 /Identification/real_log/
 /WebUI/runtime-runs/
+
+# Offline-identification inference artifacts are small enough to track:
+# the v7 encoder checkpoints, the hybrid calibration/manifest, and the
+# cleaned real-log bundle consumed by evaluate_real_log_hybrid.py.
+/Identification/datasets/*
+!/Identification/datasets/real_logs_26_8_12_v1/
+/Identification/runs/*
+!/Identification/runs/repro_20260806/
+/Identification/runs/repro_20260806/*
+!/Identification/runs/repro_20260806/sim2real_offline_hybrid_v7/
+!/Identification/runs/repro_20260806/sim2real_offline_logs_step_response_tcn_500hz_v7/
+!/Identification/runs/repro_20260806/sim2real_offline_logs_step_response_bigru_500hz_v7b/
+!/Identification/runs/repro_20260806/sim2real_offline_logs_step_response_mlp_v7/
+/Identification/runs/repro_20260806/sim2real_offline_logs_step_response_tcn_500hz_v7/*
+!/Identification/runs/repro_20260806/sim2real_offline_logs_step_response_tcn_500hz_v7/identifier.pt
+/Identification/runs/repro_20260806/sim2real_offline_logs_step_response_bigru_500hz_v7b/*
+!/Identification/runs/repro_20260806/sim2real_offline_logs_step_response_bigru_500hz_v7b/identifier.pt
+/Identification/runs/repro_20260806/sim2real_offline_logs_step_response_mlp_v7/*
+!/Identification/runs/repro_20260806/sim2real_offline_logs_step_response_mlp_v7/identifier.pt
 logs/
 *.log
 *.ulg
