@@ -1,0 +1,6 @@
+# Fixed demo geometry. Regenerate pair headers and restart comp_control after changes.
+unit_model: SimEnv/configs/sim2real_micro_coaxial_3100kv_airframe1_manual_v2.yaml
+unit_controller: Controller/configs/lqi_coaxial_collective_servo_airframe1_manual_v3.yaml
+arm_m: 0.075
+# Must match CEKF_MSTR_YAW / CEKF_SLV_YAW. Both aircraft share the unit model.
+installation_yaw_deg: [-30.0, 30.0]

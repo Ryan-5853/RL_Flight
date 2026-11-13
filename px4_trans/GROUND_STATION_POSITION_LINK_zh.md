@@ -1,6 +1,6 @@
 # 地面站位置闭环与 RC 子模式约定
 
-状态日期：2026-10-21\
+状态日期：2026-11-03\
 适用固件：`micoair_h743-v2_nncontrol`\
 串口：TELEM1 / `SERIAL1` / `/dev/ttyS0`\
 串口波特率：`4000000`；`8N1`、无硬件流控是当前实现默认
@@ -19,8 +19,8 @@ UDP 实测记录：[2026-10-20 延迟与带宽测试](GS_LINK_UDP_LATENCY_TEST_2
 - 飞控只接收四轴归一化虚拟遥控量；
 - 地面站控制注册为 PX4 External Mode，但仍受 RC 手动控制监督；
 - 实机 RC 是唯一主手动输入；地面站只能在 RC 监督通过后替换四轴指令；
-- RC 解锁、通道 8 模式槽 6、链路新鲜度和全部既有安全门控必须同时成立；
-- 通道 8 离开模式槽 6、RC disarm、RC 丢失或地面站链路超时，立即退出；
+- RC 解锁、通道 8 模式槽 4、链路新鲜度和全部既有安全门控必须同时成立；
+- 通道 8 离开模式槽 4、RC disarm、RC 丢失或地面站链路超时，立即退出；
 - 地面站链路中断后恢复，不自动重新接管，必须先回模式 1 再选模式 6；
 - 串口固定为 4,000,000 baud；`8N1`、无硬件流控按当前实现，协议讨论时确认；
 - 目标状态下，串口 1 的运行时唯一占用者是 ESP 自定义 GS-Link 协议；MAVLink
@@ -73,7 +73,7 @@ RC 优先约定。
   │  GS-Link v1（gs_link 独占）
   ▼
 nn_control
-  │  RC 解锁 + RC 模式槽 6 + 指令新鲜
+  │  RC 解锁 + RC 模式槽 4 + 指令新鲜
   ▼
 LQI / 执行器输出
 ```
@@ -122,20 +122,20 @@ UART 上。当前已决定：GS-Link v1 自定义协议成为 `ttyS0` 的唯一�
 2. RC 手动输入有效、新鲜，且来源是物理 RC；
 3. 原始 `input_rc` 没有 `rc_lost`/`rc_failsafe`，来源不是 MAVLink；
 4. `RC_MAP_FLTMODE` 已配置为通道 8；
-5. 通道 8 当前对应 `manual_control_switches.mode_slot == 6`；
-6. `COM_FLTMODE6` 映射到 `nn_control` 注册并可选择的 External Mode；
+5. 通道 8 当前对应 `manual_control_switches.mode_slot == 4`；
+6. `COM_FLTMODE4` 映射到 `nn_control` 注册并可选择的 External Mode；
 7. 飞控实际 `vehicle_status.nav_state` 已进入该 External Mode；
 8. 本次解锁后模式 6 被重新选择，并保持 100 ms；
 9. 地面站指令在 `NN_GS_TIMEOUT_MS` 内持续更新。
 
-物理 RC 的槽 6 可能比 Commander 的 External Mode 早一个控制周期可见。门控在
+物理 RC 的槽 4 可能比 Commander 的 External Mode 早一个控制周期可见。门控在
 `nav_state` 尚未切到 External Mode 时保持 RC，但保留本次模式 6 的选择授权；
 只有 External Mode 生效后才开始 100 ms 确认计时，不需要飞手重复拨动开关。
 
 以下任一条件成立，在下一个 2 ms 控制周期退出地面站控制：
 
 - RC disarm；
-- 通道 8 离开模式槽 6，包括进入模式 1–5；
+- 通道 8 离开模式槽 4，包括进入模式 1–3、5–6；
 - RC 信号丢失、failsafe、校准或通道数不满足；
 - 地面站指令超时；
 - `NN_GS_EN=0` 或当前传输层来源不匹配。
@@ -158,11 +158,12 @@ rates 和 allocation 开启，position、velocity、altitude、climb-rate、auto
 ```text
 RC_MAP_FLTMODE=8
 COM_FLTMODE1=0      # Manual，RC
-COM_FLTMODE6=101    # External Mode 2，地面站
-NN_GS_MODE_SLOT=6
+COM_FLTMODE4=101    # External Mode 2，地面站
+COM_FLTMODE6=102    # External Mode 3，组合模式
+NN_GS_MODE_SLOT=4
 ```
 
-`nn_control` 启动后注册名为 `Ground Station` 的 External Mode，并把模式槽 6 自动
+`nn_control` 启动后注册名为 `Ground Station` 的 External Mode，并把模式槽 4 自动
 映射到 PX4 实际分配的 External Mode 编号。PX4 通过 `COM_MODE<n>_HASH` 保证同一
 模式名稳定分配到同一索引。22001 机架启动脚本预留 `COM_MODE0_HASH`，并把
 `Ground Station` 的 FNV-1a 哈希写入 `COM_MODE1_HASH`，因此固定分配为
@@ -185,11 +186,11 @@ WebUI 只有在地面站遥测新鲜且飞控报告 `GS_MODE_ACTIVE` 时才显�
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
 | `NN_GS_EN` | `1` | 默认允许 RC 监督下的地面站输入；可显式设为 `0` 禁用 |
-| `NN_GS_MODE_SLOT` | `6` | 地面站 RC 飞行模式槽位 |
+| `NN_GS_MODE_SLOT` | `4` | 地面站 RC 飞行模式槽位 |
 | `NN_GS_TIMEOUT_MS` | `250` | 地面站指令最大允许间隔 |
 | `RC_MAP_FLTMODE` | 部署值 `8` | 通道 8 作为六槽飞行模式开关 |
 | `COM_FLTMODE1` | 部署值 `0` | 模式槽 1 = Manual/RC |
-| `COM_FLTMODE6` | 部署值 `101` | 目标为模式槽 6 = External Mode 2 |
+| `COM_FLTMODE4` | 部署值 `101` | 目标为模式槽 4 = External Mode 2 |
 | `COM_MODE0_HASH` | `-301203826` | 预留 External Mode 1 槽 |
 | `COM_MODE1_HASH` | `-696130346` | 固定 `Ground Station` 为 External Mode 2 |
 | `COM_RC_IN_MODE` | 实机 `0`；HIL `2` | 实机 RC-only；HIL 保留 WebUI 飞手 |
@@ -219,7 +220,7 @@ param show NN_GS_MODE_SLOT
 param show NN_GS_TIMEOUT_MS
 param show RC_MAP_FLTMODE
 param show COM_FLTMODE1
-param show COM_FLTMODE6
+param show COM_FLTMODE4
 param show COM_MODE0_HASH
 param show COM_MODE1_HASH
 commander status
@@ -285,7 +286,7 @@ GS-Link v1 只有 CRC，不提供链路认证或加密；能访问该 UDP 或串
    ```
 
    `commander status` 应出现一个 `Ground Station` External Mode。切到模式 6 时
-   `manual_control_switches.mode_slot` 必须为 6，`vehicle_status.nav_state` 必须为
+   `manual_control_switches.mode_slot` 必须为 4，`vehicle_status.nav_state` 必须为
    该 External Mode 的 nav_state；若模式槽是 6、但 nav_state 仍为 Manual，说明
    External Mode 未注册或模式槽映射不正确。
 
@@ -328,7 +329,7 @@ bash px4_trans/tests/run_ground_station_gate_check.sh
 
 | 日期 | 变更 |
 | --- | --- |
-| 2026-10-21 | 改为 RC 飞行模式槽 6；注册 Ground Station External Mode，离开槽或链路失效立即回 RC |
+| 2026-10-21 | 改为 RC 飞行模式槽 4；注册 Ground Station External Mode，离开槽或链路失效立即回 RC |
 | 2026-10-20 | 固化 RC 监督状态机、实机 RC-only、通道 8 手势、超时退出和安全门控 |
 | 2026-10-20 | 串口固定为 4,000,000 8N1；MAVLink 明确标记为待替换原型 |
 | 2026-10-20 | 确定 GS-Link v1 二进制协议，ESP 独占串口 1，MAVLink 仅保留为过渡原型 |

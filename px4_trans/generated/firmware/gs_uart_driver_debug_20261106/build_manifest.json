@@ -1,0 +1,20 @@
+{
+  "build_utc": "2026-11-06T08:03:38.979585+00:00",
+  "files_sha256": {
+    "micoair_h743-v2_nncontrol_gs_uart_driver_debug.px4": "9ee319bf07df9b9de70a196ce52d0cc97005d4fdb83ceb9022713f34bb6a9632",
+    "micoair_h743-v2_nncontrol_gs_uart_driver_debug.elf": "4132660fd56b30ec5cd1cc8afb04d5bd901f07612299452b917262bc7e4b336d"
+  },
+  "source_sha256": {
+    "src/modules/gs_link/GsLink.cpp": "0190ce0ca43af42596b83d632cce8112346a12d05a37c99d1e132b6fb7a4c17e",
+    "boards/micoair/h743-v2/nuttx-config/nsh/defconfig": "6fb7ead3c38ee1a9f8fe0423d4649439c2cb8a2af781796e894a3074e48bcc64",
+    "platforms/nuttx/NuttX/nuttx/arch/arm/src/stm32h7/Kconfig": "2ba8488227b7edb03348e192b656ee971cfbdfc24496bd0f7c1e42b7d6a42948",
+    "platforms/nuttx/NuttX/nuttx/arch/arm/src/stm32h7/stm32_serial.c": "14ece4f62cb42fe59d3adef7d3d1e4efe8b99e2e49106cfc156f9803766b6859",
+    "platforms/nuttx/NuttX/nuttx/arch/arm/src/stm32h7/stm32_usart1_rxdiag.h": "80a1f5c7b2e3c8f83ca10802085b6cbfc2ee46fd1deee65e7691b94b42bd73c9"
+  },
+  "diagnostic_config": "CONFIG_STM32H7_USART1_RXDIAG=y",
+  "validation": [
+    "Target firmware build passed",
+    "Driver diagnostic symbol and revision marker present in ELF"
+  ],
+  "flashed": false
+}

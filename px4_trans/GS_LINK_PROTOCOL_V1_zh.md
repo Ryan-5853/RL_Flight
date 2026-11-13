@@ -1,5 +1,7 @@
 # GS-Link v1 地面站串口协议设计
 
+> 2026-11-03：地面组合适配已增加 `DATA_RC` bit2 `PairControl` 和 DATA `0x10–0x13`。定义见固件 `GsLinkDiagnostics.hpp` 及 [地面组合流程](../Docs/GROUND_PAIR_FLIGHT_zh.md)。ESP 保证逐 UDP 包一帧；基础 v1 帧格式和遥测不变。
+
 状态：v1 通信测试已实现；飞行控制动作未启用\
 日期：2026-10-20\
 物理层：TELEM1 / `SERIAL1` / `/dev/ttyS0`，`4,000,000 8N1`，无硬件流控\
@@ -11,8 +13,8 @@
 GS-Link v1 只替换地面站到飞控的传输层，不改变既有 RC 监督状态机：
 
 - 实机 RC 仍是唯一主手动输入和唯一解锁来源；
-- 通道 8 的模式槽 6 仍是地面站子模式的物理硬门控；
-- RC disarm、RC 丢失、通道 8 离开模式槽 6 或链路超时，仍立即退出；
+- 通道 8 的模式槽 4 仍是地面站子模式的物理硬门控；
+- RC disarm、RC 丢失、通道 8 离开模式槽 4 或链路超时，仍立即退出；
 - 飞控仍只接收四轴归一化虚拟遥控量，不接收位置目标；
 - `NN_LQI_OUTPUT_EN`、Commander、failsafe 和执行器授权全部不变；
 - 串口 1 由 ESP 自定义协议独占，MAVLink 不再占用该口；
@@ -200,7 +202,7 @@ FC 接收后按 `value / 10000.0f` 转成 `[-1,1]`，再交给现有
 | 0 | `ARMED` | 飞控已解锁 |
 | 1 | `GS_MODE_ACTIVE` | RC 监督下的地面站模式已生效 |
 | 2 | `RC_VALID` | 物理 RC 输入有效 |
-| 3 | `RC_SWITCH_SELECTED` | 通道 8 位于地面站模式槽（当前为槽 6） |
+| 3 | `RC_SWITCH_SELECTED` | 通道 8 位于地面站模式槽（当前为槽 4） |
 | 4 | `FAILSAFE` | failsafe 生效 |
 | 5 | `ATTITUDE_VALID` | 姿态角有效 |
 | 6 | `MOTOR_RPM_VALID` | 两路电机 RPM 都有效 |
@@ -377,7 +379,7 @@ FC 只有在以下条件都成立时才把地面站输入视为有效：
 - `DATA_RC.flags.VALID=1`；
 - RC 数据在 250 ms 内；
 - GCS 心跳在 500 ms 内；
-- 物理 RC、模式槽 6 和 External Mode 状态仍由 `GroundStationGate` 判定通过。
+- 物理 RC、模式槽 4 和 External Mode 状态仍由 `GroundStationGate` 判定通过。
 
 任一条件失效，FC 立即回到 RC；不自动恢复。GCS 的 `DATA_RC` 只依赖新鲜
 FC 遥测，不因低频心跳偶发缺失而停止；需要 `session_id` 的指令仍要求 FC
@@ -416,9 +418,9 @@ GS-Link 不能取代 RC，也不能直接写电机/舵机：
 
 - `DATA_RC` 只提供四轴归一化虚拟遥控量；
 - 模式槽只从物理 RC 的 `manual_control_switches` 读取，协议不能设置；
-- 起飞/降落/abort 仅在 `GS_MODE_ACTIVE`、RC 已解锁、模式槽 6 且链路新鲜时执行；
+- 起飞/降落/abort 仅在 `GS_MODE_ACTIVE`、RC 已解锁、模式槽 4 且链路新鲜时执行；
 - 任何指令被拒绝都返回 ACK，不允许静默改变飞行状态；
-- RC disarm、RC 丢失、通道 8 离开模式槽 6 或链路超时，地面站指令立即取消；
+- RC disarm、RC 丢失、通道 8 离开模式槽 4 或链路超时，地面站指令立即取消；
 - 起飞/降落指令不会自动 arm，也不会绕过 `NN_LQI_OUTPUT_EN`；
 - `CMD_TAKEOFF`/`CMD_LAND` 的飞控执行逻辑尚未实现前，飞控必须返回
   `UNSUPPORTED`，不能假装执行。
@@ -493,7 +495,7 @@ F0 D8
 
 1. `MAV_0_CONFIG=0`，`/dev/ttyS0` 由 `gs_link` 独占；
 2. `gs_link start -d /dev/ttyS0 -b 4000000` 在 `nn_control` 之前启动；
-3. `DATA_RC` 转换为 `GsLinkControl`，继续经过 RC 模式槽 6 门控；`NN_GS_EN` 默认
+3. `DATA_RC` 转换为 `GsLinkControl`，继续经过 RC 模式槽 4 门控；`NN_GS_EN` 默认
    为 `1`，因此门控通过时允许替换 RC 四轴输入；
 4. `DATA_TELEMETRY` 包含姿态、两路电机转速、电源状态和实际 RC 通道；
 5. `CMD_PING`、心跳和 ACK 已实现；
@@ -514,3 +516,8 @@ F0 D8
 - 地面站闭环实飞授权与飞行前检查；
 - 是否需要事件包或日志通道；
 - 是否需要大包分片（v1 明确不支持）。
+
+
+## 动捕三轴姿态与时间同步扩展（2026-11-06）
+
+新增DATA `0x03`（36字节动捕姿态）和DATA `0x04`（8字节时间同步请求/24字节回复）；旧消息不变。字段、坐标变换、50 Hz发送规则与启用参数见[MOCAP_FULL_ATTITUDE_zh.md](MOCAP_FULL_ATTITUDE_zh.md)。

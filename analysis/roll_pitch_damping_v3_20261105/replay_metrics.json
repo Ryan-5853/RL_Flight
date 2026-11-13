@@ -1,0 +1,18 @@
+{
+  "scope": "Identical recorded inputs: controller-output sensitivity, NOT alternate flight.",
+  "results": {
+    "v2": {
+      "servo1_4_8hz_rms": 0.1662367287385017,
+      "max_abs_roll_integral_moment": 0.0044999998062849045,
+      "motor_command_max": 0.36350372433662415,
+      "servo_command_max_abs": 0.9293691515922546
+    },
+    "v3": {
+      "servo1_4_8hz_rms": 0.04223543053718104,
+      "max_abs_roll_integral_moment": 0.008099999278783798,
+      "motor_command_max": 0.36350372433662415,
+      "servo_command_max_abs": 0.8146095871925354
+    }
+  },
+  "v3_v2_band_rms_ratio": 0.2540679839990077
+}

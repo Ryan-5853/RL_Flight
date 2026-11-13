@@ -1,0 +1,15 @@
+{
+  "scope": "Existing model evaluated on recorded commands/RPM; no measured grid forces or linkage angles",
+  "time_s": [
+    30,
+    32
+  ],
+  "predicted_grid_force_body_y_right_mean_n": 0.13255128315832942,
+  "predicted_grid_roll_moment_mean_n_m": -0.006039625390344059,
+  "user_clarification": "Right refers to position motion, not right side physically down",
+  "motion_27_30_under_marker_heading": {
+    "right_velocity_mean_m_s": 0.123,
+    "right_acceleration_mean_m_s2": -0.09,
+    "method": "100Hz resampling, 1.01s Savitzky-Golay derivatives; marker horizontal right direction"
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "built_utc": "2026-11-06T07:32:05.676001+00:00",
+  "sha256": {
+    "micoair_h743-v2_nncontrol_gs_uart_hw_debug.px4": "1be8a1d3b4b6f0e3778fb5cdd1302db20efb698998ce4232b339383b3c0c1188",
+    "micoair_h743-v2_nncontrol_gs_uart_hw_debug.elf": "da49a6f4cdd6e6a4bf7b908d983db2408a7fde7d9d4f4b57829fb1e30cafe970"
+  },
+  "source_sha256": "1df5880d04faea38c60241d1333804694e54c42c004fe72aacfd4b20e05b1a44",
+  "validation": "Target board firmware build passed; hardware reads not yet tested on the aircraft",
+  "flashed": false
+}

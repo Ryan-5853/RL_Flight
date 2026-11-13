@@ -1,0 +1,217 @@
+{
+  "source": "/home/ryan/RL_Flight/log/26.11.5/log_0_UnknownDate_1.ulg",
+  "windows_seconds": {
+    "prearm_not_verified_stationary": [
+      2,
+      7
+    ],
+    "flight": [
+      19,
+      32
+    ]
+  },
+  "fifo": {
+    "0": {
+      "device_id": 6684690,
+      "dt_us": 500.0,
+      "windows": {
+        "prearm_not_verified_stationary": {
+          "std_rad_s": [
+            0.08703345060348511,
+            0.07295149564743042,
+            0.31431543827056885
+          ],
+          "mean_rad_s": [
+            -0.0006027092458680272,
+            0.0006360193365253508,
+            -0.044820431619882584
+          ],
+          "max_abs_rad_s": [
+            0.6263754367828369,
+            0.49854370951652527,
+            2.3265373706817627
+          ],
+          "spacing_us_p50_p99_max": [
+            500.000000000167,
+            549.0000000003547,
+            554.0000000001655
+          ],
+          "sample_count": 9979,
+          "peak_250_350_hz": [
+            327.1484375,
+            349.609375,
+            345.21484375
+          ],
+          "rms_250_350_rad_s": [
+            0.010575151160400366,
+            0.009271669404933807,
+            0.010769145184019778
+          ]
+        },
+        "flight": {
+          "std_rad_s": [
+            2.308497905731201,
+            0.9060357809066772,
+            0.3759624660015106
+          ],
+          "mean_rad_s": [
+            -0.009732436388731003,
+            -0.0040756394155323505,
+            0.01830441690981388
+          ],
+          "max_abs_rad_s": [
+            5.8887810707092285,
+            2.3222763538360596,
+            1.3081445693969727
+          ],
+          "spacing_us_p50_p99_max": [
+            500.0000000023874,
+            549.0000000030193,
+            555.9999999995568
+          ],
+          "sample_count": 25945,
+          "peak_250_350_hz": [
+            300.78125,
+            300.78125,
+            318.603515625
+          ],
+          "rms_250_350_rad_s": [
+            2.067947631353786,
+            0.7687664560472013,
+            0.2814211161816772
+          ]
+        }
+      }
+    },
+    "1": {
+      "device_id": 3604506,
+      "dt_us": 625.0,
+      "windows": {
+        "prearm_not_verified_stationary": {
+          "std_rad_s": [
+            0.06151470169425011,
+            0.04488286003470421,
+            0.30595338344573975
+          ],
+          "mean_rad_s": [
+            0.0032829998526722193,
+            -0.005200838204473257,
+            -0.04629568010568619
+          ],
+          "max_abs_rad_s": [
+            0.5177342891693115,
+            0.48684069514274597,
+            2.2797353267669678
+          ],
+          "spacing_us_p50_p99_max": [
+            1241.9999999995212,
+            1864.00000000031,
+            2496.9999999999714
+          ],
+          "sample_count": 4999
+        },
+        "flight": {
+          "std_rad_s": [
+            2.406395435333252,
+            0.958346426486969,
+            0.39330044388771057
+          ],
+          "mean_rad_s": [
+            0.010460153222084045,
+            -0.013146557845175266,
+            0.0077281822450459
+          ],
+          "max_abs_rad_s": [
+            5.4149041175842285,
+            2.39585280418396,
+            1.343339443206787
+          ],
+          "spacing_us_p50_p99_max": [
+            1241.999999997745,
+            1864.000000001198,
+            3734.0000000014584
+          ],
+          "sample_count": 13001
+        }
+      }
+    }
+  },
+  "ekf": {
+    "control_bit_0_flight_fraction": 1.0,
+    "control_bit_1_flight_fraction": 0.0,
+    "control_bit_2_flight_fraction": 0.0,
+    "control_bit_3_flight_fraction": 0.0,
+    "control_bit_4_flight_fraction": 0.0,
+    "control_bit_5_flight_fraction": 0.0,
+    "control_bit_7_flight_fraction": 1.0,
+    "control_bit_9_flight_fraction": 1.0,
+    "control_bit_10_flight_fraction": 0.0,
+    "control_bit_11_flight_fraction": 0.0,
+    "control_bit_12_flight_fraction": 0.0,
+    "control_bit_13_flight_fraction": 0.0,
+    "control_bit_14_flight_fraction": 0.0,
+    "control_bit_24_flight_fraction": 0.0,
+    "control_bit_26_flight_fraction": 0.0,
+    "control_bit_29_flight_fraction": 1.0,
+    "control_bit_34_flight_fraction": 0.9230769230769231,
+    "control_bit_44_flight_fraction": 0.0,
+    "gyro_bias_flight_min": [
+      -0.004671178758144379,
+      -0.0016265581361949444,
+      -0.0013871314004063606
+    ],
+    "gyro_bias_flight_max": [
+      -0.0005393077153712511,
+      0.0001367138174828142,
+      -0.0012262561358511448
+    ],
+    "accel_bias_flight_min": [
+      -0.12267093360424042,
+      0.02615574561059475,
+      0.14613951742649078
+    ],
+    "accel_bias_flight_max": [
+      -0.027167394757270813,
+      0.23645590245723724,
+      0.22398075461387634
+    ]
+  },
+  "parameter_differences": {
+    "CAL_GYRO0_PRIO": {
+      "file": 25.0,
+      "log_last_recorded": -1
+    },
+    "CAL_GYRO0_XOFF": {
+      "file": -0.003003395,
+      "log_last_recorded": 0.0016048995312303305
+    },
+    "CAL_GYRO0_YOFF": {
+      "file": -0.0005276808,
+      "log_last_recorded": 0.002516607753932476
+    },
+    "CAL_GYRO0_ZOFF": {
+      "file": -0.0016764121,
+      "log_last_recorded": 0.007748322561383247
+    },
+    "CAL_GYRO1_PRIO": {
+      "file": 100.0,
+      "log_last_recorded": -1
+    },
+    "CAL_GYRO1_XOFF": {
+      "file": 0.00050068955,
+      "log_last_recorded": 0.010067268274724483
+    },
+    "CAL_GYRO1_YOFF": {
+      "file": -0.0005475626,
+      "log_last_recorded": -0.002731149783357978
+    },
+    "CAL_GYRO1_ZOFF": {
+      "file": 0.0008522375,
+      "log_last_recorded": -0.0005899452953599393
+    },
+    "CAL_GYRO2_PRIO": {
+      "file": 50.0,
+      "log_last_recorded": -1
+    }
+  }
+}

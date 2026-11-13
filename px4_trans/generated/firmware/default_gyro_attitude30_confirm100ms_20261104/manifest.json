@@ -1,0 +1,22 @@
+{
+  "firmware": "micoair_h743-v2_nncontrol_default_gyro_attitude30_confirm100ms.px4",
+  "sha256": "8a51b16b8c583bc331d36744106c0ef750f6f958c4c54a130de3686b04baae35",
+  "flashed": false,
+  "target": "micoair_h743-v2_nncontrol",
+  "FD_FAIL_R": 30,
+  "FD_FAIL_P": 30,
+  "FD_FAIL_R_TTRI": 0.1,
+  "FD_FAIL_P_TTRI": 0.1,
+  "target_roll_pitch_limit_deg": 10,
+  "independent_30deg_termination_confirmation_ms": 0,
+  "gyro_selection": "PX4 defaults",
+  "dual_gyro_logging": true,
+  "checks": [
+    "full firmware build passed",
+    "airframe shell syntax and whitespace passed",
+    "built ROMFS thresholds and 100ms confirmation verified",
+    "built ROMFS default gyro selection verified",
+    "firmware decompression and image size verified",
+    "independent protection string present"
+  ]
+}

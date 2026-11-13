@@ -1,0 +1,6 @@
+{
+  "matching_gyro_lag_s": -0.013035361225489725,
+  "rate_rmse_rad_s": 0.32389728968265546,
+  "logger_write_rate_median_kib_s": 84.6177978515625,
+  "max_buffer_used_bytes": 48529
+}

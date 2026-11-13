@@ -1,0 +1,20 @@
+{
+  "note": "Current live station state queried after flight, not a recorded in-flight time-sync trace.",
+  "generated_mono_ms": 590759358,
+  "task": {
+    "mode": "single",
+    "aircraft_id": "aircraft-01",
+    "master_id": "aircraft-01",
+    "slave_id": "aircraft-02"
+  },
+  "telemetry_fresh": true,
+  "heartbeat_fresh": true,
+  "mocap_attitude": {
+    "time_sync_valid": false,
+    "time_sync_rtt_ms": -1,
+    "time_sync_age_ms": -1,
+    "tx_packets": 0
+  },
+  "pose_connected": true,
+  "pose_sensor_id": 1
+}

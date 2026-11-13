@@ -1,0 +1,53 @@
+{
+  "firmware": "micoair_h743-v2_nncontrol_yaw_balanced_v1.px4",
+  "sha256": "d746c76a1e227ff7c86f6ea95d47906b4146e1c1bde8d8f75715dd4d2a5c55b3",
+  "image_size": 1204168,
+  "flashed": false,
+  "model_checksum": "0xfd093c6f",
+  "model_schema_version": 4,
+  "controller_contract": "pilot_acceleration_bounded_rotor_differential_grid_yaw_trim",
+  "manual_yaw_limit_rad_s": 0.3,
+  "manual_yaw_filter_time_constant_s": 0.2,
+  "yaw_balance_profile": {
+    "trim_speed_ratio": 1.0800000429153442,
+    "maximum_speed_ratio": 1.149999976158142,
+    "motor_command_maximum": 0.8999999761581421,
+    "grid_common_command": -0.1599999964237213,
+    "grid_yaw_per_thrust_per_command": 0.004287499934434891,
+    "yaw_integral_moment_limit_n_m": 0.003000000026077032,
+    "lower_torque_scale": 0.699999988079071
+  },
+  "policy_hover_trim_physical_commands": [
+    0.2763244373197069,
+    0.3498804154722097
+  ],
+  "policy_hover_trim_motor_speed_rad_s": [
+    963.9750385772445,
+    1041.0931396484375
+  ],
+  "checks": [
+    "Full firmware build passed",
+    "Existing core/golden/termination/output checks passed",
+    "Yaw envelope sweep and sustained-error/anti-windup checks passed",
+    "2 payload provenance tests passed",
+    "Payload read/checksum roundtrip passed",
+    "Actual C++ core reduced nonlinear yaw/vertical sensitivity checks passed for assumed torque ratios 0.60-0.80",
+    "Packaged image decompression, size, embedded policy bytes and checksum verified"
+  ],
+  "limits": [
+    "Not flashed or flight validated",
+    "Predicted steady RPM ratio constraint; no measured ESC speed servo",
+    "Common sign/effectiveness need airframe bench verification",
+    "Reduced model is not a full SimEnv/6-DoF simulation"
+  ],
+  "source_sha256": {
+    "px4_trans/configs/lqi_coaxial_collective_airframe1_yaw_balanced_v1.yaml": "8a8e0055005e81530022e294110d3d04619e01ab4ef49ba09ffc538a03000a59",
+    "px4_trans/px4/src/modules/nn_control/LqiCoaxialCollectiveModel.hpp": "c4ef914c55461eb3f0bd11f126311c9c0143df04c6d6037816bdf89691896842",
+    "px4_trans/px4/src/modules/nn_control/LqiCoaxialCollectiveCore.hpp": "c8d3b49879340619e6c6d27041daf60971c174e2a51e6ab041f0d68fd1a4fa65",
+    "px4_trans/px4/src/modules/nn_control/LqiCoaxialCollectivePayload.hpp": "40f54ff5f0c96914fbeaf794a74f0a8f58dbd1b1c318ea052107d193a98adbfe",
+    "px4_trans/px4/src/modules/nn_control/LqiManualReference.hpp": "5e5526e0c8c1b041503e5246776cb53edd187cfe928a5b80405eeb227c900441",
+    "px4_trans/px4/src/modules/nn_control/FinalMotorOutputMap.hpp": "e673642fe15e62842fc68532ab507760e1b9eb7d895406a9fc961dbdd85f78e2",
+    "px4_trans/tools/generate_coaxial_collective_backend.py": "9c65289f33cd3f7e2713753c1d21020f2dbefba15ee7b218dd22297e7f55e18c",
+    "analysis/yaw_balance_candidate_20261105/verification.json": "ac0f78db2faabc8c3d87ed9865356e98f359a890e2d1dfa184c5234c863a2cf8"
+  }
+}

@@ -1,0 +1,125 @@
+{
+  "scope": "Nonlinear rigid-body + actuator check of the actual C++ implementation.\nIncludes 3-axis rotation, translation, rotor and servo first-order dynamics,\ngrid force/arm/yaw coupling, and constant roll disturbance. No measured wake,\ncontact, battery, IMU noise, linkage backlash, or hardware validation.\n",
+  "results": [
+    {
+      "case": "nominal",
+      "assumed_lower_torque_ratio": 0.7,
+      "servo_tau_s": 0.06,
+      "grid_vector_gain_multiplier": 1.0,
+      "constant_roll_disturbance_n_m": 0.0,
+      "duration_s": 15.998000000000001,
+      "model_pwm_hold_hz": 50,
+      "extra_delay_s": 0.004,
+      "max_abs_roll_pitch_deg": [
+        7.489153807943083,
+        6.434264153156275
+      ],
+      "final_mean_roll_pitch_deg": [
+        -0.001578949135491923,
+        0.0010248738548091717
+      ],
+      "final_mean_yaw_rate": 1.1911811371336252e-05,
+      "pass_declared_model_checks": true
+    },
+    {
+      "case": "roll_bias",
+      "assumed_lower_torque_ratio": 0.7,
+      "servo_tau_s": 0.06,
+      "grid_vector_gain_multiplier": 1.0,
+      "constant_roll_disturbance_n_m": 0.006,
+      "duration_s": 0.6940000000000001,
+      "model_pwm_hold_hz": 50,
+      "extra_delay_s": 0.004,
+      "max_abs_roll_pitch_deg": [
+        45.015665342686745,
+        10.065342286725492
+      ],
+      "final_mean_roll_pitch_deg": [
+        23.534951602520003,
+        4.210700672676122
+      ],
+      "final_mean_yaw_rate": 0.043805221662105424,
+      "pass_declared_model_checks": false
+    },
+    {
+      "case": "slower_servo",
+      "assumed_lower_torque_ratio": 0.7,
+      "servo_tau_s": 0.1,
+      "grid_vector_gain_multiplier": 1.0,
+      "constant_roll_disturbance_n_m": 0.004,
+      "duration_s": 2.5380000000000003,
+      "model_pwm_hold_hz": 50,
+      "extra_delay_s": 0.004,
+      "max_abs_roll_pitch_deg": [
+        45.15166681304471,
+        12.758533418046136
+      ],
+      "final_mean_roll_pitch_deg": [
+        11.908960124611452,
+        2.4480887414242285
+      ],
+      "final_mean_yaw_rate": 0.007684620942510127,
+      "pass_declared_model_checks": false
+    },
+    {
+      "case": "stronger_grid",
+      "assumed_lower_torque_ratio": 0.7,
+      "servo_tau_s": 0.12,
+      "grid_vector_gain_multiplier": 3.0,
+      "constant_roll_disturbance_n_m": 0.004,
+      "duration_s": 15.998000000000001,
+      "model_pwm_hold_hz": 50,
+      "extra_delay_s": 0.004,
+      "max_abs_roll_pitch_deg": [
+        8.339883075178724,
+        7.925270859438025
+      ],
+      "final_mean_roll_pitch_deg": [
+        0.016407291664566757,
+        0.033081027790778886
+      ],
+      "final_mean_yaw_rate": -0.06687066814263541,
+      "pass_declared_model_checks": true
+    },
+    {
+      "case": "weaker_lower",
+      "assumed_lower_torque_ratio": 0.65,
+      "servo_tau_s": 0.06,
+      "grid_vector_gain_multiplier": 1.0,
+      "constant_roll_disturbance_n_m": 0.004,
+      "duration_s": 15.998000000000001,
+      "model_pwm_hold_hz": 50,
+      "extra_delay_s": 0.004,
+      "max_abs_roll_pitch_deg": [
+        15.408676538899002,
+        10.859186022635841
+      ],
+      "final_mean_roll_pitch_deg": [
+        0.06145018603869469,
+        0.03315439672358033
+      ],
+      "final_mean_yaw_rate": 5.501055894628377e-06,
+      "pass_declared_model_checks": true
+    },
+    {
+      "case": "stronger_lower",
+      "assumed_lower_torque_ratio": 0.8,
+      "servo_tau_s": 0.06,
+      "grid_vector_gain_multiplier": 1.0,
+      "constant_roll_disturbance_n_m": 0.004,
+      "duration_s": 15.998000000000001,
+      "model_pwm_hold_hz": 50,
+      "extra_delay_s": 0.004,
+      "max_abs_roll_pitch_deg": [
+        14.667258661550248,
+        10.33537205301701
+      ],
+      "final_mean_roll_pitch_deg": [
+        -0.0037922404722634745,
+        -0.004020059131435829
+      ],
+      "final_mean_yaw_rate": 7.564815457124822e-06,
+      "pass_declared_model_checks": true
+    }
+  ]
+}

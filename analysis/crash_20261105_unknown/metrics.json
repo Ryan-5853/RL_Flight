@@ -1,0 +1,278 @@
+{
+  "source": "/home/ryan/RL_Flight/log/26.11.5/log_0_UnknownDate.ulg",
+  "time_basis": "FC boot seconds",
+  "quality": {
+    "dropout_count": 71,
+    "dropout_total_ms": 4945,
+    "checks": "topic timestamps monotonic; quaternion norm passed"
+  },
+  "ground": {
+    "session": "/home/ryan/TeleaiTrans_dev/Dock_ground/logs/flights/flight_20261105T030533_568Z_aircraft-01_2",
+    "min_attitude_abs_dot": 0.9997070354267206,
+    "offset_spread_ms": 4.379620018880814,
+    "fresh_percent_after_18s": 100.0
+  },
+  "windows": [
+    {
+      "start_s": 18,
+      "end_s": 22,
+      "rpy_min_deg": [
+        -2.946208432389176,
+        -4.8046316071979875,
+        -16.94452672200302
+      ],
+      "rpy_max_deg": [
+        2.1641385798174984,
+        1.9452822603401958,
+        -2.797813003082404
+      ],
+      "ground_roll_range_deg": [
+        -2.297023856964775,
+        1.8776931083796995
+      ],
+      "ground_height_mean_m": 1.1477601575,
+      "motor_median": [
+        0.28098562359809875,
+        0.2507787346839905
+      ],
+      "esc_rpm_median": [
+        9954.619354723969,
+        8607.711133111326
+      ],
+      "predicted_upper_lower_speed_ratio_median": 1.0402347537114935,
+      "upper_speed_ratio_boundary_sample_percent": 2.9487179487179485,
+      "actual_upper_lower_rpm_ratio_median": 1.1593653178249879,
+      "grid_common_median": -0.14294639229774475,
+      "servo_endpoint_percent": [
+        0.0,
+        0.0,
+        0.38461538461538464
+      ],
+      "inferred_roll_moment_lower_limit_sample_percent": 28.14526588845655,
+      "moment_proxy_valid_samples": 771,
+      "roll_moment_proxy_median": -0.0061762104742228985,
+      "rc_yaw_median": 0.0,
+      "actual_yaw_rate_mean_rad_s": -0.04096531264369574,
+      "motor_output_max_age_ms_from_ground": 2.017
+    },
+    {
+      "start_s": 23,
+      "end_s": 24,
+      "rpy_min_deg": [
+        -9.668609475412277,
+        -0.7396868425673154,
+        -5.107303829039567
+      ],
+      "rpy_max_deg": [
+        -2.8240572022420305,
+        4.9844149313008055,
+        -3.8112699916125763
+      ],
+      "ground_roll_range_deg": [
+        -7.132314876993538,
+        -0.7112350357063181
+      ],
+      "ground_height_mean_m": 1.4264226999999996,
+      "motor_median": [
+        0.3036642074584961,
+        0.2448807880282402
+      ],
+      "esc_rpm_median": [
+        10313.812433277712,
+        8470.96336497705
+      ],
+      "predicted_upper_lower_speed_ratio_median": 1.075304311990943,
+      "upper_speed_ratio_boundary_sample_percent": 5.376344086021505,
+      "actual_upper_lower_rpm_ratio_median": 1.218611277816564,
+      "grid_common_median": -0.14597606658935547,
+      "servo_endpoint_percent": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "inferred_roll_moment_lower_limit_sample_percent": 69.35483870967742,
+      "moment_proxy_valid_samples": 186,
+      "roll_moment_proxy_median": -0.008999999612569809,
+      "rc_yaw_median": 0.540206253528595,
+      "actual_yaw_rate_mean_rad_s": 0.006372926386025976,
+      "motor_output_max_age_ms_from_ground": 1.938
+    },
+    {
+      "start_s": 24,
+      "end_s": 25,
+      "rpy_min_deg": [
+        -11.324781535955598,
+        -0.17571283287220407,
+        -5.063480846782688
+      ],
+      "rpy_max_deg": [
+        5.442028091598584,
+        6.747965002979766,
+        -2.083372486035319
+      ],
+      "ground_roll_range_deg": [
+        -7.199205414679108,
+        7.953723397466868
+      ],
+      "ground_height_mean_m": 1.4785142999999998,
+      "motor_median": [
+        0.291502445936203,
+        0.24442121386528015
+      ],
+      "esc_rpm_median": [
+        10056.872174824124,
+        8335.710652303997
+      ],
+      "predicted_upper_lower_speed_ratio_median": 1.070029217593639,
+      "upper_speed_ratio_boundary_sample_percent": 1.694915254237288,
+      "actual_upper_lower_rpm_ratio_median": 1.2117951539917495,
+      "grid_common_median": -0.1440707892179489,
+      "servo_endpoint_percent": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "inferred_roll_moment_lower_limit_sample_percent": 92.65536723163842,
+      "moment_proxy_valid_samples": 177,
+      "roll_moment_proxy_median": -0.008999999612569809,
+      "rc_yaw_median": 0.6123712062835693,
+      "actual_yaw_rate_mean_rad_s": 0.04119927855451551,
+      "motor_output_max_age_ms_from_ground": 2.87
+    },
+    {
+      "start_s": 25,
+      "end_s": 26,
+      "rpy_min_deg": [
+        -19.859721642811934,
+        -6.309312270420534,
+        -2.022221864045273
+      ],
+      "rpy_max_deg": [
+        14.341490232362693,
+        9.38453043146013,
+        6.415595355209751
+      ],
+      "ground_roll_range_deg": [
+        -16.899197158528995,
+        16.77122441652604
+      ],
+      "ground_height_mean_m": 1.2873017999999998,
+      "motor_median": [
+        0.294512540102005,
+        0.25106489658355713
+      ],
+      "esc_rpm_median": [
+        10028.272597074152,
+        8434.374854334854
+      ],
+      "predicted_upper_lower_speed_ratio_median": 1.046074939222955,
+      "upper_speed_ratio_boundary_sample_percent": 1.0752688172043012,
+      "actual_upper_lower_rpm_ratio_median": 1.164588816580124,
+      "grid_common_median": -0.14628320932388306,
+      "servo_endpoint_percent": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "inferred_roll_moment_lower_limit_sample_percent": 65.59139784946237,
+      "moment_proxy_valid_samples": 186,
+      "roll_moment_proxy_median": -0.008999998681247234,
+      "rc_yaw_median": 0.5505155324935913,
+      "actual_yaw_rate_mean_rad_s": 0.06314563136543436,
+      "motor_output_max_age_ms_from_ground": 2.4
+    },
+    {
+      "start_s": 26,
+      "end_s": 27,
+      "rpy_min_deg": [
+        -25.66613800105033,
+        -7.988519621110011,
+        2.732626413643656
+      ],
+      "rpy_max_deg": [
+        14.385860610458318,
+        12.822675102348605,
+        9.760756417705773
+      ],
+      "ground_roll_range_deg": [
+        -22.610569381599223,
+        17.033726074182844
+      ],
+      "ground_height_mean_m": 0.8495552700000001,
+      "motor_median": [
+        0.3213980346918106,
+        0.23137755692005157
+      ],
+      "esc_rpm_median": [
+        10538.803193494274,
+        8206.623976950901
+      ],
+      "predicted_upper_lower_speed_ratio_median": 1.1496165213302325,
+      "upper_speed_ratio_boundary_sample_percent": 50.0,
+      "actual_upper_lower_rpm_ratio_median": 1.3041302597357798,
+      "grid_common_median": -0.14595860242843628,
+      "servo_endpoint_percent": [
+        0.0,
+        1.1363636363636365,
+        3.4090909090909087
+      ],
+      "inferred_roll_moment_lower_limit_sample_percent": 68.0,
+      "moment_proxy_valid_samples": 150,
+      "roll_moment_proxy_median": -0.008999999612569809,
+      "rc_yaw_median": 0.5340206623077393,
+      "actual_yaw_rate_mean_rad_s": -0.17690252917578927,
+      "motor_output_max_age_ms_from_ground": 2.65
+    },
+    {
+      "start_s": 27,
+      "end_s": 27.5,
+      "rpy_min_deg": [
+        -12.286215657645627,
+        -1.5847746949972397,
+        -54.19774830872722
+      ],
+      "rpy_max_deg": [
+        5.802465672447878,
+        9.380608879801615,
+        2.5210890620685484
+      ],
+      "ground_roll_range_deg": [
+        -4.658581649983943,
+        10.426947116279926
+      ],
+      "ground_height_mean_m": 0.44494968,
+      "motor_median": [
+        0.3185809552669525,
+        0.22152630984783173
+      ],
+      "esc_rpm_median": [
+        10447.166222749554,
+        7935.0
+      ],
+      "predicted_upper_lower_speed_ratio_median": 1.1499932689279149,
+      "upper_speed_ratio_boundary_sample_percent": 100.0,
+      "actual_upper_lower_rpm_ratio_median": 1.3153843952305984,
+      "grid_common_median": -0.1443641185760498,
+      "servo_endpoint_percent": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "inferred_roll_moment_lower_limit_sample_percent": 89.0,
+      "moment_proxy_valid_samples": 100,
+      "roll_moment_proxy_median": -0.008999999612569809,
+      "rc_yaw_median": 0.509278416633606,
+      "actual_yaw_rate_mean_rad_s": -2.017405401517474,
+      "motor_output_max_age_ms_from_ground": 1.938
+    }
+  ],
+  "yaw_exceeds_1_rad_s_at": 26.992016,
+  "throttle_below_minus_0p8_at": 27.605781,
+  "motors_zero_at": 27.616258,
+  "stop_guard_log_s": 28.118694,
+  "gyro_lowpass_correlations_xyz": [
+    0.9127188614702605,
+    0.8857153686614109,
+    0.9957707399008192
+  ]
+}

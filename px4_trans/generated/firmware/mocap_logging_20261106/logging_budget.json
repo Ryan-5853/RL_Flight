@@ -1,0 +1,222 @@
+{
+  "assumptions": "Single EKF; interval=0 EV streams publish 50Hz; other topics at configured rate caps. Excludes format/parameter/event overhead; not a measured SD rate.",
+  "estimated_bytes_s": 110013.0,
+  "topics": [
+    {
+      "topic": "vehicle_attitude",
+      "instances": 1,
+      "interval_ms": 5,
+      "rate_cap_hz": 200.0,
+      "bytes_per_record": 54,
+      "estimated_bytes_s": 10800.0
+    },
+    {
+      "topic": "vehicle_angular_velocity",
+      "instances": 1,
+      "interval_ms": 5,
+      "rate_cap_hz": 200.0,
+      "bytes_per_record": 45,
+      "estimated_bytes_s": 9000.0
+    },
+    {
+      "topic": "actuator_motors",
+      "instances": 1,
+      "interval_ms": 5,
+      "rate_cap_hz": 200.0,
+      "bytes_per_record": 71,
+      "estimated_bytes_s": 14200.0
+    },
+    {
+      "topic": "actuator_servos",
+      "instances": 1,
+      "interval_ms": 5,
+      "rate_cap_hz": 200.0,
+      "bytes_per_record": 53,
+      "estimated_bytes_s": 10600.0
+    },
+    {
+      "topic": "esc_status",
+      "instances": 1,
+      "interval_ms": 50,
+      "rate_cap_hz": 20.0,
+      "bytes_per_record": 341,
+      "estimated_bytes_s": 6820.0
+    },
+    {
+      "topic": "vehicle_acceleration",
+      "instances": 1,
+      "interval_ms": 10,
+      "rate_cap_hz": 100.0,
+      "bytes_per_record": 33,
+      "estimated_bytes_s": 3300.0
+    },
+    {
+      "topic": "sensor_accel",
+      "instances": 2,
+      "interval_ms": 20,
+      "rate_cap_hz": 50.0,
+      "bytes_per_record": 49,
+      "estimated_bytes_s": 4900.0
+    },
+    {
+      "topic": "sensor_gyro",
+      "instances": 2,
+      "interval_ms": 10,
+      "rate_cap_hz": 100.0,
+      "bytes_per_record": 49,
+      "estimated_bytes_s": 9800.0
+    },
+    {
+      "topic": "vehicle_imu_status",
+      "instances": 2,
+      "interval_ms": 100,
+      "rate_cap_hz": 10.0,
+      "bytes_per_record": 137,
+      "estimated_bytes_s": 2740.0
+    },
+    {
+      "topic": "sensor_selection",
+      "instances": 1,
+      "interval_ms": 100,
+      "rate_cap_hz": 10.0,
+      "bytes_per_record": 21,
+      "estimated_bytes_s": 210.0
+    },
+    {
+      "topic": "vehicle_visual_odometry",
+      "instances": 1,
+      "interval_ms": 0,
+      "rate_cap_hz": 50,
+      "bytes_per_record": 113,
+      "estimated_bytes_s": 5650
+    },
+    {
+      "topic": "estimator_aid_src_ev_att",
+      "instances": 1,
+      "interval_ms": 0,
+      "rate_cap_hz": 50,
+      "bytes_per_record": 120,
+      "estimated_bytes_s": 6000
+    },
+    {
+      "topic": "estimator_status_flags",
+      "instances": 1,
+      "interval_ms": 20,
+      "rate_cap_hz": 50.0,
+      "bytes_per_record": 99,
+      "estimated_bytes_s": 4950.0
+    },
+    {
+      "topic": "gs_link_control",
+      "instances": 1,
+      "interval_ms": 20,
+      "rate_cap_hz": 50.0,
+      "bytes_per_record": 47,
+      "estimated_bytes_s": 2350.0
+    },
+    {
+      "topic": "gs_link_status",
+      "instances": 1,
+      "interval_ms": 100,
+      "rate_cap_hz": 10.0,
+      "bytes_per_record": 26,
+      "estimated_bytes_s": 260.0
+    },
+    {
+      "topic": "logger_status",
+      "instances": 1,
+      "interval_ms": 1000,
+      "rate_cap_hz": 1.0,
+      "bytes_per_record": 41,
+      "estimated_bytes_s": 41.0
+    },
+    {
+      "topic": "vehicle_rates_setpoint",
+      "instances": 1,
+      "interval_ms": 20,
+      "rate_cap_hz": 50.0,
+      "bytes_per_record": 38,
+      "estimated_bytes_s": 1900.0
+    },
+    {
+      "topic": "vehicle_attitude_setpoint",
+      "instances": 1,
+      "interval_ms": 20,
+      "rate_cap_hz": 50.0,
+      "bytes_per_record": 47,
+      "estimated_bytes_s": 2350.0
+    },
+    {
+      "topic": "vehicle_local_position",
+      "instances": 1,
+      "interval_ms": 50,
+      "rate_cap_hz": 20.0,
+      "bytes_per_record": 197,
+      "estimated_bytes_s": 3940.0
+    },
+    {
+      "topic": "manual_control_setpoint",
+      "instances": 1,
+      "interval_ms": 20,
+      "rate_cap_hz": 50.0,
+      "bytes_per_record": 70,
+      "estimated_bytes_s": 3500.0
+    },
+    {
+      "topic": "battery_status",
+      "instances": 2,
+      "interval_ms": 200,
+      "rate_cap_hz": 5.0,
+      "bytes_per_record": 173,
+      "estimated_bytes_s": 1730.0
+    },
+    {
+      "topic": "estimator_status",
+      "instances": 1,
+      "interval_ms": 50,
+      "rate_cap_hz": 20.0,
+      "bytes_per_record": 134,
+      "estimated_bytes_s": 2680.0
+    },
+    {
+      "topic": "estimator_sensor_bias",
+      "instances": 1,
+      "interval_ms": 100,
+      "rate_cap_hz": 10.0,
+      "bytes_per_record": 123,
+      "estimated_bytes_s": 1230.0
+    },
+    {
+      "topic": "sensors_status_imu",
+      "instances": 1,
+      "interval_ms": 200,
+      "rate_cap_hz": 5.0,
+      "bytes_per_record": 101,
+      "estimated_bytes_s": 505.0
+    },
+    {
+      "topic": "cpuload",
+      "instances": 1,
+      "interval_ms": 500,
+      "rate_cap_hz": 2.0,
+      "bytes_per_record": 21,
+      "estimated_bytes_s": 42.0
+    },
+    {
+      "topic": "system_power",
+      "instances": 1,
+      "interval_ms": 200,
+      "rate_cap_hz": 5.0,
+      "bytes_per_record": 47,
+      "estimated_bytes_s": 235.0
+    },
+    {
+      "topic": "vehicle_control_mode",
+      "instances": 1,
+      "interval_ms": 100,
+      "rate_cap_hz": 10.0,
+      "bytes_per_record": 28,
+      "estimated_bytes_s": 280.0
+    }
+  ]
+}

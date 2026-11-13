@@ -1,0 +1,53 @@
+schema_version: 1
+airframe_id: airframe-1
+airframe_registry: Identification/configs/airframes.yaml
+
+simulator_config: SimEnv/configs/sim2real_micro_coaxial_3100kv_airframe1_manual_v2.yaml
+controller_config: Controller/configs/lqi_coaxial_collective_servo_airframe1_manual_v3.yaml
+identified_model:
+  report: Identification/datasets/real_logs_26_10_26_v4/offline_identification_v7_hybrid_pq03.json
+  expected_checksum: "0x1716d847"
+
+motor_speed_calibration:
+  path: log/电机标定/3100kv上桨_空中.csv
+  shaft: upper
+  mode: HARDWARE
+  physical_command_to_controller_scale: 2.0
+  measured_physical_command_range: [0.05, 0.25]
+  measured_controller_command_range: [0.10, 0.50]
+  above_range_extrapolation:
+    method: linear_to_previous_full_scale
+    previous_full_scale_rad_s: 1200.0
+
+final_motor_output_scale: 0.5
+physical_motor_pole_count: 28
+
+manual_reference:
+  roll:
+    limit_rad: 0.1745329252
+    # Zero means pass the upstream command through without a first-order lag.
+    time_constant_s: 0.0
+  pitch:
+    limit_rad: 0.1745329252
+    time_constant_s: 0.0
+  yaw:
+    limit_rad_s: 0.30
+    time_constant_s: 0.20
+
+# Experimental firmware envelope, on top of the verified moment-domain gains.
+# These constrain predicted steady speed; there is no ESC speed servo here.
+# Common sign follows this airframe model: negative common => negative yaw.
+yaw_balance_profile:
+  trim_speed_ratio: 1.08
+  maximum_speed_ratio: 1.15
+  motor_command_maximum: 0.90  # physical actuator_motors <= 0.45 after x0.5
+  grid_common_command: -0.16  # maximum reserve; preferred -0.08 in revision 2
+  grid_yaw_per_thrust_per_command: 0.0042875  # N m / N / common command
+  yaw_integral_moment_limit_n_m: 0.003
+  lower_torque_scale: 0.70  # tentative from near-zero-yaw flight windows
+
+# Revision 2: half-cap bounded roll/pitch integral, directional anti-windup,
+# and shared grid/motor yaw allocation. Prefer -0.08 common; retain -0.16..0.
+allocation_safety:
+  roll_pitch_integral_moment_fraction: 0.50
+  grid_common_preference_fraction: 0.50

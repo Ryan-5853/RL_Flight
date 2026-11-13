@@ -1,0 +1,420 @@
+--- a/include/dock_ground/config.hpp
++++ b/include/dock_ground/config.hpp
+@@ -49,6 +49,8 @@
+     std::uint16_t gs_link_heartbeat_timeout_ms{300};
+     double gs_link_heartbeat_rate_hz{10.0};
+     double data_rc_rate_hz{100.0};
++    bool mocap_attitude_enabled{true};
++    double mocap_attitude_noise_rad{0.05};
+     RcChannelMapping rc_mapping{};
+     bool flight_log_enabled{true};
+     std::string flight_log_directory{"logs/flights"};
+--- a/include/dock_ground/gs_link.hpp
++++ b/include/dock_ground/gs_link.hpp
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include "dock_ground/pair_telemetry.hpp"
++#include "dock_ground/math.hpp"
+ 
+ #include <array>
+ #include <cstdint>
+@@ -29,6 +30,8 @@
+ enum class DataMessage : std::uint8_t {
+     Rc = 0x01,
+     Telemetry = 0x02,
++    MocapAttitude = 0x03,
++    TimeSync = 0x04,
+     NodeDiagnostics = 0x10,
+     ObserverDiagnostics = 0x11,
+     ControllerDiagnostics = 0x12,
+@@ -177,6 +180,10 @@
+     bool telemetry_fresh{false};
+     bool heartbeat_fresh{false};
+     bool uplink_allowed{false};
++    bool mocap_time_sync_valid{false};
++    double mocap_time_sync_rtt_ms{-1.0};
++    double mocap_time_sync_age_ms{-1.0};
++    std::uint64_t mocap_tx_packets{0};
+     double telemetry_age_ms{-1.0};
+     double heartbeat_age_ms{-1.0};
+     FlightTelemetry telemetry{};
+@@ -244,6 +251,12 @@
+     std::uint16_t sequence, const RcCommand& command,
+     std::uint32_t sender_time_ms, std::uint8_t packet_flags = 0);
+ 
++// q is body FLU -> local FLU. Conversion to body FRD -> local FRD occurs here.
++[[nodiscard]] std::vector<std::uint8_t> encode_mocap_attitude(
++    std::uint16_t sequence, std::uint32_t session_id,
++    std::uint32_t sample_sequence, std::uint64_t sample_time_us,
++    const Quaternion& q, float variance);
++
+ [[nodiscard]] std::vector<std::uint8_t> encode_telemetry(
+     std::uint16_t sequence, const FlightTelemetry& telemetry,
+     std::uint8_t packet_flags = 0);
+@@ -294,6 +307,10 @@
+ 
+     [[nodiscard]] bool send(
+         const UplinkRequest& request, std::string& error);
++    // Nonblocking, at most 50 Hz. No retry or control/deadman gate.
++    [[nodiscard]] bool send_mocap_attitude(
++        std::uint32_t sample_sequence, std::uint64_t sample_mono_ns,
++        const Quaternion& q, float variance);
+     [[nodiscard]] Status status() const;
+     [[nodiscard]] std::uint16_t bound_port() const;
+     [[nodiscard]] std::vector<DiagnosticFrame> take_diagnostics();
+--- a/src/config.cpp
++++ b/src/config.cpp
+@@ -489,7 +489,7 @@
+              "transport", "protocol", "remote_ip", "remote_port",
+              "local_ip", "local_port", "telemetry_timeout_ms",
+              "heartbeat_timeout_ms", "heartbeat_rate_hz",
+-             "data_rc_rate_hz",
++             "data_rc_rate_hz", "mocap_attitude_enabled", "mocap_attitude_noise_rad",
+              "rc_roll_channel", "rc_pitch_channel",
+              "rc_throttle_channel", "rc_yaw_channel",
+              "bumpless_hold_ms", "throttle_transition_ms",
+@@ -629,6 +629,8 @@
+         read_string(flight, "pair_pose_frame", "flight.pair_pose_frame", config.pair_pose_frame, error) &&
+         read_number(flight, "pair_master_yaw_deg", "flight.pair_master_yaw_deg", config.pair_master_yaw_deg, error) &&
+         read_number(flight, "pair_arm_m", "flight.pair_arm_m", config.pair_arm_m, error) &&
++        read_boolean(flight, "mocap_attitude_enabled", "flight.mocap_attitude_enabled", config.mocap_attitude_enabled, error) &&
++        read_number(flight, "mocap_attitude_noise_rad", "flight.mocap_attitude_noise_rad", config.mocap_attitude_noise_rad, error) &&
+         read_boolean(flight, "pair_enabled", "flight.pair_enabled", config.pair_enabled, error) &&
+         read_string(flight, "slave_ip", "flight.slave_ip", config.slave_ip, error) &&
+         read_optional_u16(flight, "slave_port", "flight.slave_port", config.slave_port, error) &&
+@@ -1008,6 +1010,8 @@
+         config.flight_transport == "loopback" ||
+             config.flight_transport == "udp",
+         "flight.transport must be 'loopback' or 'udp'");
++    require(std::isfinite(config.mocap_attitude_noise_rad) && config.mocap_attitude_noise_rad >= 0.001
++            && config.mocap_attitude_noise_rad <= 1.0, "mocap_attitude_noise_rad must be in [0.001, 1]");
+     if (config.pair_enabled && config.flight_transport == "udp") {
+         require(config.pair_pose_frame == "master" || config.pair_pose_frame == "composite", "pair_pose_frame must be master or composite");
+         require(std::isfinite(config.pair_master_yaw_deg) && std::abs(config.pair_master_yaw_deg) <= 180, "invalid pair installation yaw");
+--- a/src/gs_link.cpp
++++ b/src/gs_link.cpp
+@@ -1,6 +1,7 @@
+ #include "dock_ground/gs_link.hpp"
+ 
+ #include <algorithm>
++#include <bit>
+ #include <arpa/inet.h>
+ #include <array>
+ #include <deque>
+@@ -138,6 +139,24 @@
+         frame.data() + 2U, frame.size() - 2U));
+     append_le<std::uint16_t>(frame, crc);
+     return frame;
++}
++
++std::vector<std::uint8_t> encode_mocap_attitude(
++    std::uint16_t sequence, std::uint32_t session_id,
++    std::uint32_t sample_sequence, std::uint64_t sample_time_us,
++    const Quaternion& q, float variance) {
++    std::vector<std::uint8_t> payload;
++    append_le(payload, session_id);
++    append_le(payload, sample_sequence);
++    append_le(payload, sample_time_us);
++    // C * R * C^T, C = diag(1,-1,-1). The world has arbitrary heading.
++    const auto unit = normalized(q);
++    for (float value : {static_cast<float>(unit.w), static_cast<float>(unit.x),
++                        static_cast<float>(-unit.y), static_cast<float>(-unit.z), variance}) {
++        append_le(payload, std::bit_cast<std::uint32_t>(value));
++    }
++    return encode_frame(PacketClass::Data,
++        static_cast<std::uint8_t>(DataMessage::MocapAttitude), 0, sequence, payload);
+ }
+ 
+ std::vector<std::uint8_t> encode_data_rc(
+@@ -579,6 +598,11 @@
+         if (!configure_socket(error)) {
+             return false;
+         }
++        sync_valid = false;
++        sync_request_ns = 0;
++        next_sync = {};
++        next_mocap_tx = {};
++        last_mocap_sample_ns = 0;
+         started_at = Clock::now();
+         next_heartbeat = started_at;
+         running.store(true, std::memory_order_relaxed);
+@@ -619,7 +643,7 @@
+     bool raw_send_locked(
+         std::span<const std::uint8_t> frame) noexcept {
+         const ssize_t sent = ::send(
+-            fd, frame.data(), frame.size(), MSG_NOSIGNAL);
++            fd, frame.data(), frame.size(), MSG_NOSIGNAL | MSG_DONTWAIT);
+         if (sent != static_cast<ssize_t>(frame.size())) {
+             last_send_errno = errno;
+             ++counters.send_errors;
+@@ -715,6 +739,27 @@
+         }
+ 
+         if (packet.packet_class == PacketClass::Data) {
++            if (packet.message_id == static_cast<std::uint8_t>(DataMessage::TimeSync)) {
++                if (packet.payload.size() != 24 || packet.flags != static_cast<std::uint8_t>(PacketFlag::Response)) return;
++                const auto sent = read_le<std::uint64_t>(packet.payload, 0);
++                const auto rx_us = read_le<std::uint64_t>(packet.payload, 8);
++                const auto tx_us = read_le<std::uint64_t>(packet.payload, 16);
++                const auto received = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count());
++                if (sent != sync_request_ns || sent == 0 || received < sent || tx_us < rx_us) return;
++                const auto elapsed = received - sent;
++                if (elapsed > 20'000'000 || tx_us - rx_us > elapsed / 1000) return;
++                const auto rtt = elapsed - (tx_us - rx_us) * 1000;
++                // Choose the lowest-delay exchange in a 10 s window to reduce queueing bias.
++                if (!sync_valid || now - best_sync_at > std::chrono::seconds(10) || rtt <= best_sync_rtt_ns) {
++                    fc_offset_us = (static_cast<std::int64_t>(rx_us) + static_cast<std::int64_t>(tx_us)) / 2
++                        - static_cast<std::int64_t>((sent / 1000 + received / 1000) / 2);
++                    best_sync_rtt_ns = rtt;
++                    best_sync_at = now;
++                }
++                sync_valid = true;
++                last_sync_at = now;
++                return;
++            }
+             if (packet.message_id >= 16 && packet.message_id <= 19) {
+                 DiagnosticFrame frame;
+                 const auto received = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+@@ -781,6 +826,11 @@
+                         std::chrono::nanoseconds>(
+                         now.time_since_epoch())
+                         .count());
++            if (heartbeat.valid && heartbeat.session_id != decoded.session_id) {
++                sync_valid = false;
++                sync_request_ns = 0;
++                next_sync = now;
++            }
+             heartbeat = decoded;
+             last_heartbeat_rx = now;
+             return;
+@@ -961,6 +1011,15 @@
+                         now + std::chrono::duration_cast<Clock::duration>(
+                                   std::chrono::duration<double>(
+                                       1.0 / rate));
++                }
++                if (heartbeat.valid && now >= next_sync) {
++                    sync_request_ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count());
++                    std::vector<std::uint8_t> payload;
++                    append_le(payload, sync_request_ns);
++                    const auto frame = encode_frame(PacketClass::Data,
++                        static_cast<std::uint8_t>(DataMessage::TimeSync), 0, next_sequence_locked(), payload);
++                    (void)raw_send_locked(frame);
++                    next_sync = now + (sync_valid ? std::chrono::milliseconds(1000) : std::chrono::milliseconds(100));
+                 }
+                 retry_pending_locked(now);
+             }
+@@ -1140,6 +1199,10 @@
+         const std::lock_guard lock(mutex);
+         Status result;
+         result.enabled = true;
++        result.mocap_time_sync_valid = sync_valid && now - last_sync_at <= std::chrono::seconds(3);
++        result.mocap_time_sync_rtt_ms = sync_valid ? best_sync_rtt_ns / 1e6 : -1.0;
++        result.mocap_time_sync_age_ms = age_ms(now, last_sync_at, sync_valid);
++        result.mocap_tx_packets = mocap_tx_packets;
+         result.transport = "udp";
+         result.protocol = "gs-link-v1";
+         result.transport_connected = transport_connected;
+@@ -1172,6 +1235,14 @@
+     UdpConfig config;
+     int fd{-1};
+     std::uint16_t bound_port{0};
++    std::uint64_t mocap_tx_packets{0};
++    bool sync_valid{false};
++    std::uint64_t sync_request_ns{0};
++    std::uint64_t best_sync_rtt_ns{0};
++    std::int64_t fc_offset_us{0};
++    Clock::time_point next_sync{}, last_sync_at{}, best_sync_at{};
++    Clock::time_point next_mocap_tx{};
++    std::uint64_t last_mocap_sample_ns{0};
+     std::uint32_t session_id{0};
+     std::atomic_bool running{false};
+     std::thread thread;
+@@ -1225,6 +1296,42 @@
+     return impl_->send(request, error);
+ }
+ 
++bool UdpLink::send_mocap_attitude(
++    std::uint32_t sample_sequence, std::uint64_t sample_mono_ns,
++    const Quaternion& q, float variance) {
++    const auto now = Clock::now();
++    const auto now_ns = static_cast<std::uint64_t>(
++        std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count());
++    const double norm_sq = q.w*q.w + q.x*q.x + q.y*q.y + q.z*q.z;
++    const std::lock_guard lock(impl_->mutex);
++    if (!impl_->sync_valid || now - impl_->last_sync_at > std::chrono::seconds(3)
++        || !impl_->telemetry_link_ready_locked(now)
++        || !fresh(now, impl_->last_heartbeat_rx, impl_->config.heartbeat_timeout_ms, impl_->heartbeat.valid)
++        || sample_mono_ns == 0 || sample_mono_ns > now_ns
++        || sample_mono_ns <= impl_->last_mocap_sample_ns
++        || now_ns - sample_mono_ns > 50'000'000ULL
++        || now < impl_->next_mocap_tx
++        || !is_finite(q) || std::abs(norm_sq - 1.0) > 1e-3
++        || !std::isfinite(variance) || variance < 1e-6f || variance > 1.f) {
++        return false;
++    }
++    // NTP midpoint estimate; FC tolerates up to half the maximum accepted RTT
++    // of clock asymmetry. No artificial transport delay is added to sample time.
++    const auto fc_sample_us = static_cast<std::int64_t>(sample_mono_ns / 1000U) + impl_->fc_offset_us;
++    if (fc_sample_us <= 0) return false;
++    const auto frame = encode_mocap_attitude(impl_->next_sequence_locked(), impl_->session_id,
++        sample_sequence, static_cast<std::uint64_t>(fc_sample_us), q, variance);
++    // Consume samples even on congestion: no retry of old observations.
++    impl_->last_mocap_sample_ns = sample_mono_ns;
++    if (now - impl_->next_mocap_tx >= std::chrono::milliseconds(20)) {
++        impl_->next_mocap_tx = now;
++    }
++    impl_->next_mocap_tx += std::chrono::milliseconds(20);
++    const bool sent = impl_->raw_send_locked(frame);
++    if (sent) ++impl_->mocap_tx_packets;
++    return sent;
++}
++
+ Status UdpLink::status() const {
+     return impl_->status();
+ }
+--- a/src/runtime.cpp
++++ b/src/runtime.cpp
+@@ -572,6 +572,20 @@
+                 initial_target_applied = !config.initial_target_use_current_pose;
+             }
+             if (auto next_pose = pose_source->latest()) {
++                if (config.mocap_attitude_enabled && config.pose_source == "vrpn"
++                    && gs_link_transport && next_pose->valid && !next_pose->source_time_regression) {
++                    auto master_pose = *next_pose;
++                    // Controller pose may refer to C. EKF must always receive the actual aircraft A pose.
++                    if (config.pair_enabled && config.pair_pose_frame == "composite") {
++                        master_pose = composite_pose_from_master(master_pose, -config.pair_master_yaw_deg, 0.0);
++                    }
++                    const auto source_age = master_pose.source_time_valid ? master_pose.source_age_at_receive_ns : 0;
++                    if (source_age < master_pose.received_mono_ns) {
++                        (void)gs_link_transport->send_mocap_attitude(master_pose.sequence,
++                            master_pose.received_mono_ns - source_age, master_pose.q_body_to_world,
++                            static_cast<float>(config.mocap_attitude_noise_rad * config.mocap_attitude_noise_rad));
++                    }
++                }
+                 if (pair_selected && config.pair_pose_frame == "master") {
+                     *next_pose = composite_pose_from_master(*next_pose, config.pair_master_yaw_deg, config.pair_arm_m);
+                 }
+@@ -1515,6 +1529,11 @@
+            << gs_link::to_string(gs.heartbeat.state)
+            << "\",\"error_code\":"
+            << static_cast<unsigned int>(gs.heartbeat.error_code) << '}';
++    output << ",\"mocap_attitude\":{\"time_sync_valid\":"
++           << (gs.mocap_time_sync_valid ? "true" : "false")
++           << ",\"time_sync_rtt_ms\":" << gs.mocap_time_sync_rtt_ms
++           << ",\"time_sync_age_ms\":" << gs.mocap_time_sync_age_ms
++           << ",\"tx_packets\":" << gs.mocap_tx_packets << '}';
+     output << ",\"last_ack\":{\"valid\":"
+            << (gs.last_ack.valid ? "true" : "false")
+            << ",\"acked_class\":"
+--- a/tests/test_main.cpp
++++ b/tests/test_main.cpp
+@@ -9,6 +9,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <bit>
+ #include <arpa/inet.h>
+ #include <cerrno>
+ #include <chrono>
+@@ -646,6 +647,37 @@
+             received_rc.gs_ready,
+         "UDP DATA_RC should preserve uplink fields");
+ 
++    check(wait_for_packet(fake_fc, PacketClass::Data,
++          static_cast<std::uint8_t>(DataMessage::TimeSync), packet, peer, 300, error),
++          "ground sends a time synchronization request");
++    auto sync_reply = packet.payload;
++    const auto sync_fc_us = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
++        std::chrono::steady_clock::now().time_since_epoch()).count());
++    for (int timestamp = 0; timestamp < 2; ++timestamp) {
++        for (unsigned byte = 0; byte < 8; ++byte) sync_reply.push_back(static_cast<std::uint8_t>(sync_fc_us >> (8*byte)));
++    }
++    check(send_packet(fake_fc, peer, encode_frame(PacketClass::Data,
++          static_cast<std::uint8_t>(DataMessage::TimeSync),
++          static_cast<std::uint8_t>(PacketFlag::Response), 102U, sync_reply), error),
++          "fake FC returns a time synchronization exchange");
++    std::this_thread::sleep_for(std::chrono::milliseconds(5));
++
++    const auto mocap_now = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++        std::chrono::steady_clock::now().time_since_epoch()).count());
++    check(!link.send_mocap_attitude(1, mocap_now - 60'000'000, {}, 0.0025f),
++          "stale mocap observation must be dropped");
++    check(!link.send_mocap_attitude(1, mocap_now, dock_ground::Quaternion{0,0,0,0}, 0.0025f),
++          "zero quaternion must be rejected before normalization");
++    check(link.send_mocap_attitude(2, mocap_now - 1'000'000, {}, 0.0025f),
++          "mocap observation sends without RC/deadman request");
++    check(wait_for_packet(fake_fc, PacketClass::Data,
++          static_cast<std::uint8_t>(DataMessage::MocapAttitude), packet, peer, 300, error),
++          "fake FC receives mocap observation");
++    check(!link.send_mocap_attitude(2, mocap_now - 1'000'000, {}, 0.0025f),
++          "same mocap sample must never be transmitted twice");
++    check(!link.send_mocap_attitude(3, mocap_now, {}, 0.0025f),
++          "mocap rate limiter prevents immediate second transmission");
++
+     UplinkRequest ping;
+     ping.kind = UplinkKind::Ping;
+     ping.token = 77U;
+@@ -2162,7 +2194,30 @@
+ 
+ }  // namespace
+ 
++void test_mocap_attitude_codec() {
++    using namespace dock_ground;
++    using namespace dock_ground::gs_link;
++    const Quaternion q = normalized(Quaternion{0.7, 0.2, -0.3, 0.4});
++    const auto frame = encode_mocap_attitude(42, 0x12345678, 99, 12000, q, 0.0025f);
++    const auto decoded = decode_frame(frame);
++    check(frame.size() == 48 && frame[4] == 3 && frame[8] == 36,
++          "mocap wire ID, payload size and total frame size");
++    check(decoded.failure == DecodeFailure::None, "mocap frame CRC and header");
++    const auto read_float = [&](std::size_t offset) {
++        std::uint32_t bits = 0;
++        for (unsigned i = 0; i < 4; ++i) bits |= std::uint32_t(frame[offset+i]) << (8*i);
++        return std::bit_cast<float>(bits);
++    };
++    check(frame[10] == 0x78 && frame[13] == 0x12 && frame[14] == 99,
++          "mocap session and sample sequence little endian");
++    check(std::abs(read_float(26)-q.w) < 1e-6 && std::abs(read_float(30)-q.x) < 1e-6
++          && std::abs(read_float(34)+q.y) < 1e-6 && std::abs(read_float(38)+q.z) < 1e-6,
++          "FLU body/world to FRD body/world quaternion basis change");
++    check(std::abs(read_float(42)-0.0025f) < 1e-8, "mocap rad squared variance");
++}
++
+ int main() {
++    test_mocap_attitude_codec();
+     test_json();
+     test_flight_logger_arm_session();
+     test_gs_link_codec();
+--- a/docs/05-gs-link-v1.md
++++ b/docs/05-gs-link-v1.md
+@@ -181,3 +181,28 @@
+ AP 拓扑、串口分帧、端到端时延、飞控 failsafe 和位置环现场调参仍需台架联调。
+ 通信-only 固件对起飞/降落/abort 返回 `UNSUPPORTED` 时，界面和 `last_ack`
+ 会如实显示。
++
++
++## 动捕三轴姿态（2026-11-06）
++
++VRPN有效观测会独立于deadman/RC接管，以50 Hz调度发送DATA 0x03；只发新样本、不重传。
++`flight.mocap_attitude_enabled`默认true，`flight.mocap_attitude_noise_rad`默认0.05（rad标准差）。
++源样本总龄期超过50 ms、链路遥测/心跳过期或时间同步失效时暂停发送。
++只发送主机姿态；组合体输入按安装yaw逆变换还原主机，副机尚无独立动捕融合输入。
++
++地面FLU→世界FLU的wxyz四元数在边界转换为[w,x,-y,-z]，表示本机FRD→本地FRD。
++世界航向任意，不声明NED，也不使用Three.js显示变换。VRPN刚体须预先对齐本机FLU。
++DATA 0x03 payload小端36字节：session_id(u32)、sample_sequence(u32)、
++sample_time_us(u64，飞控时钟)、q(float32[4])、各向同性旋转向量方差(float32，rad²)。
++
++DATA 0x04提供NTP式四时间戳同步：请求8字节ground_send_ns，回复24字节
++[ground_send_ns,fc_receive_us,fc_transmit_us]，均u64；回复flags=8。
++只使用匹配且RTT≤20 ms的交换，以10秒窗口最小RTT估计偏移。
++未同步时10 Hz请求，建立后1 Hz，3秒无有效回复停发姿态；旧固件不会启用新姿态发送。
++源时间可信时扣除源龄期，否则采样时刻以本机接收时间为基础，未测的采集延迟仍需补偿。
++状态`gs_link.mocap_attitude`公开time_sync_valid、time_sync_rtt_ms、time_sync_age_ms、tx_packets。
++
++飞控新固件启用`EKF2_EV_CTRL=16`融合完整姿态，替代旧EV yaw更新；
++推荐初值`EKF2_EV_NOISE_MD=0`、`EKF2_EVA_NOISE=0.05`、`EKF2_EV_DELAY=0`，
++室内无磁辅助时`EKF2_MAG_TYPE=5`，保存后重启。EV_DELAY只补偿尚未包含的采集/滤波延迟。
++完整设计及验证见RL_Flight仓库`px4_trans/MOCAP_FULL_ATTITUDE_zh.md`。

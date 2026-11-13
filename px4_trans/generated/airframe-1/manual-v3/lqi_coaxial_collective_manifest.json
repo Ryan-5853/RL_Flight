@@ -4,15 +4,15 @@
   "airframe_id": "airframe-1",
   "airframe_number": 1,
   "controller_contract": "pilot_acceleration_dual_motor_common_differential_servo_roll_pitch",
-  "model_checksum": "0x78ae1111",
+  "model_checksum": "0x6bdc0589",
   "source": {
     "deployment_config": "px4_trans/configs/lqi_coaxial_collective_airframe1_manual_v3.yaml",
-    "deployment_sha256": "6001e6bf4c378a073ddba6b5644e70bd1420a0287c4b614d15f13bb781f857be",
+    "deployment_sha256": "9e726a15ee3f7ee39b0a3c97520eff072aa14cd4fd321b14559955ad331a0913",
     "simulator_config": "SimEnv/configs/sim2real_micro_coaxial_3100kv_airframe1_manual_v2.yaml",
     "simulator_sha256": "3e674fc92e8d2f15894aeb044c52d153abab8ff318a4d3eda9917510e7d5928f",
     "controller_config": "Controller/configs/lqi_coaxial_collective_servo_airframe1_manual_v3.yaml",
     "controller_sha256": "e9cfbede107bdb2ce537465981d00f33bf5446f26e1dc47006492a675c9f77da",
-    "calibration_path": "log/电机标定/3100kv上桨_空中.csv",
+    "calibration_path": "log/\u7535\u673a\u6807\u5b9a/3100kv\u4e0a\u6868_\u7a7a\u4e2d.csv",
     "calibration_sha256": "616a9a625f92593929f275180b1b43e6529fa0986b35fb8fbcf616a06f8f5d5d",
     "calibration_rows": [
       {
@@ -59,9 +59,9 @@
   },
   "generated": {
     "candidate_payload": "px4_trans/generated/airframe-1/manual-v3/LqiCoaxialCollectivePayload.hpp",
-    "candidate_payload_sha256": "caee603962ad8d0fe510d7011cf8deaf6a77fc72ac2db402e9e107e1fb1e4eaa",
+    "candidate_payload_sha256": "5ca5b098bbd41f59e972922cc30e43896547edee8f52e7efbfe2ea1c916766a5",
     "active_header": "px4_trans/px4/src/modules/nn_control/LqiCoaxialCollectivePayload.hpp",
-    "active_header_sha256": "caee603962ad8d0fe510d7011cf8deaf6a77fc72ac2db402e9e107e1fb1e4eaa",
+    "active_header_sha256": "5ca5b098bbd41f59e972922cc30e43896547edee8f52e7efbfe2ea1c916766a5",
     "candidate_golden_header": "px4_trans/generated/airframe-1/manual-v3/lqi_coaxial_collective_golden.hpp",
     "candidate_golden_header_sha256": "9147b2126252858ec7fac8d3f785266706ec042ef901699c760be74fac5b73e2",
     "candidate_golden_json": "px4_trans/generated/airframe-1/manual-v3/lqi_coaxial_collective_golden.json",
@@ -70,10 +70,5 @@
     "golden_header_sha256": "9147b2126252858ec7fac8d3f785266706ec042ef901699c760be74fac5b73e2",
     "golden_json": "px4_trans/tests/lqi_coaxial_collective_golden.json",
     "golden_json_sha256": "9ce8e71e3223eca1f2a1b51379a965818b1b3a4275ca95c240e6fc9d9933b91f"
-  },
-  "firmware_artifact": {
-    "path": "px4_trans/generated/airframe-1/manual-v3/micoair_h743-v2_nncontrol_manual_v3.px4",
-    "sha256": "0453336d9c3fd7694581955886145f2d54483635cb97ac60b6e215da1d366ff0",
-    "size_bytes": 1061994
   }
 }

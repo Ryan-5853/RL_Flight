@@ -205,12 +205,12 @@ static constexpr LqiCoaxialCollectiveModel kModel {
 	1e-10f,
 	0.02f,
 	0.002f,
-	0.3490659f,
-	0.3490659f,
+	0.174532925f,
+	0.174532925f,
 	1.2f,
 	kManualCommandDecay,
 	504u,
-	0x78ae1111u,
+	0x6bdc0589u,
 };
 
 } // namespace lqi_coaxial_collective

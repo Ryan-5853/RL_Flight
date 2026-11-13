@@ -13,6 +13,20 @@ trap 'rm -rf "$WORK"' EXIT
 
 g++ -std=c++17 -O2 -Wall -Wextra -Werror \
 	-I"$ROOT/px4/src/modules/nn_control" \
+	"$ROOT/tests/attitude_termination_check.cpp" \
+	-o "$WORK/attitude_termination_check"
+
+"$WORK/attitude_termination_check"
+
+g++ -std=c++17 -O2 -Wall -Wextra -Werror \
+	-I"$ROOT/px4/src/modules/nn_control" \
+	"$ROOT/tests/actuator_output_validation_check.cpp" \
+	-o "$WORK/actuator_output_validation_check"
+
+"$WORK/actuator_output_validation_check"
+
+g++ -std=c++17 -O2 -Wall -Wextra -Werror \
+	-I"$ROOT/px4/src/modules/nn_control" \
 	"$ROOT/tests/motor_output_map_check.cpp" \
 	-o "$WORK/motor_output_map_check"
 
@@ -38,3 +52,17 @@ g++ -std=c++17 -O2 -Wall -Wextra -Werror \
 	-o "$WORK/lqi_coaxial_collective_core_check"
 
 "$WORK/lqi_coaxial_collective_core_check"
+
+g++ -std=c++17 -O2 -Wall -Wextra -Werror \
+	-I"$ROOT/px4/src/modules/nn_control" \
+	"$ROOT/tests/yaw_balance_envelope_check.cpp" \
+	-o "$WORK/yaw_balance_envelope_check"
+
+"$WORK/yaw_balance_envelope_check"
+
+g++ -std=c++17 -O2 -Wall -Wextra -Werror \
+	-I"$ROOT/px4/src/modules/nn_control" \
+	"$ROOT/tests/shared_yaw_antiwindup_check.cpp" \
+	-o "$WORK/shared_yaw_antiwindup_check"
+
+"$WORK/shared_yaw_antiwindup_check"

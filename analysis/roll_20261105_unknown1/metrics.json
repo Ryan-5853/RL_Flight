@@ -1,0 +1,222 @@
+{
+  "source": "/home/ryan/RL_Flight/log/26.11.5/log_0_UnknownDate_1.ulg",
+  "time_basis": "FC boot seconds",
+  "dropouts_ms": [],
+  "ground": {
+    "session": "/home/ryan/TeleaiTrans_dev/Dock_ground/logs/flights/flight_20261105T061135_138Z_aircraft-01_3",
+    "min_attitude_dot": 0.9999979276130151,
+    "fresh_percent": 100.0,
+    "max_pose_age_ms": 9.66482
+  },
+  "windows": [
+    {
+      "start": 13,
+      "end": 16,
+      "roll_stick_median": -0.3047035038471222,
+      "roll_target_deg_mean": -3.4903318881988525,
+      "onboard_roll_deg_mean": -1.547848334569778,
+      "mocap_roll_deg_mean": -2.156385069417213,
+      "mocap_roll_range_deg": [
+        -4.589605574099052,
+        0.9325393479062755
+      ],
+      "height_mean_m": 1.33780719,
+      "motor_median": [
+        0.23387663066387177,
+        0.2970878779888153
+      ],
+      "servo1_range": [
+        -0.8547863364219666,
+        -0.5822358131408691,
+        0.26952722668647766
+      ],
+      "common_median": -0.0716887041926384,
+      "valid_moment_samples": 551,
+      "roll_moment_model_median_n_m": -0.006188196130096912,
+      "roll_moment_lower_clip_percent_valid_samples": 28.13067150635209,
+      "inferred_roll_integral_moment_median_n_m": -0.004494519698520536
+    },
+    {
+      "start": 19,
+      "end": 22,
+      "roll_stick_median": -0.685071587562561,
+      "roll_target_deg_mean": -6.736571311950684,
+      "onboard_roll_deg_mean": -4.88103791555937,
+      "mocap_roll_deg_mean": -3.668493737152374,
+      "mocap_roll_range_deg": [
+        -5.907879640120617,
+        -1.8202705186087111
+      ],
+      "height_mean_m": 0.9142338033333334,
+      "motor_median": [
+        0.2402336671948433,
+        0.32780878245830536
+      ],
+      "servo1_range": [
+        -0.7847263216972351,
+        -0.616627424955368,
+        0.17565222084522247
+      ],
+      "common_median": -0.07505132257938385,
+      "valid_moment_samples": 572,
+      "roll_moment_model_median_n_m": -0.007064335513859987,
+      "roll_moment_lower_clip_percent_valid_samples": 35.48951048951049,
+      "inferred_roll_integral_moment_median_n_m": -0.004511981111092832
+    },
+    {
+      "start": 27,
+      "end": 30,
+      "roll_stick_median": -0.86094069480896,
+      "roll_target_deg_mean": -8.429959297180176,
+      "onboard_roll_deg_mean": -6.302536296147185,
+      "mocap_roll_deg_mean": -2.559485672257782,
+      "mocap_roll_range_deg": [
+        -4.447474956260128,
+        1.1970210214248678
+      ],
+      "height_mean_m": 1.2161596,
+      "motor_median": [
+        0.2636496126651764,
+        0.3057800978422165
+      ],
+      "servo1_range": [
+        -0.8009083867073059,
+        -0.6121065318584442,
+        0.179316908121109
+      ],
+      "common_median": -0.07522636651992798,
+      "valid_moment_samples": 600,
+      "roll_moment_model_median_n_m": -0.00700667267665267,
+      "roll_moment_lower_clip_percent_valid_samples": 31.0,
+      "inferred_roll_integral_moment_median_n_m": -0.0045041655510668
+    },
+    {
+      "start": 30,
+      "end": 32,
+      "roll_stick_median": -0.9959100484848022,
+      "roll_target_deg_mean": -9.666104316711426,
+      "onboard_roll_deg_mean": -5.95535645909365,
+      "mocap_roll_deg_mean": -2.668150490551616,
+      "mocap_roll_range_deg": [
+        -5.899118986986607,
+        -0.5278283590130581
+      ],
+      "height_mean_m": 1.1546163999999999,
+      "motor_median": [
+        0.28148552775382996,
+        0.28875358402729034
+      ],
+      "servo1_range": [
+        -0.8056212067604065,
+        -0.7517365515232086,
+        0.2908383309841156
+      ],
+      "common_median": -0.0755048617720604,
+      "valid_moment_samples": 400,
+      "roll_moment_model_median_n_m": -0.00899999774992466,
+      "roll_moment_lower_clip_percent_valid_samples": 55.50000000000001,
+      "inferred_roll_integral_moment_median_n_m": -0.004463310934836347
+    },
+    {
+      "start": 32,
+      "end": 33,
+      "roll_stick_median": -0.9856851100921631,
+      "roll_target_deg_mean": -9.808218002319336,
+      "onboard_roll_deg_mean": -5.093778701675311,
+      "mocap_roll_deg_mean": -2.3280298050456785,
+      "mocap_roll_range_deg": [
+        -4.424996441409379,
+        -0.22215253011407185
+      ],
+      "height_mean_m": 0.8256168100000001,
+      "motor_median": [
+        0.28890323638916016,
+        0.2594107389450073
+      ],
+      "servo1_range": [
+        -0.8050523996353149,
+        -0.7696178555488586,
+        -0.2343694567680359
+      ],
+      "common_median": -0.07310379296541214,
+      "valid_moment_samples": 201,
+      "roll_moment_model_median_n_m": -0.008999999612569809,
+      "roll_moment_lower_clip_percent_valid_samples": 67.66169154228857,
+      "inferred_roll_integral_moment_median_n_m": -0.0044645698735662105
+    },
+    {
+      "start": 33,
+      "end": 35,
+      "roll_stick_median": -0.9959100484848022,
+      "roll_target_deg_mean": -9.972034454345703,
+      "onboard_roll_deg_mean": -3.4506193335063298,
+      "mocap_roll_deg_mean": -1.7409731679438378,
+      "mocap_roll_range_deg": [
+        -5.702457849391908,
+        1.8349906937727822
+      ],
+      "height_mean_m": 0.33368497499999994,
+      "motor_median": [
+        0.3296009749174118,
+        0.24785350263118744
+      ],
+      "servo1_range": [
+        -0.8283278942108154,
+        -0.7390131652355194,
+        0.40707534551620483
+      ],
+      "common_median": -0.07528174668550491,
+      "valid_moment_samples": 271,
+      "roll_moment_model_median_n_m": -0.008999999612569809,
+      "roll_moment_lower_clip_percent_valid_samples": 74.16974169741697,
+      "inferred_roll_integral_moment_median_n_m": -0.004544159700348028
+    }
+  ],
+  "pwm": [
+    {
+      "channel": 6,
+      "function": 203,
+      "minimum": 1100,
+      "maximum": 1840,
+      "disarmed": 1500,
+      "armed_zero": 1470.0
+    },
+    {
+      "channel": 7,
+      "function": 202,
+      "minimum": 1200,
+      "maximum": 1900,
+      "disarmed": 1500,
+      "armed_zero": 1550.0
+    },
+    {
+      "channel": 8,
+      "function": 201,
+      "minimum": 1230,
+      "maximum": 1860,
+      "disarmed": 1450,
+      "armed_zero": 1545.0
+    }
+  ],
+  "roll_decomposition_30_32s": {
+    "scope": "Model-domain approximation assuming roll I moment at its observed/inferred -0.0045 cap; not internal trace",
+    "P_mean_n_m": -0.005273858552240282,
+    "D_mean_n_m": 0.00015607328510625356,
+    "D_std_n_m": 0.003983385084400694,
+    "I_assumed_n_m": -0.0045,
+    "raw_mean_n_m": -0.009617785267134029,
+    "clipped_mean_n_m": -0.007605571314677675,
+    "output_inferred_mean_n_m": -0.007498785387724638
+  },
+  "pwm_interpretation": "User confirmed endpoint midpoint is intended zero; disarm values do not participate in flight. No disarm-as-neutral fault inferred.",
+  "spectrum": {
+    "primary_fifo_max_spacing_s": 0.0005559999999995568,
+    "primary_fifo_peak_hz": 300.78125,
+    "control_roll_rate_peak_hz": 5.615234375,
+    "mocap_approx_roll_rate_peak_1_20_hz": 5.46875,
+    "gyro_mocap_roll_rate_coherence_near_5p5_hz": 0.9631803935851594,
+    "control_roll_rate_std_rad_s": 0.25104705084651874,
+    "control_roll_rate_abs_above_0p3_fraction": 0.23046153846153847,
+    "note": "Native primary FIFO nearly continuous at 2kHz; 500Hz logged raw gyro has a ~198Hz alias and should not be used to identify the true main frequency."
+  }
+}

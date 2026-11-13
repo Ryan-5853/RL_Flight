@@ -1,0 +1,9 @@
+{
+  "LqiCoaxialCollectiveCore.hpp": "c8d3b49879340619e6c6d27041daf60971c174e2a51e6ab041f0d68fd1a4fa65",
+  "LqiCoaxialCollectiveModel.hpp": "c4ef914c55461eb3f0bd11f126311c9c0143df04c6d6037816bdf89691896842",
+  "LqiCoaxialCollectivePayload.hpp": "40f54ff5f0c96914fbeaf794a74f0a8f58dbd1b1c318ea052107d193a98adbfe",
+  "LqiManualReference.hpp": "5e5526e0c8c1b041503e5246776cb53edd187cfe928a5b80405eeb227c900441",
+  "LqiControllerCore.hpp": "9a46c046b09fdf9419ec038c0d68233d36d93be73e3cf7cecee5d4c9a5c1b3ad",
+  "LqiControllerModel.hpp": "694921b568cba6e7eacc290f0b8559ffd854f79de9a44ad22b8432b8ce693886",
+  "LqiCompositeControllerModel.hpp": "3cdaa49bb95b7f59f4d6516e651ea44165653bff2e974f97c1d36c5df7f2f71a"
+}

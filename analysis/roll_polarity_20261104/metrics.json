@@ -1,0 +1,77 @@
+[
+  {
+    "log": "flight_20261104T064431_947Z_aircraft-01_2",
+    "windows": {
+      "5-8.5s": {
+        "rc_roll_mean": 0.0,
+        "fc_roll_mean_deg": 4.948913757372512,
+        "mocap_roll_mean_deg": 0.296911694704898,
+        "fc_minus_mocap_roll_deg": 4.652002062667614,
+        "gyro_p_mean_deg_s": 1.1109374016138223,
+        "mocap_p_mean_deg_s": -0.07226957178414203,
+        "specific_force_y_mean": -0.7050644103,
+        "servos_mean": [
+          -0.6235294085882352,
+          0.34710088618235285,
+          0.27642852379411753
+        ]
+      },
+      "9-10s": {
+        "rc_roll_mean": -0.05012510033489796,
+        "fc_roll_mean_deg": 6.000832426974227,
+        "mocap_roll_mean_deg": -6.220855202410408,
+        "fc_minus_mocap_roll_deg": 12.221687629384633,
+        "gyro_p_mean_deg_s": -15.199984355242684,
+        "mocap_p_mean_deg_s": -15.861359659560089,
+        "specific_force_y_mean": -0.4606614803185714,
+        "servos_mean": [
+          -0.46693233680489804,
+          0.4625804273914284,
+          0.004351891210673463
+        ]
+      },
+      "10-11s": {
+        "rc_roll_mean": 0.6626404416653061,
+        "fc_roll_mean_deg": 8.450611657743284,
+        "mocap_roll_mean_deg": -10.912714635060645,
+        "fc_minus_mocap_roll_deg": 19.36332629280393,
+        "gyro_p_mean_deg_s": 24.327539446545636,
+        "mocap_p_mean_deg_s": 19.941576522145834,
+        "specific_force_y_mean": 1.3156794085102042,
+        "servos_mean": [
+          -0.3427406939897959,
+          0.11737134127979593,
+          0.22536934299918368
+        ]
+      },
+      "11-12s": {
+        "rc_roll_mean": 0.9701104190208335,
+        "fc_roll_mean_deg": 19.55783606639498,
+        "mocap_roll_mean_deg": -5.143606725139889,
+        "fc_minus_mocap_roll_deg": 24.701442791534873,
+        "gyro_p_mean_deg_s": 0.7447301005038237,
+        "mocap_p_mean_deg_s": -7.045984015886037,
+        "specific_force_y_mean": 0.65827991233125,
+        "servos_mean": [
+          -0.24742043278562495,
+          0.08880254597895831,
+          0.158617884225
+        ]
+      },
+      "12-13.3s": {
+        "rc_roll_mean": 0.999999881,
+        "fc_roll_mean_deg": 20.149375204473806,
+        "mocap_roll_mean_deg": -11.915907508980645,
+        "fc_minus_mocap_roll_deg": 32.06528271345445,
+        "gyro_p_mean_deg_s": -0.1560493696612177,
+        "mocap_p_mean_deg_s": -5.239892797962053,
+        "specific_force_y_mean": 0.4753548167703125,
+        "servos_mean": [
+          -0.23960095744188595,
+          -0.07165277841453126,
+          0.31125373260937506
+        ]
+      }
+    }
+  }
+]

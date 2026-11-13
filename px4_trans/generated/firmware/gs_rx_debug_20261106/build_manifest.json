@@ -1,0 +1,16 @@
+{
+  "build_utc": "2026-11-06T07:23:33.305845+00:00",
+  "files_sha256": {
+    "micoair_h743-v2_nncontrol_gs_rx_debug.px4": "528242d4b269fbf9eaddf2f59eafe2245d1cc5ceb7d490e652f49fdee32ce429",
+    "micoair_h743-v2_nncontrol_gs_rx_debug.elf": "e949fdd34ca9b0f5a6c54eacf943524b92a66c2d1afa9fbf6629d7de033a52bc"
+  },
+  "source_sha256": {
+    "px4_trans/px4/src/modules/gs_link/GsLink.cpp": "e2d00344582515f489a0d04aee2cbefd619e21c15dc8c9aba151f0b9ddf76caf",
+    "px4_trans/px4/src/modules/gs_link/GsLink.hpp": "abc8ec214f6de86dcf3019b8784861672c6c1c62f1ff40959620b91a6dd113c9"
+  },
+  "checks": [
+    "micoair_h743-v2_nncontrol firmware build passed",
+    "GS-Link protocol and pair diagnostics host checks passed"
+  ],
+  "flashed": false
+}

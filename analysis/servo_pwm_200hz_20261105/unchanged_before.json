@@ -1,0 +1,10 @@
+{
+  "px4_trans/px4/src/modules/nn_control/LqiCoaxialCollectivePayload.hpp": "cd6641485c00318c3d212d47b35a4d539b23ff4f71cab2051374a75cd17637d7",
+  "px4_trans/px4/src/modules/nn_control/LqiCoaxialCollectiveCore.hpp": "b0a02dc07d4217b1736e13d72104fd32a6d843b0e50c077cb3cf4ee9e3cb3cbd",
+  "px4_trans/px4/src/modules/nn_control/LqiCoaxialCollectiveModel.hpp": "6e8df8bd6ae59770b616096c38a219798f2e5ee1fd33e35f9b1f55ee92184e19",
+  "px4_trans/px4/src/modules/nn_control/LqiManualReference.hpp": "dd2f983de1ed3f1a92ac527ce19bf70ebb979d9c030b02373d35db2bb0d7e3c2",
+  "px4_trans/px4/src/modules/nn_control/NNControl.cpp": "fa942031094b68524f1f35aa99b804168cdb129d14dfaa261432b1ab16b650ff",
+  "px4_trans/px4/src/modules/nn_control/NNControl.hpp": "0049d02dff6f3cdaa0cd86310e9ec14cf641d59a083dc9f0a9a4838902ef9515",
+  "px4_trans/px4/src/drivers/pwm_out/PWMOut.cpp": "050cd5e01a51df991fa435fe4c555ee171fb0fddb6f6b431ca8359ff380300e9",
+  "px4_trans/px4/src/lib/mixer_module/mixer_module.cpp": "d8140b57e6367ea35f7bbd24ba419dd766432f796177199a10bafd2107929cbe"
+}

@@ -1,0 +1,1282 @@
+{
+  "scope": "Linear comparison: servo lag, 50Hz ZOH, 40Hz gyro LPF and explicit transport delay.\nUncertainty range is hypothetical, not identified. 20ms extra-delay stresses\nare retained even though not all are stable; no flight-validation claim.\n",
+  "results": {
+    "v2": {
+      "kp_kd_ki": [
+        0.0814316645,
+        0.0168643519,
+        0.0997526571
+      ],
+      "delay_groups": [
+        {
+          "extra_delay_s": 0,
+          "worst_pole_radius": 1.1338991547718293,
+          "unstable_cases": 13
+        },
+        {
+          "extra_delay_s": 0.002,
+          "worst_pole_radius": 1.1622091045281446,
+          "unstable_cases": 14
+        },
+        {
+          "extra_delay_s": 0.004,
+          "worst_pole_radius": 1.187009972917195,
+          "unstable_cases": 14
+        },
+        {
+          "extra_delay_s": 0.01,
+          "worst_pole_radius": 1.2428812914026555,
+          "unstable_cases": 17
+        },
+        {
+          "extra_delay_s": 0.02,
+          "worst_pole_radius": 1.2921405333171188,
+          "unstable_cases": 18
+        }
+      ],
+      "cases": [
+        {
+          "delay_s": 0,
+          "radius": 0.9624505151137238,
+          "gain_multiplier": 0.5,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0.002,
+          "radius": 0.9624321838501466,
+          "gain_multiplier": 0.5,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0.004,
+          "radius": 0.962413863299877,
+          "gain_multiplier": 0.5,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0.01,
+          "radius": 0.9623586851683802,
+          "gain_multiplier": 0.5,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0.02,
+          "radius": 0.9666595249472631,
+          "gain_multiplier": 0.5,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0,
+          "radius": 0.9622460740171574,
+          "gain_multiplier": 0.5,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0.002,
+          "radius": 0.9622275079772701,
+          "gain_multiplier": 0.5,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0.004,
+          "radius": 0.9622089415870569,
+          "gain_multiplier": 0.5,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0.01,
+          "radius": 0.967430407071383,
+          "gain_multiplier": 0.5,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0.02,
+          "radius": 0.9917243420965179,
+          "gain_multiplier": 0.5,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0,
+          "radius": 0.9826262708009946,
+          "gain_multiplier": 0.5,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0.002,
+          "radius": 0.9859286908235095,
+          "gain_multiplier": 0.5,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0.004,
+          "radius": 0.9892008317555282,
+          "gain_multiplier": 0.5,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0.01,
+          "radius": 0.9987820807629234,
+          "gain_multiplier": 0.5,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0.02,
+          "radius": 1.0136299490505838,
+          "gain_multiplier": 0.5,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0,
+          "radius": 0.9932625022108714,
+          "gain_multiplier": 0.5,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0.002,
+          "radius": 0.99601444991554,
+          "gain_multiplier": 0.5,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0.004,
+          "radius": 0.9987408583488665,
+          "gain_multiplier": 0.5,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0.01,
+          "radius": 1.0067293061413563,
+          "gain_multiplier": 0.5,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0.02,
+          "radius": 1.0191677812245523,
+          "gain_multiplier": 0.5,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0,
+          "radius": 0.9590601987595938,
+          "gain_multiplier": 1.0,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0.002,
+          "radius": 0.9590388939773171,
+          "gain_multiplier": 1.0,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0.004,
+          "radius": 0.96968193250522,
+          "gain_multiplier": 1.0,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0.01,
+          "radius": 1.0066566872794416,
+          "gain_multiplier": 1.0,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0.02,
+          "radius": 1.0542300648084324,
+          "gain_multiplier": 1.0,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0,
+          "radius": 0.9752246907834924,
+          "gain_multiplier": 1.0,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0.002,
+          "radius": 0.9852535208426436,
+          "gain_multiplier": 1.0,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0.004,
+          "radius": 0.9949251240776963,
+          "gain_multiplier": 1.0,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0.01,
+          "radius": 1.0215905088012576,
+          "gain_multiplier": 1.0,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0.02,
+          "radius": 1.0575227455504035,
+          "gain_multiplier": 1.0,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0,
+          "radius": 1.0038493084673348,
+          "gain_multiplier": 1.0,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0.002,
+          "radius": 1.0101111796825322,
+          "gain_multiplier": 1.0,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0.004,
+          "radius": 1.016205631133161,
+          "gain_multiplier": 1.0,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0.01,
+          "radius": 1.033369663464947,
+          "gain_multiplier": 1.0,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0.02,
+          "radius": 1.0577163009002675,
+          "gain_multiplier": 1.0,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0,
+          "radius": 1.011146656390291,
+          "gain_multiplier": 1.0,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0.002,
+          "radius": 1.0164183692587196,
+          "gain_multiplier": 1.0,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0.004,
+          "radius": 1.0215621739057896,
+          "gain_multiplier": 1.0,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0.01,
+          "radius": 1.0361375360896903,
+          "gain_multiplier": 1.0,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0.02,
+          "radius": 1.057138242454608,
+          "gain_multiplier": 1.0,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0,
+          "radius": 0.9933222304962971,
+          "gain_multiplier": 1.5,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0.002,
+          "radius": 1.0122518086033547,
+          "gain_multiplier": 1.5,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0.004,
+          "radius": 1.029840621441426,
+          "gain_multiplier": 1.5,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0.01,
+          "radius": 1.074761418904237,
+          "gain_multiplier": 1.5,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0.02,
+          "radius": 1.126642988756847,
+          "gain_multiplier": 1.5,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0,
+          "radius": 1.0120498011752752,
+          "gain_multiplier": 1.5,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0.002,
+          "radius": 1.025748202963604,
+          "gain_multiplier": 1.5,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0.004,
+          "radius": 1.0386706368551168,
+          "gain_multiplier": 1.5,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0.01,
+          "radius": 1.0727224072631683,
+          "gain_multiplier": 1.5,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0.02,
+          "radius": 1.1145714622009386,
+          "gain_multiplier": 1.5,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0,
+          "radius": 1.0271352601573978,
+          "gain_multiplier": 1.5,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0.002,
+          "radius": 1.035978754140912,
+          "gain_multiplier": 1.5,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0.004,
+          "radius": 1.044453134759202,
+          "gain_multiplier": 1.5,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0.01,
+          "radius": 1.0675471452277374,
+          "gain_multiplier": 1.5,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0.02,
+          "radius": 1.098055513983502,
+          "gain_multiplier": 1.5,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0,
+          "radius": 1.0308276749275365,
+          "gain_multiplier": 1.5,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0.002,
+          "radius": 1.038342448792056,
+          "gain_multiplier": 1.5,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0.004,
+          "radius": 1.045576491810797,
+          "gain_multiplier": 1.5,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0.01,
+          "radius": 1.0654900747649545,
+          "gain_multiplier": 1.5,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0.02,
+          "radius": 1.0924069363040918,
+          "gain_multiplier": 1.5,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0,
+          "radius": 1.0425136601507905,
+          "gain_multiplier": 2.0,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0.002,
+          "radius": 1.0651322720928063,
+          "gain_multiplier": 2.0,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0.004,
+          "radius": 1.0856801182937343,
+          "gain_multiplier": 2.0,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0.01,
+          "radius": 1.1357827294821126,
+          "gain_multiplier": 2.0,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0.02,
+          "radius": 1.1884985228531033,
+          "gain_multiplier": 2.0,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0,
+          "radius": 1.0478695159888998,
+          "gain_multiplier": 2.0,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0.002,
+          "radius": 1.0646621145033222,
+          "gain_multiplier": 2.0,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0.004,
+          "radius": 1.080209247647875,
+          "gain_multiplier": 2.0,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0.01,
+          "radius": 1.1196355321006988,
+          "gain_multiplier": 2.0,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0.02,
+          "radius": 1.1644581920223582,
+          "gain_multiplier": 2.0,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0,
+          "radius": 1.050283589989421,
+          "gain_multiplier": 2.0,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0.002,
+          "radius": 1.061423629729626,
+          "gain_multiplier": 2.0,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0.004,
+          "radius": 1.0719519748010293,
+          "gain_multiplier": 2.0,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0.01,
+          "radius": 1.0998269592683219,
+          "gain_multiplier": 2.0,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0.02,
+          "radius": 1.134476296306331,
+          "gain_multiplier": 2.0,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0,
+          "radius": 1.0504997314438227,
+          "gain_multiplier": 2.0,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0.002,
+          "radius": 1.0600420946317233,
+          "gain_multiplier": 2.0,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0.004,
+          "radius": 1.0691164502280552,
+          "gain_multiplier": 2.0,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0.01,
+          "radius": 1.093461591953247,
+          "gain_multiplier": 2.0,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0.02,
+          "radius": 1.1246013376116633,
+          "gain_multiplier": 2.0,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0,
+          "radius": 1.1338991547718293,
+          "gain_multiplier": 3.0,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0.002,
+          "radius": 1.1622091045281446,
+          "gain_multiplier": 3.0,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0.004,
+          "radius": 1.187009972917195,
+          "gain_multiplier": 3.0,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0.01,
+          "radius": 1.2428812914026555,
+          "gain_multiplier": 3.0,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0.02,
+          "radius": 1.2921405333171188,
+          "gain_multiplier": 3.0,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0,
+          "radius": 1.1157925756392848,
+          "gain_multiplier": 3.0,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0.002,
+          "radius": 1.1375791650886513,
+          "gain_multiplier": 3.0,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0.004,
+          "radius": 1.1571325716132823,
+          "gain_multiplier": 3.0,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0.01,
+          "radius": 1.203598408033815,
+          "gain_multiplier": 3.0,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0.02,
+          "radius": 1.2496237314734715,
+          "gain_multiplier": 3.0,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0,
+          "radius": 1.0951616404172004,
+          "gain_multiplier": 3.0,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0.002,
+          "radius": 1.1102356245651603,
+          "gain_multiplier": 3.0,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0.004,
+          "radius": 1.1241448045002171,
+          "gain_multiplier": 3.0,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0.01,
+          "radius": 1.1591869020635077,
+          "gain_multiplier": 3.0,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0.02,
+          "radius": 1.1984304708925646,
+          "gain_multiplier": 3.0,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0,
+          "radius": 1.0888824198912963,
+          "gain_multiplier": 3.0,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0.002,
+          "radius": 1.1019655610709769,
+          "gain_multiplier": 3.0,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0.004,
+          "radius": 1.1141428422522421,
+          "gain_multiplier": 3.0,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0.01,
+          "radius": 1.1453842631660818,
+          "gain_multiplier": 3.0,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0.02,
+          "radius": 1.1817379293858628,
+          "gain_multiplier": 3.0,
+          "servo_tau_s": 0.12
+        }
+      ]
+    },
+    "v3": {
+      "kp_kd_ki": [
+        0.012,
+        0.004,
+        0.02
+      ],
+      "delay_groups": [
+        {
+          "extra_delay_s": 0,
+          "worst_pole_radius": 0.990661997535138,
+          "unstable_cases": 0
+        },
+        {
+          "extra_delay_s": 0.002,
+          "worst_pole_radius": 0.9909036972045008,
+          "unstable_cases": 0
+        },
+        {
+          "extra_delay_s": 0.004,
+          "worst_pole_radius": 0.9911533671280219,
+          "unstable_cases": 0
+        },
+        {
+          "extra_delay_s": 0.01,
+          "worst_pole_radius": 0.9995390116753399,
+          "unstable_cases": 0
+        },
+        {
+          "extra_delay_s": 0.02,
+          "worst_pole_radius": 1.0165295987692613,
+          "unstable_cases": 3
+        }
+      ],
+      "cases": [
+        {
+          "delay_s": 0,
+          "radius": 0.9838512190885039,
+          "gain_multiplier": 0.5,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0.002,
+          "radius": 0.9838491728788057,
+          "gain_multiplier": 0.5,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0.004,
+          "radius": 0.9838483948276997,
+          "gain_multiplier": 0.5,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0.01,
+          "radius": 0.9838548328958149,
+          "gain_multiplier": 0.5,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0.02,
+          "radius": 0.9839030601571124,
+          "gain_multiplier": 0.5,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0,
+          "radius": 0.984355890881493,
+          "gain_multiplier": 0.5,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0.002,
+          "radius": 0.9843834786673811,
+          "gain_multiplier": 0.5,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0.004,
+          "radius": 0.9844142097456218,
+          "gain_multiplier": 0.5,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0.01,
+          "radius": 0.9845277934237747,
+          "gain_multiplier": 0.5,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0.02,
+          "radius": 0.9848057608749531,
+          "gain_multiplier": 0.5,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0,
+          "radius": 0.9877144707805412,
+          "gain_multiplier": 0.5,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0.002,
+          "radius": 0.9878831886630671,
+          "gain_multiplier": 0.5,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0.004,
+          "radius": 0.9880604230149124,
+          "gain_multiplier": 0.5,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0.01,
+          "radius": 0.9886459272107315,
+          "gain_multiplier": 0.5,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0.02,
+          "radius": 0.9898132221050059,
+          "gain_multiplier": 0.5,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0,
+          "radius": 0.990661997535138,
+          "gain_multiplier": 0.5,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0.002,
+          "radius": 0.9909036972045008,
+          "gain_multiplier": 0.5,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0.004,
+          "radius": 0.9911533671280219,
+          "gain_multiplier": 0.5,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0.01,
+          "radius": 0.9919504529185943,
+          "gain_multiplier": 0.5,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0.02,
+          "radius": 0.9934358053221928,
+          "gain_multiplier": 0.5,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0,
+          "radius": 0.963804546522314,
+          "gain_multiplier": 1.0,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0.002,
+          "radius": 0.9637088816221916,
+          "gain_multiplier": 1.0,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0.004,
+          "radius": 0.9636170384226674,
+          "gain_multiplier": 1.0,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0.01,
+          "radius": 0.9633642204437787,
+          "gain_multiplier": 1.0,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0.02,
+          "radius": 0.9630192212172807,
+          "gain_multiplier": 1.0,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0,
+          "radius": 0.962787669456251,
+          "gain_multiplier": 1.0,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0.002,
+          "radius": 0.9627341799006469,
+          "gain_multiplier": 1.0,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0.004,
+          "radius": 0.9626845403914489,
+          "gain_multiplier": 1.0,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0.01,
+          "radius": 0.9625574623111096,
+          "gain_multiplier": 1.0,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0.02,
+          "radius": 0.9624118908406307,
+          "gain_multiplier": 1.0,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0,
+          "radius": 0.9618244492158897,
+          "gain_multiplier": 1.0,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0.002,
+          "radius": 0.9618403411331626,
+          "gain_multiplier": 1.0,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0.004,
+          "radius": 0.9618574879067764,
+          "gain_multiplier": 1.0,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0.01,
+          "radius": 0.9619156759909201,
+          "gain_multiplier": 1.0,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0.02,
+          "radius": 0.9699379251553439,
+          "gain_multiplier": 1.0,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0,
+          "radius": 0.9671451983893407,
+          "gain_multiplier": 1.0,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0.002,
+          "radius": 0.968493356005896,
+          "gain_multiplier": 1.0,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0.004,
+          "radius": 0.9698450358834895,
+          "gain_multiplier": 1.0,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0.01,
+          "radius": 0.9739108973964165,
+          "gain_multiplier": 1.0,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0.02,
+          "radius": 0.9806447196304878,
+          "gain_multiplier": 1.0,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0,
+          "radius": 0.966463352865654,
+          "gain_multiplier": 1.5,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0.002,
+          "radius": 0.9664490910955198,
+          "gain_multiplier": 1.5,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0.004,
+          "radius": 0.9664354549844529,
+          "gain_multiplier": 1.5,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0.01,
+          "radius": 0.9663980418396816,
+          "gain_multiplier": 1.5,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0.02,
+          "radius": 0.9663467751800473,
+          "gain_multiplier": 1.5,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0,
+          "radius": 0.966286264509028,
+          "gain_multiplier": 1.5,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0.002,
+          "radius": 0.9662784387562611,
+          "gain_multiplier": 1.5,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0.004,
+          "radius": 0.966271127335779,
+          "gain_multiplier": 1.5,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0.01,
+          "radius": 0.9662521141259228,
+          "gain_multiplier": 1.5,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0.02,
+          "radius": 0.9662295972361737,
+          "gain_multiplier": 1.5,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0,
+          "radius": 0.9660553070646876,
+          "gain_multiplier": 1.5,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0.002,
+          "radius": 0.9660580870258132,
+          "gain_multiplier": 1.5,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0.004,
+          "radius": 0.9660611623636899,
+          "gain_multiplier": 1.5,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0.01,
+          "radius": 0.9675279339888249,
+          "gain_multiplier": 1.5,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0.02,
+          "radius": 0.9793150604768343,
+          "gain_multiplier": 1.5,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0,
+          "radius": 0.9680943226406049,
+          "gain_multiplier": 1.5,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0.002,
+          "radius": 0.9701207750844111,
+          "gain_multiplier": 1.5,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0.004,
+          "radius": 0.9721445490078802,
+          "gain_multiplier": 1.5,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0.01,
+          "radius": 0.9781772123650455,
+          "gain_multiplier": 1.5,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0.02,
+          "radius": 0.9879425502682223,
+          "gain_multiplier": 1.5,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0,
+          "radius": 0.9677185542917608,
+          "gain_multiplier": 2.0,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0.002,
+          "radius": 0.9677125630375122,
+          "gain_multiplier": 2.0,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0.004,
+          "radius": 0.967706825341744,
+          "gain_multiplier": 2.0,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0.01,
+          "radius": 0.9676910061875281,
+          "gain_multiplier": 2.0,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0.02,
+          "radius": 0.9676691068792197,
+          "gain_multiplier": 2.0,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0,
+          "radius": 0.9676366234023112,
+          "gain_multiplier": 2.0,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0.002,
+          "radius": 0.9676332617389265,
+          "gain_multiplier": 2.0,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0.004,
+          "radius": 0.967630113759574,
+          "gain_multiplier": 2.0,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0.01,
+          "radius": 0.9676218817845075,
+          "gain_multiplier": 2.0,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0.02,
+          "radius": 0.9676120352229719,
+          "gain_multiplier": 2.0,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0,
+          "radius": 0.9675143845157417,
+          "gain_multiplier": 2.0,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0.002,
+          "radius": 0.9675156310550965,
+          "gain_multiplier": 2.0,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0.004,
+          "radius": 0.967517019691968,
+          "gain_multiplier": 2.0,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0.01,
+          "radius": 0.9758201246683066,
+          "gain_multiplier": 2.0,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0.02,
+          "radius": 0.9906526629682385,
+          "gain_multiplier": 2.0,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0,
+          "radius": 0.9717469204769018,
+          "gain_multiplier": 2.0,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0.002,
+          "radius": 0.9744128192788578,
+          "gain_multiplier": 2.0,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0.004,
+          "radius": 0.9770648978744056,
+          "gain_multiplier": 2.0,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0.01,
+          "radius": 0.9849013442806114,
+          "gain_multiplier": 2.0,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0.02,
+          "radius": 0.9973159434043706,
+          "gain_multiplier": 2.0,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0,
+          "radius": 0.9688247535312271,
+          "gain_multiplier": 3.0,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0.002,
+          "radius": 0.9688223291395124,
+          "gain_multiplier": 3.0,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0.004,
+          "radius": 0.9688200046713766,
+          "gain_multiplier": 3.0,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0.01,
+          "radius": 0.9688135612683793,
+          "gain_multiplier": 3.0,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0.02,
+          "radius": 0.9861414100681957,
+          "gain_multiplier": 3.0,
+          "servo_tau_s": 0.04
+        },
+        {
+          "delay_s": 0,
+          "radius": 0.9687881695838757,
+          "gain_multiplier": 3.0,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0.002,
+          "radius": 0.9687867779268429,
+          "gain_multiplier": 3.0,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0.004,
+          "radius": 0.9687854724680381,
+          "gain_multiplier": 3.0,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0.01,
+          "radius": 0.9699481268615012,
+          "gain_multiplier": 3.0,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0.02,
+          "radius": 1.0008370736149381,
+          "gain_multiplier": 3.0,
+          "servo_tau_s": 0.06
+        },
+        {
+          "delay_s": 0,
+          "radius": 0.9708772987639882,
+          "gain_multiplier": 3.0,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0.002,
+          "radius": 0.9755207202940086,
+          "gain_multiplier": 3.0,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0.004,
+          "radius": 0.9800999957882117,
+          "gain_multiplier": 3.0,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0.01,
+          "radius": 0.9933608970422205,
+          "gain_multiplier": 3.0,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0.02,
+          "radius": 1.0133377780240602,
+          "gain_multiplier": 3.0,
+          "servo_tau_s": 0.1
+        },
+        {
+          "delay_s": 0,
+          "radius": 0.9806512043196473,
+          "gain_multiplier": 3.0,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0.002,
+          "radius": 0.9845402245975822,
+          "gain_multiplier": 3.0,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0.004,
+          "radius": 0.9883802328669034,
+          "gain_multiplier": 3.0,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0.01,
+          "radius": 0.9995390116753399,
+          "gain_multiplier": 3.0,
+          "servo_tau_s": 0.12
+        },
+        {
+          "delay_s": 0.02,
+          "radius": 1.0165295987692613,
+          "gain_multiplier": 3.0,
+          "servo_tau_s": 0.12
+        }
+      ]
+    }
+  },
+  "controller_magnitude_at_5p6hz": {
+    "v2": 0.5961392328494302,
+    "v3": 0.14068764660648586
+  },
+  "v3_vs_v2_db": -12.541834789088588
+}

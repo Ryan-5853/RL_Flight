@@ -1,0 +1,27 @@
+{
+  "scope": "Same recorded inputs, two controller versions; not closed-loop flight validation",
+  "results": {
+    "v1": {
+      "max_abs_integral_moment_xyz_n_m": [
+        0.03273533613591442,
+        0.005050455053109969,
+        0.0030000000836562404
+      ],
+      "late_grid_common_mean": -0.15499989688396454,
+      "late_grid_common_min": -0.1600000113248825,
+      "late_grid_common_max": -0.14976215362548828,
+      "late_target_yaw_deg_mean": 70.3385009765625
+    },
+    "v2": {
+      "max_abs_integral_moment_xyz_n_m": [
+        0.003935185191938979,
+        0.0044999997672711825,
+        0.0030000000836562404
+      ],
+      "late_grid_common_mean": 7.152557435219364e-10,
+      "late_grid_common_min": -5.960464477539063e-08,
+      "late_grid_common_max": 5.960464477539063e-08,
+      "late_target_yaw_deg_mean": -21.50177001953125
+    }
+  }
+}

@@ -12,3 +12,11 @@ g++ -std=c++17 -O2 -Wall -Wextra -Werror \
 	-o "$WORK/gs_link_protocol_check"
 
 "$WORK/gs_link_protocol_check"
+
+"${CXX:-c++}" -std=c++17 -O2 -Wall -Wextra -Werror \
+    "$ROOT/tests/gs_pair_diagnostics_check.cpp" -o "$WORK/gs_pair_diagnostics_check"
+"$WORK/gs_pair_diagnostics_check"
+
+"${CXX:-c++}" -std=c++17 -O2 -Wall -Wextra -Werror \
+    "$ROOT/tests/gs_mocap_check.cpp" -o "$WORK/gs_mocap_check"
+"$WORK/gs_mocap_check"

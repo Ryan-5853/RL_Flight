@@ -1,0 +1,60 @@
+{
+  "scope": "post-flight live diagnosis after approved diagnostic station restart",
+  "task": {
+    "mode": "single",
+    "aircraft_id": "aircraft-01",
+    "master_id": "aircraft-01",
+    "slave_id": "aircraft-02"
+  },
+  "mocap": {
+    "time_sync_valid": false,
+    "time_sync_rtt_ms": -1,
+    "time_sync_age_ms": -1,
+    "tx_packets": 0,
+    "sync_requests_sent": 41,
+    "sync_replies_received": 0,
+    "sync_accepted": 0,
+    "sync_rejected_shape": 0,
+    "sync_rejected_token": 0,
+    "sync_rejected_clock": 0,
+    "sync_rejected_rtt": 0,
+    "sync_last_rtt_ms": -1,
+    "sync_last_result": "no_reply"
+  },
+  "telemetry_fresh": true,
+  "heartbeat_fresh": true,
+  "bridge_statistics": {
+    "read_bytes": 7272302,
+    "serial_dec_mav_msgs": 0,
+    "tcp_connected": 0,
+    "udp_connected": 1,
+    "gs_link": {
+      "uart_frames_valid": 35291,
+      "uart_crc_errors": 0,
+      "uart_length_errors": 0,
+      "uart_version_errors": 0,
+      "uart_class_errors": 0,
+      "uart_discarded_bytes": 0,
+      "uart_partial_timeouts": 0,
+      "uart_read_bytes": 7272302,
+      "udp_tx_datagrams": 35291,
+      "udp_tx_bytes": 7272302,
+      "udp_tx_errors": 0,
+      "udp_rx_datagrams": 5074,
+      "udp_rx_bytes": 128464,
+      "udp_rx_rejected": 0,
+      "udp_rx_crc_errors": 0,
+      "udp_rx_length_errors": 0,
+      "udp_rx_header_errors": 0,
+      "uart_tx_frames": 5074,
+      "uart_tx_bytes": 128464,
+      "uart_tx_errors": 0,
+      "frames_without_udp_peer": 0
+    },
+    "udp_clients": [
+      "192.168.31.220:39050"
+    ],
+    "current_client_ip": "192.168.31.214",
+    "esp_rssi": -41
+  }
+}

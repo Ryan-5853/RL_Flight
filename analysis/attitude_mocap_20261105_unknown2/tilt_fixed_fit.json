@@ -1,0 +1,17 @@
+{
+  "body_rotation_adjustment_deg": [
+    -3.4235028597937833,
+    -1.4091624465592534,
+    -4.984732817638151
+  ],
+  "world_vertical_adjustment_deg": [
+    -1.5906043704605848,
+    2.4844303137028527
+  ],
+  "residual_p5_p50_p95_deg": [
+    0.44106396799879105,
+    1.9745923159165397,
+    3.407224015506022
+  ],
+  "note": "optimistic all-flight fit; body correction bounded at +/-5 deg rotvec components"
+}

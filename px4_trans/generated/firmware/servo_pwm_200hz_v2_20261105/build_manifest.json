@@ -1,0 +1,43 @@
+{
+  "firmware": "micoair_h743-v2_nncontrol_v2_servo200hz.px4",
+  "sha256": "5c2ca0124b7cc11a6def66c11764de831c3b34c58ea0bbc7eb54b2b21d95626a",
+  "image_size": 1205728,
+  "flashed": false,
+  "baseline": "selected v2 / last flight log_0_UnknownDate_1.ulg controller",
+  "model_checksum": "0x30298daf",
+  "servo_pwm_hz": 200,
+  "servo_pwm_period_ms": 5,
+  "startup_parameters": {
+    "PWM_MAIN_TIM1": 200,
+    "PWM_MAIN_TIM2": 200
+  },
+  "override_saved_50hz": true,
+  "controller_software_50hz_hold": "No separate runtime hold found; 50 Hz ZOH was the previous physical PWM period and an offline modeling assumption. Controller interval remains 2ms.",
+  "unchanged_control_and_driver_sha256": {
+    "px4_trans/px4/src/modules/nn_control/LqiCoaxialCollectivePayload.hpp": "cd6641485c00318c3d212d47b35a4d539b23ff4f71cab2051374a75cd17637d7",
+    "px4_trans/px4/src/modules/nn_control/LqiCoaxialCollectiveCore.hpp": "b0a02dc07d4217b1736e13d72104fd32a6d843b0e50c077cb3cf4ee9e3cb3cbd",
+    "px4_trans/px4/src/modules/nn_control/LqiCoaxialCollectiveModel.hpp": "6e8df8bd6ae59770b616096c38a219798f2e5ee1fd33e35f9b1f55ee92184e19",
+    "px4_trans/px4/src/modules/nn_control/LqiManualReference.hpp": "dd2f983de1ed3f1a92ac527ce19bf70ebb979d9c030b02373d35db2bb0d7e3c2",
+    "px4_trans/px4/src/modules/nn_control/NNControl.cpp": "fa942031094b68524f1f35aa99b804168cdb129d14dfaa261432b1ab16b650ff",
+    "px4_trans/px4/src/modules/nn_control/NNControl.hpp": "0049d02dff6f3cdaa0cd86310e9ec14cf641d59a083dc9f0a9a4838902ef9515",
+    "px4_trans/px4/src/drivers/pwm_out/PWMOut.cpp": "050cd5e01a51df991fa435fe4c555ee171fb0fddb6f6b431ca8359ff380300e9",
+    "px4_trans/px4/src/lib/mixer_module/mixer_module.cpp": "d8140b57e6367ea35f7bbd24ba419dd766432f796177199a10bafd2107929cbe"
+  },
+  "airframe_script_sha256": "2336317105a21862d933b0c29a846691153bf1a45a1dc0724968495678be6a92",
+  "pruned_airframe_script_sha256": "e3d7a1b8837ce12df0dfb5b9e3dd104109f42c82d29e1417cbe3ea41229915f0",
+  "embedded_cromfs_sha256": "7bda47bec2c5d3a02f60954eda1278c5b03f5b9118f2829436724711588f553b",
+  "checks": [
+    "Full target firmware build passed",
+    "Startup executable command diff is limited to TIM1/TIM2",
+    "All controller/payload/PWM-driver/mixer hashes unchanged from before edit",
+    "Selected payload identical to archived v2",
+    "2 payload provenance tests passed",
+    "Generated init contains forced 200Hz for both servo timer groups",
+    "Generated compressed ROMFS byte image found intact in packaged firmware",
+    "Firmware decompression, length and v2 model checksum verified"
+  ],
+  "limits": [
+    "Not flashed; actual pulse period and mechanical response not measured",
+    "PWM signal update rate does not guarantee mechanical bandwidth or resolve existing roll bias"
+  ]
+}

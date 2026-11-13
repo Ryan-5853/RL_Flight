@@ -4,10 +4,16 @@
  *
  ****************************************************************************/
 
-#include "lqi_coaxial_collective_golden.hpp"
+#ifndef COAXIAL_GOLDEN_HEADER
+#define COAXIAL_GOLDEN_HEADER "lqi_coaxial_collective_golden.hpp"
+#endif
+#include COAXIAL_GOLDEN_HEADER
 
 #include "../px4/src/modules/nn_control/LqiCoaxialCollectiveCore.hpp"
-#include "../px4/src/modules/nn_control/LqiCoaxialCollectivePayload.hpp"
+#ifndef COAXIAL_PAYLOAD_HEADER
+#define COAXIAL_PAYLOAD_HEADER "../px4/src/modules/nn_control/LqiCoaxialCollectivePayload.hpp"
+#endif
+#include COAXIAL_PAYLOAD_HEADER
 #include "../px4/src/modules/nn_control/LqiManualReference.hpp"
 
 #include <cmath>

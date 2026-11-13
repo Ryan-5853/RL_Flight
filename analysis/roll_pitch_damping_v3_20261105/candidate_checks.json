@@ -1,0 +1,12 @@
+{
+  "host_core_checks": "3 passed",
+  "payload_checksum_roundtrip": true,
+  "yaw_and_plant_tables_unchanged": true,
+  "new_pid": [
+    0.012,
+    0.004,
+    0.02
+  ],
+  "integral_fraction": 0.9,
+  "model_checksum": "0xe55d7665"
+}

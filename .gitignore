@@ -46,6 +46,9 @@ compile_commands.json
 *.so
 *.dylib
 *.dll
+*.a
+*.lib
+*.elf
 
 # Training, simulation, and experiment outputs
 /Train/runs/
@@ -54,8 +57,17 @@ compile_commands.json
 /Identification/outputs/
 /Identification/real_log/
 /WebUI/runtime-runs/
+/px4_trans/runtime-runs/
 
-# Offline-identification inference artifacts are small enough to track:
+# Flight-analysis data; keep scripts, reports, and plots available to track.
+/analysis/**/*.npz
+/analysis/**/*.npy
+/analysis/**/*.csv
+
+# Generated firmware binaries; keep headers, manifests, configs, and patches.
+/px4_trans/generated/**/*.px4
+
+# Curated offline-identification artifacts (keep exception order intact):
 # the v7 encoder checkpoints, the hybrid calibration/manifest, and the
 # cleaned real-log bundle consumed by evaluate_real_log_hybrid.py.
 /Identification/datasets/*
@@ -73,6 +85,8 @@ compile_commands.json
 !/Identification/runs/repro_20260806/sim2real_offline_logs_step_response_bigru_500hz_v7b/identifier.pt
 /Identification/runs/repro_20260806/sim2real_offline_logs_step_response_mlp_v7/*
 !/Identification/runs/repro_20260806/sim2real_offline_logs_step_response_mlp_v7/identifier.pt
+
+# Logs and experiment trackers
 logs/
 *.log
 *.ulg

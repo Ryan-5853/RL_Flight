@@ -1,0 +1,37 @@
+flight_20261106T033559_414Z_aircraft-02_1 {'offset_s': 582381.316162869, 'matching_samples': 2243, 'offset_spread_p5p95_ms': [-5.339825851842761, 5.173002148512752], 'time_range': [23.65234606701415, 46.08226331102196], 'sources': {'RC': 2244}, 'deadman': {'0': 2244}}
+ground-EKF rotation err deg [0.79896207 1.64742561 5.63808174]
+flight_20261106T033622_944Z_aircraft-02_2 {'offset_s': 582381.318894005, 'matching_samples': 447, 'offset_spread_p5p95_ms': [-3.837492421735078, 4.353508225176483], 'time_range': [47.1795308040455, 52.32953111699317], 'sources': {'RC': 516}, 'deadman': {'0': 516}}
+ground-EKF rotation err deg [  2.43740397 137.05865651 179.37368057]
+TIMELINE
+27.003 e [-0.3 -0.1  2.5] yaw_unwrap 2.5 rate [-0.1  0.1  0.1] rcyaw/thr [ 0. -1.] mot [nan nan] serv [nan nan nan] height 0.0266848 gs 0
+28.652 e [-0.3 -0.1  2.5] yaw_unwrap 2.5 rate [ 0.1 -0.2 -0.1] rcyaw/thr [ 0. -1.] mot [nan nan] serv [nan nan nan] height 0.0266635 gs 0
+29.0 e [-0.3 -0.1  2.5] yaw_unwrap 2.5 rate [-0.  -0.3 -0.2] rcyaw/thr [ 0. -1.] mot [0. 0.] serv [0. 0. 0.] height 0.0266893 gs 0
+30.002 e [-0.3 -0.2  2.5] yaw_unwrap 2.5 rate [-4.3 -6.8  0.8] rcyaw/thr [ 0.    -0.747] mot [0.045 0.045] serv [ 0.628 -1.     0.372] height 0.0266938 gs 0
+31.001 e [-0.3 -0.1  2.5] yaw_unwrap 2.5 rate [ 1.4  2.4 -0.8] rcyaw/thr [ 0.    -0.031] mot [0.048 0.049] serv [ 0.02   0.238 -0.293] height 0.0266874 gs 0
+32.002 e [-0.3 -0.1 -0.1] yaw_unwrap -0.1 rate [ -2.4   1.1 -11.9] rcyaw/thr [-0.014  0.135] mot [0.176 0.135] serv [ 0.157 -0.062 -0.101] height 0.0266879 gs 0
+33.002 e [  2.2   3.9 -42. ] yaw_unwrap -42.0 rate [  0.   -0.7 -19.5] rcyaw/thr [0.   0.27] mot [0.282 0.206] serv [-0.131  0.354 -0.391] height 0.0518924 gs 0
+33.999 e [   0.9   -1.1 -112. ] yaw_unwrap -112.0 rate [ -7.2   0.6 -19.1] rcyaw/thr [0.    0.054] mot [0.313 0.219] serv [-0.137  0.257 -0.249] height 0.482642 gs 0
+35.0 e [  -1.3   -0.5 -120.8] yaw_unwrap -120.8 rate [-3.4 -0.1 -2.2] rcyaw/thr [0. 0.] mot [0.262 0.291] serv [ 0.081 -0.033 -0.268] height 1.02773 gs 0
+36.001 e [ 0.00e+00  1.00e-01 -1.31e+02] yaw_unwrap -131.0 rate [ -4.3  -1.1 -16.4] rcyaw/thr [-0.343 -0.061] mot [0.284 0.239] serv [-0.206  0.435 -0.441] height 1.52866 gs 0
+37.001 e [-1.000e-01  3.000e-01 -1.528e+02] yaw_unwrap -152.8 rate [  3.6   5.3 -27.7] rcyaw/thr [-0.667 -0.08 ] mot [0.299 0.218] serv [-0.214  0.456 -0.452] height 1.77241 gs 0
+38.001 e [1.000e-01 1.000e-01 1.773e+02] yaw_unwrap -182.7 rate [ -0.5   2.6 -30.3] rcyaw/thr [-0.734  0.   ] mot [0.311 0.228] serv [-0.152  0.363 -0.428] height 1.78249 gs 0
+39.0 e [1.000e-01 2.000e-01 1.472e+02] yaw_unwrap -212.8 rate [  4.6   1.8 -27.2] rcyaw/thr [-0.051  0.084] mot [0.334 0.231] serv [-0.222  0.356 -0.352] height 1.77745 gs 0
+40.001 e [-5.000e-01  1.000e-01  1.301e+02] yaw_unwrap -229.9 rate [ -5.   -3.2 -11.8] rcyaw/thr [ 0.    -0.054] mot [0.285 0.24 ] serv [ 0.074  0.12  -0.406] height 1.82696 gs 0
+40.999 e [  0.7   0.3 119.9] yaw_unwrap -240.1 rate [ 4.5  8.1 -5. ] rcyaw/thr [ 0.    -0.002] mot [0.279 0.277] serv [-0.179  0.469 -0.511] height 1.6249 gs 0
+41.999 e [  1.5  -0.2 120.6] yaw_unwrap -239.4 rate [ 6.8 -5.4 -0.9] rcyaw/thr [0.    0.106] mot [0.263 0.336] serv [ 0.08  -0.085 -0.228] height 1.419 gs 0
+42.998 e [-8.000e-01  1.000e-01  1.152e+02] yaw_unwrap -244.8 rate [-34.1  -6.5 -13.3] rcyaw/thr [0. 0.] mot [0.309 0.255] serv [ 0.208 -0.134 -0.298] height 1.6476 gs 0
+44.0 e [ 2.6  0.9 99.5] yaw_unwrap -260.5 rate [ -8.2  -2.9 -15.8] rcyaw/thr [ 0.    -0.195] mot [0.279 0.207] serv [-0.129  0.385 -0.456] height 1.91746 gs 0
+45.001 e [ 1.8  0.2 65.6] yaw_unwrap -294.4 rate [ -2.7  -8.5 -74.5] rcyaw/thr [ 0.    -0.245] mot [0.269 0.2  ] serv [-0.072  0.214 -0.142] height 1.29541 gs 0
+46.002 e [-6.7 23.  29.9] yaw_unwrap -330.1 rate [-23.1 160.3   1.6] rcyaw/thr [ 0.    -0.535] mot [0.122 0.129] serv [ 0.732  0.268 -1.   ] height 0.108522 gs 0
+window 24 28 yawchange -0.01962192763896997
+fusion 1.0 maxinnovdeg [0.03983428 0.0201285  0.04217167]
+window 28.65 31 yawchange -0.029366709758750442
+fusion 1.0 maxinnovdeg [0.10226397 0.068627   0.0571272 ]
+window 31 34 yawchange -114.53788786398067
+fusion 1.0 maxinnovdeg [0.97659636 0.7899218  1.0946597 ]
+window 34 38 yawchange -70.4721213901543
+fusion 1.0 maxinnovdeg [1.0507733  1.2958081  0.33830243]
+window 38 42 yawchange -56.66566811266799
+fusion 1.0 maxinnovdeg [1.1844664  1.3226379  0.37716323]
+window 42 46 yawchange -90.57312442045341
+fusion 1.0 maxinnovdeg [0.7702433 1.7884974 0.6791313]

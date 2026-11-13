@@ -1,4 +1,9 @@
+> 恢复规则更新：AIRLINK 故障后，两机各自收到物理 RC disarm 且确认撤防后可清除故障；重新握手并再次 arm 即可恢复，无需重启。详见 `Docs/GROUND_PAIR_FLIGHT_zh.md`，以下历史永久锁存描述以此为准。
+
 # AIRLINK v1 双机串口协议
+
+> 2026-11-03 更新：当前地面组合飞行、External Mode 3 和断链停机锁死规则以
+> [地面组合飞行流程](GROUND_PAIR_FLIGHT_zh.md) 为准；本文中的旧接线边界和单体降落回退不再适用。
 
 状态：v1 设计规范；固件协议、状态机和 PX4 集成已实现，见
 `AIRLINK_FIRMWARE_zh.md`

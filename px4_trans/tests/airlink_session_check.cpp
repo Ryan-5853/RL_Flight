@@ -102,6 +102,167 @@ void establish_pair_active(airlink::Session &master, airlink::Session &slave,
 	CHECK(slave.state() == airlink::LinkState::PairActive);
 }
 
+void test_standby_waits_for_operator_and_revokes_on_safety_loss()
+{
+	auto master = std::make_unique<airlink::Session>(1);
+	auto slave = std::make_unique<airlink::Session>(1);
+	master->start(airlink::Role::Master, 1, ready_local(true), 1'000);
+	slave->start(airlink::Role::Slave, 2, ready_local(false), 1'000);
+	establish_ready(*master, *slave, 2'000);
+	CHECK(master->request_control_enable(5'000));
+	pump(*master, *slave, 5'001);
+	pump(*slave, *master, 5'002);
+	// Stay healthy for two seconds, far beyond the old 10 ms ACK expiry.
+	for (uint64_t now = 6'000; now <= 2'006'000; now += 2'000) {
+		exchange_heartbeat(*master, *slave, now);
+		CHECK(master->state() == airlink::LinkState::PairControlReady);
+		CHECK(slave->state() == airlink::LinkState::PairControlReady);
+	}
+	CHECK(master->request_pair_arm(2'006'001));
+	pump(*master, *slave, 2'006'002);
+	CHECK(slave->state() == airlink::LinkState::PairArmPending);
+
+	// A separate authorization must be revoked when either endpoint loses RC safety.
+	master = std::make_unique<airlink::Session>(1);
+	slave = std::make_unique<airlink::Session>(1);
+	master->start(airlink::Role::Master, 3, ready_local(true), 3'000'000);
+	slave->start(airlink::Role::Slave, 4, ready_local(false), 3'000'000);
+	establish_ready(*master, *slave, 3'001'000);
+	CHECK(master->request_control_enable(3'004'000));
+	pump(*master, *slave, 3'004'001);
+	pump(*slave, *master, 3'004'002);
+	auto unsafe = ready_local(false);
+	unsafe.local_rc_valid = false;
+	slave->set_local_status(unsafe);
+	exchange_heartbeat(*master, *slave, 3'006'000);
+	exchange_heartbeat(*master, *slave, 3'008'000);
+	CHECK(master->state() == airlink::LinkState::Ready);
+	CHECK(slave->state() == airlink::LinkState::Ready);
+	CHECK(!master->request_pair_arm(3'008'001));
+
+	// Authorization cannot survive loss of the periodic peer stream either.
+	slave->set_local_status(ready_local(false));
+	exchange_heartbeat(*master, *slave, 3'010'000);
+	CHECK(master->request_control_enable(3'010'001));
+	pump(*master, *slave, 3'010'002);
+	pump(*slave, *master, 3'010'003);
+	master->tick(3'030'000);
+	slave->tick(3'030'000);
+	CHECK(master->state() != airlink::LinkState::PairControlReady);
+	CHECK(slave->state() != airlink::LinkState::PairControlReady);
+	CHECK(!master->request_pair_arm(3'030'001));
+}
+
+void test_runtime_timing_does_not_refresh_periodic_safety()
+{
+	auto master = std::make_unique<airlink::Session>(1);
+	auto slave = std::make_unique<airlink::Session>(1);
+	master->start(airlink::Role::Master, 1, ready_local(true), 1'000);
+	slave->start(airlink::Role::Slave, 2, ready_local(false), 1'000);
+	establish_pair_active(*master, *slave, 2'000);
+	pump(*slave, *master, 32'010); // drain the cached duplicate arm ACK
+	const auto master_age = master->last_peer_age_us(33'000);
+	const auto slave_age = slave->last_peer_age_us(33'000);
+	master->queue_timing_probe(33'000);
+	airlink::Frame probe{};
+	CHECK(master->pop_tx(probe));
+	CHECK(probe.header.message_id == static_cast<uint8_t>(airlink::MessageId::LinkTiming));
+	CHECK(probe.header.payload_len == 8);
+	slave->receive(probe, 33'500);
+	pump(*slave, *master, 34'000);
+	CHECK(master->timing_health().samples == 1);
+	CHECK(master->timing_health().rtt_us == 1000);
+	CHECK(master->last_peer_age_us(34'000) == master_age + 1000);
+	CHECK(slave->last_peer_age_us(34'000) == slave_age + 1000);
+	// Duplicate or wrong-session replies cannot produce a second RTT sample.
+	slave->receive(probe, 34'100);
+	pump(*slave, *master, 34'200);
+	CHECK(master->timing_health().samples == 1);
+	probe.header.source_session += 1;
+	CHECK(!slave->receive(probe, 34'300).pair_active);
+	CHECK(slave->tx_queue_size() == 0);
+	CHECK(master->tick(45'000).request_disarm);
+	CHECK(slave->tick(45'000).request_disarm);
+	CHECK(master->pair_reattach_latched() && slave->pair_reattach_latched());
+}
+
+void test_estimator_kill_preempts_output_and_latches_both()
+{
+	auto master = std::make_unique<airlink::Session>(1);
+	auto slave = std::make_unique<airlink::Session>(1);
+	master->start(airlink::Role::Master, 1, ready_local(true), 1'000);
+	slave->start(airlink::Role::Slave, 2, ready_local(false), 1'000);
+	establish_pair_active(*master, *slave, 2'000);
+	pump(*slave, *master, 32'010);
+	airlink::ActuatorCommand command{};
+	command.upper_motor = command.lower_motor = .8f;
+	CHECK(master->queue_actuator_command(command, .8f, 33'000));
+	const auto kill = master->fail_estimator(33'001);
+	CHECK(kill.request_disarm && kill.pair_lost);
+	CHECK(master->pair_reattach_latched());
+	CHECK(!master->query_control_tx_allowed(33'002));
+	CHECK(!master->queue_actuator_command(command, .8f, 33'002));
+	airlink::Frame frame{};
+	CHECK(master->pop_tx(frame));
+	CHECK(frame.header.message_id == static_cast<uint8_t>(airlink::MessageId::EmergencyWithdraw));
+	CHECK((frame.header.flags & airlink::Urgent) != 0);
+	airlink::ReliableEvent event{};
+	CHECK(airlink::decode_reliable_event(frame.payload, frame.header.payload_len, event));
+	CHECK(event.reason_code == airlink::ReasonCode::EstimatorInvalid);
+	CHECK(master->tx_queue_size() == 0); // Old high-thrust packet was discarded, not transmitted ahead of kill.
+	const auto peer_kill = slave->receive(frame, 33'003);
+	CHECK(peer_kill.request_disarm && peer_kill.clear_follower_control && peer_kill.pair_lost);
+	CHECK(slave->pair_reattach_latched());
+	pump(*slave, *master, 33'004);
+	CHECK(!slave->receive(frame, 33'005).request_arm); // Duplicate kill is idempotent.
+	master->set_armed(false); slave->set_armed(false);
+	exchange_heartbeat(*master, *slave, 34'000);
+	CHECK(master->pair_reattach_latched() && slave->pair_reattach_latched());
+	CHECK(!master->request_control_enable(34'001));
+	CHECK(master->reset_after_operator_disarm(35'000));
+	CHECK(slave->pair_reattach_latched());
+	CHECK(!master->request_control_enable(35'001));
+	CHECK(slave->reset_after_operator_disarm(36'000));
+	establish_pair_active(*master, *slave, 40'000);
+}
+
+void test_lost_kill_packet_still_stops_follower()
+{
+	auto master = std::make_unique<airlink::Session>(1);
+	auto slave = std::make_unique<airlink::Session>(1);
+	master->start(airlink::Role::Master, 1, ready_local(true), 1'000);
+	slave->start(airlink::Role::Slave, 2, ready_local(false), 1'000);
+	establish_pair_active(*master, *slave, 2'000);
+	CHECK(master->fail_estimator(33'000).request_disarm);
+	airlink::Frame dropped{};
+	while (master->pop_tx(dropped)) {} // Simulate a lost emergency message.
+	const auto fallback = slave->tick(43'001);
+	CHECK(fallback.request_disarm && fallback.pair_lost && fallback.clear_follower_control);
+	CHECK(slave->pair_reattach_latched());
+}
+
+void test_estimator_kill_cancels_pending_arm()
+{
+	auto master = std::make_unique<airlink::Session>(1);
+	auto slave = std::make_unique<airlink::Session>(1);
+	master->start(airlink::Role::Master, 1, ready_local(true), 1'000);
+	slave->start(airlink::Role::Slave, 2, ready_local(false), 1'000);
+	establish_ready(*master, *slave, 2'000);
+	CHECK(master->request_control_enable(5'000));
+	pump(*master, *slave, 5'001); pump(*slave, *master, 5'002);
+	CHECK(master->request_pair_arm(6'000));
+	airlink::Frame arm{}; CHECK(master->pop_tx(arm));
+	CHECK(slave->receive(arm,6'001).request_arm);
+	const auto kill = master->fail_estimator(6'002);
+	CHECK(kill.pair_lost);
+	airlink::Frame emergency{}; CHECK(master->pop_tx(emergency));
+	CHECK(slave->receive(emergency,6'003).pair_lost);
+	CHECK(!slave->notify_local_arm_result(true,6'004));
+	pump(*slave,*master,6'005);
+	CHECK(!master->notify_local_arm_result(true,6'006));
+	CHECK(master->pair_reattach_latched() && slave->pair_reattach_latched());
+}
+
 void test_handshake_and_pair_lifecycle()
 {
 	constexpr uint32_t config_crc = 0x12345678u;
@@ -324,10 +485,176 @@ void test_v2_preheat_and_yaw_reference()
 	CHECK(!master->queue_yaw_reference(reference, 85'000));
 }
 
+void test_unconnected_and_restarted_peer()
+{
+	auto master = std::make_unique<airlink::Session>(1);
+	auto slave = std::make_unique<airlink::Session>(1);
+	master->start(airlink::Role::Master, 1, ready_local(true), 1'000);
+	slave->start(airlink::Role::Slave, 2, ready_local(false), 1'000);
+	CHECK(!master->tick(1'000'000).pair_lost);
+	CHECK(!master->pair_reattach_latched());
+	establish_ready(*master, *slave, 1'002'000);
+	slave->start(airlink::Role::Slave, 3, ready_local(false), 1'006'000);
+	slave->tick(1'006'000);
+	airlink::Frame frame{};
+	bool lost = false;
+	while (slave->pop_tx(frame)) {
+		lost |= master->receive(frame, 1'006'001).pair_lost;
+	}
+	CHECK(lost && master->pair_reattach_latched());
+	// Restarting a session on the same endpoint cannot clear its fault latch.
+	master->start(airlink::Role::Master, 4, ready_local(true), 1'008'000);
+	CHECK(master->pair_reattach_latched());
+}
+
+void test_ground_connection_fault_lock()
+{
+	for (bool airborne : {false, true}) {
+		auto master = std::make_unique<airlink::Session>(1);
+		auto slave = std::make_unique<airlink::Session>(1);
+		master->start(airlink::Role::Master, 1, ready_local(true), 1'000);
+		slave->start(airlink::Role::Slave, 2, ready_local(false), 1'000);
+		if (airborne) {
+			establish_pair_active(*master, *slave, 2'000);
+			auto local = ready_local(true);
+			local.armed = true;
+			local.airborne_latched = true;
+			master->set_local_status(local);
+			slave->set_local_status(local);
+		} else {
+			establish_ready(*master, *slave, 2'000);
+		}
+		const auto a = master->tick(50'000);
+		const auto b = slave->tick(50'000);
+		CHECK(a.pair_lost && b.pair_lost);
+		CHECK(master->pair_reattach_latched() && slave->pair_reattach_latched());
+		if (airborne) {
+			CHECK(a.request_disarm && b.request_disarm);
+		}
+		master->set_local_status(ready_local(true));
+		slave->set_local_status(ready_local(false));
+		exchange_heartbeat(*master, *slave, 51'000);
+		CHECK(!master->request_control_enable(51'001));
+		CHECK(master->pair_reattach_latched() && slave->pair_reattach_latched());
+	}
+}
+
+void test_single_direction_disconnect()
+{
+	for (bool drop_master_tx : {false, true}) {
+		auto master = std::make_unique<airlink::Session>(1);
+		auto slave = std::make_unique<airlink::Session>(1);
+		master->start(airlink::Role::Master, 1, ready_local(true), 1'000);
+		slave->start(airlink::Role::Slave, 2, ready_local(false), 1'000);
+		establish_ready(*master, *slave, 2'000);
+		for (uint64_t now = 6'000; now <= 40'000; now += 2'000) {
+			master->tick(now);
+			slave->tick(now);
+			airlink::Frame frame{};
+			while (master->pop_tx(frame)) {
+				if (!drop_master_tx) { slave->receive(frame, now); }
+			}
+			while (slave->pop_tx(frame)) {
+				if (drop_master_tx) { master->receive(frame, now); }
+			}
+		}
+		CHECK(master->pair_reattach_latched());
+		CHECK(slave->pair_reattach_latched());
+	}
+}
+
+void test_disarm_cancels_delayed_arm_ack()
+{
+	auto master = std::make_unique<airlink::Session>(1);
+	auto slave = std::make_unique<airlink::Session>(1);
+	master->start(airlink::Role::Master, 1, ready_local(true), 1'000);
+	slave->start(airlink::Role::Slave, 2, ready_local(false), 1'000);
+	establish_ready(*master, *slave, 2'000);
+	CHECK(master->request_control_enable(5'000));
+	pump(*master, *slave, 5'001);
+	pump(*slave, *master, 5'002);
+	CHECK(master->request_pair_arm(6'000));
+	pump(*master, *slave, 6'001);
+	CHECK(slave->notify_local_arm_result(true, 6'002));
+	airlink::Frame delayed_ack{};
+	CHECK(slave->pop_tx(delayed_ack));
+	CHECK(slave->request_pair_disarm(airlink::ReasonCode::OperatorRequest, 6'003));
+	pump(*slave, *master, 6'004);
+	CHECK(!master->receive(delayed_ack, 6'005).request_arm);
+	CHECK(master->state() == airlink::LinkState::Ready);
+	CHECK(!master->pair_reattach_latched());
+}
+
+void test_rc_disarm_from_either_endpoint()
+{
+	for (bool slave_disarms : {false, true}) {
+		auto master = std::make_unique<airlink::Session>(1);
+		auto slave = std::make_unique<airlink::Session>(1);
+		master->start(airlink::Role::Master, 1, ready_local(true), 1'000);
+		slave->start(airlink::Role::Slave, 2, ready_local(false), 1'000);
+		establish_pair_active(*master, *slave, 2'000);
+		auto &sender = slave_disarms ? *slave : *master;
+		auto &receiver = slave_disarms ? *master : *slave;
+		CHECK(sender.request_pair_disarm(airlink::ReasonCode::OperatorRequest, 33'000));
+		airlink::Frame frame{};
+		bool disarmed = false;
+		while (sender.pop_tx(frame)) {
+			disarmed |= receiver.receive(frame, 33'001).request_disarm;
+		}
+		CHECK(disarmed);
+		master->set_local_status(ready_local(true));
+		slave->set_local_status(ready_local(false));
+		pump(receiver, sender, 33'002);
+		exchange_heartbeat(*master, *slave, 34'000);
+		CHECK(!master->pair_reattach_latched() && !slave->pair_reattach_latched());
+		CHECK(master->state() == airlink::LinkState::Ready);
+		CHECK(slave->state() == airlink::LinkState::Ready);
+		CHECK(master->request_control_enable(34'001));
+	}
+}
+
+void test_rc_disarm_recovers_fault()
+{
+	auto master = std::make_unique<airlink::Session>(1);
+	auto slave = std::make_unique<airlink::Session>(1);
+	master->start(airlink::Role::Master, 1, ready_local(true), 1'000);
+	slave->start(airlink::Role::Slave, 2, ready_local(false), 1'000);
+	establish_pair_active(*master, *slave, 2'000);
+	CHECK(master->tick(60'000).request_disarm);
+	CHECK(slave->tick(60'000).request_disarm);
+	CHECK(master->pair_reattach_latched() && slave->pair_reattach_latched());
+	CHECK(!master->reset_after_operator_disarm(60'001)); // Still armed.
+	master->set_armed(false);
+	slave->set_armed(false);
+	CHECK(!master->request_control_enable(60'002)); // Automatic disarm does not clear fault.
+	CHECK(master->reset_after_operator_disarm(61'000));
+	CHECK(!master->pair_reattach_latched());
+	CHECK(slave->pair_reattach_latched()); // Each endpoint requires its own RC acknowledgement.
+	exchange_heartbeat(*master, *slave, 61'100);
+	CHECK(!master->pair_reattach_latched());
+	CHECK(!master->request_control_enable(61'101));
+	CHECK(slave->reset_after_operator_disarm(62'000));
+	CHECK(!slave->pair_reattach_latched());
+	CHECK(master->state() == airlink::LinkState::Discovered);
+	CHECK(slave->state() == airlink::LinkState::Down);
+	establish_pair_active(*master, *slave, 70'000);
+}
+
 } // namespace
 
 int main()
 {
+	test_estimator_kill_preempts_output_and_latches_both();
+	test_lost_kill_packet_still_stops_follower();
+	test_estimator_kill_cancels_pending_arm();
+	test_runtime_timing_does_not_refresh_periodic_safety();
+	test_standby_waits_for_operator_and_revokes_on_safety_loss();
+	test_rc_disarm_recovers_fault();
+	test_unconnected_and_restarted_peer();
+	test_ground_connection_fault_lock();
+	test_single_direction_disconnect();
+	test_disarm_cancels_delayed_arm_ack();
+	test_rc_disarm_from_either_endpoint();
 	test_handshake_and_pair_lifecycle();
 	test_handshake_config_mismatch();
 	test_same_role_never_links();

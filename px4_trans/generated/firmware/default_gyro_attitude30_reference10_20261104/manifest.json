@@ -1,0 +1,34 @@
+{
+  "firmware": "micoair_h743-v2_nncontrol_default_gyro_attitude30_reference10.px4",
+  "sha256": "7dd16351e16109b3aabe117cfc2d87fbe9faf8a44f69c1870386bd43e27570bc",
+  "flashed": false,
+  "target": "micoair_h743-v2_nncontrol",
+  "gyro_selection": "PX4 defaults and automatic health-based selection; exclusive BMI088 overrides removed",
+  "compiled_gyro_priority_defaults": {
+    "CAL_GYRO0_PRIO": -1,
+    "CAL_GYRO1_PRIO": -1,
+    "CAL_GYRO2_PRIO": -1,
+    "CAL_GYRO3_PRIO": -1
+  },
+  "internal_effective_default_priority": 50,
+  "reset_at_boot": [
+    "CAL_GYRO0_PRIO",
+    "CAL_GYRO1_PRIO",
+    "CAL_GYRO2_PRIO",
+    "CAL_GYRO3_PRIO"
+  ],
+  "calibration_reset": false,
+  "target_roll_pitch_limit_deg": 10,
+  "termination_roll_pitch_deg": 30,
+  "termination_latches_until_disarm": true,
+  "dual_gyro_logging": true,
+  "model_checksum": "0x6bdc0589",
+  "checks": [
+    "full firmware build passed",
+    "airframe shell syntax and whitespace checks passed",
+    "built ROMFS resets all four priority overrides without setting calibration IDs/offsets",
+    "compiled parameter defaults verified",
+    "firmware image size and protection/logger strings verified"
+  ],
+  "runtime_validation_pending": true
+}

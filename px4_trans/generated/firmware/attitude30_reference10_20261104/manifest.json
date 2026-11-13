@@ -1,0 +1,30 @@
+{
+  "firmware": "micoair_h743-v2_nncontrol_attitude30_reference10.px4",
+  "sha256": "7620184664439dff4f93cf418be7e007717cd181ad1c0236ba7b52773987f506",
+  "flashed": false,
+  "target": "micoair_h743-v2_nncontrol",
+  "built_from_current_workspace": true,
+  "model_checksum": "0x6bdc0589",
+  "target_roll_pitch_limit_deg": 10,
+  "termination_roll_pitch_deg": 30,
+  "termination_confirmation_ms": 0,
+  "termination_latches_until_disarm": true,
+  "bmi088_exclusive_and_dual_gyro_logging": true,
+  "latest_log_replay_first_stop_boot_s": 14.142536,
+  "checks": [
+    "full target build passed",
+    "termination/reference/world-vertical feedback host tests passed",
+    "all three LQI core golden checks passed",
+    "built ROMFS settings verified",
+    "firmware image decompression/size and guard log string verified",
+    "model manifest source and generated hashes verified"
+  ],
+  "sources_sha256": {
+    "px4_trans/px4/src/modules/nn_control/AttitudeTerminationGuard.hpp": "4b642c4641277438c00fc379c628f4d04c2e99f1a454c43968e1fd64a23b52ce",
+    "px4_trans/px4/src/modules/nn_control/NNControl.cpp": "fa942031094b68524f1f35aa99b804168cdb129d14dfaa261432b1ab16b650ff",
+    "px4_trans/px4/src/modules/nn_control/ControllerBackend.hpp": "4f02cec14133b73f4dedec7d7d5fe133c6f96c46c2ae8551fad79dabaeb17289",
+    "px4_trans/px4/src/modules/nn_control/LqiCoaxialCollectivePayload.hpp": "5ca5b098bbd41f59e972922cc30e43896547edee8f52e7efbfe2ea1c916766a5",
+    "px4_trans/configs/lqi_coaxial_collective_airframe1_manual_v3.yaml": "9e726a15ee3f7ee39b0a3c97520eff072aa14cd4fd321b14559955ad331a0913"
+  },
+  "runtime_validation_pending": true
+}

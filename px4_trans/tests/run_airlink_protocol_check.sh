@@ -22,6 +22,11 @@ test -f "$source_file"
 	"$test_file" \
 	-o "$build_dir/airlink_protocol_check"
 
+"${CXX:-c++}" -std=c++17 -Wall -Wextra -Werror -I"$module_dir" \
+	"$session_source" "$(dirname "$test_file")/maintained_arm_switch_check.cpp" \
+	-o "$build_dir/maintained_arm_switch_check"
+"$build_dir/maintained_arm_switch_check"
+
 "$build_dir/airlink_protocol_check"
 
 "${CXX:-c++}" \
@@ -46,3 +51,11 @@ test -f "$source_file"
 	-o "$build_dir/airlink_landing_check"
 
 "$build_dir/airlink_landing_check"
+
+"${CXX:-c++}" -std=c++17 -Wall -Wextra -Werror -I"$module_dir" \
+    "$(dirname "$test_file")/airlink_health_check.cpp" -o "$build_dir/airlink_health_check"
+"$build_dir/airlink_health_check"
+
+"${CXX:-c++}" -std=c++17 -Wall -Wextra -Werror -I"$module_dir" \
+    "$(dirname "$test_file")/pair_estimate_safety_check.cpp" -o "$build_dir/pair_estimate_safety_check"
+"$build_dir/pair_estimate_safety_check"

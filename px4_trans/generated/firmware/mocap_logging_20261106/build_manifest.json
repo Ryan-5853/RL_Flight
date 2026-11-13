@@ -1,0 +1,16 @@
+{
+  "built_at": "2026-11-06T03:03:53.396526+00:00",
+  "target": "micoair_h743-v2_nncontrol",
+  "firmware": "micoair_h743-v2_nncontrol_mocap_logging.px4",
+  "firmware_sha256": "fd992f16c381b4f89ab421a0d28d97b8d53c5f0c7dbeeea57072aae3cad5d661",
+  "source_sha256": {
+    "px4_trans/px4/src/modules/logger/logged_topics.cpp": "9b02bcdcdc6740954661fe19f8e5794cd5c03393ae85ff5f4289243fe0398054",
+    "px4_trans/px4/src/modules/logger/logger.cpp": "b4dae741141a76e45da61b67bd638c5ac2d225f948dbeaee0398c16186aa0ce2"
+  },
+  "validation": [
+    "Target firmware build passed",
+    "Generated uORB schemas resolved for all fixed-profile topics",
+    "Fixed-profile subscription audit passed; FIFO absent, EV topics present"
+  ],
+  "flashed": false
+}

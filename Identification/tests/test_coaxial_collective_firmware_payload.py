@@ -7,20 +7,18 @@ import math
 from pathlib import Path
 import unittest
 
-import torch
 import yaml
 
-from simenv.config import load_and_materialize
 
 
 ROOT = Path(__file__).resolve().parents[2]
 DEPLOYMENT = (
     ROOT
-    / "px4_trans/configs/lqi_coaxial_collective_airframe1_manual_v3.yaml"
+    / "px4_trans/configs/lqi_coaxial_collective_airframe1_yaw_balanced_v2.yaml"
 )
 MANIFEST = (
     ROOT
-    / "px4_trans/generated/airframe-1/manual-v3/"
+    / "px4_trans/generated/airframe-1/yaw-balanced-v2/"
     / "lqi_coaxial_collective_manifest.json"
 )
 
@@ -33,12 +31,12 @@ class CoaxialCollectiveFirmwarePayloadTest(unittest.TestCase):
     def test_shared_motor_table_uses_csv_in_controller_domain(self) -> None:
         deployment = yaml.safe_load(DEPLOYMENT.read_text(encoding="utf-8"))
         simulator_path = ROOT / deployment["simulator_config"]
-        materialized = load_and_materialize(
-            simulator_path, 1, torch.device("cpu"), torch.float64
-        )
-        tables = materialized.parameters["motors.pwm_to_rpm_table"][0]
+        # Verify the source calibration directly; the firmware reuse path
+        # deliberately does not require SimEnv source or Torch.
+        simulator = yaml.safe_load(simulator_path.read_text(encoding="utf-8"))
+        tables = [motor["pwm_to_rpm_table"]["value"] for motor in simulator["motors"]]
         table = tables[0]
-        self.assertTrue(torch.equal(tables[0], tables[1]))
+        self.assertEqual(tables[0], tables[1])
         with (
             ROOT / deployment["motor_speed_calibration"]["path"]
         ).open(encoding="utf-8-sig", newline="") as stream:
@@ -47,19 +45,19 @@ class CoaxialCollectiveFirmwarePayloadTest(unittest.TestCase):
         for index, row in enumerate(rows):
             command = 2.0 * float(row["command_normalized"])
             speed = float(row["rpm_mean"]) * 2.0 * math.pi / 60.0
-            self.assertEqual(table[index + 2, 0].item(), command)
+            self.assertEqual(table[index + 2][0], command)
             self.assertTrue(
                 math.isclose(
-                    table[index + 2, 1].item(), speed, rel_tol=2e-7
+                    table[index + 2][1], speed, rel_tol=2e-7
                 )
             )
-        self.assertEqual(table[-1, 0].item(), 1.0)
-        self.assertEqual(table[-1, 1].item(), 1200.0)
+        self.assertEqual(table[-1][0], 1.0)
+        self.assertEqual(table[-1][1], 1200.0)
 
     def test_payload_manifest_matches_generated_sources(self) -> None:
         manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
         self.assertEqual(manifest["airframe_id"], "airframe-1")
-        self.assertEqual(manifest["model_checksum"], "0x78ae1111")
+        self.assertEqual(manifest["model_checksum"], '0x30298daf')
         source = manifest["source"]
         for path_name, digest_name in (
             ("simulator_config", "simulator_sha256"),
@@ -92,13 +90,15 @@ class CoaxialCollectiveFirmwarePayloadTest(unittest.TestCase):
             )
         payload = (
             ROOT
-            / "px4_trans/generated/airframe-1/manual-v3/"
+            / "px4_trans/generated/airframe-1/yaw-balanced-v2/"
             / "LqiCoaxialCollectivePayload.hpp"
         ).read_text(encoding="utf-8")
-        self.assertIn(
-            "kManualCommandDecay[3] = {\n\t0.0f,\n\t0.0f,\n\t0.0f,",
-            payload,
-        )
+        self.assertIn("kYawBalance[7]", payload)
+        self.assertEqual(manifest["controller_contract"], "pilot_acceleration_shared_yaw_antiwindup")
+        self.assertEqual(source["allocation_safety"]["roll_pitch_integral_moment_fraction"], .5)
+        self.assertEqual(source["allocation_safety"]["grid_common_preference_fraction"], .5)
+        self.assertAlmostEqual(source["yaw_balance_profile"]["grid_common_command"], -0.16, places=6)
+        self.assertAlmostEqual(source["yaw_balance_profile"]["maximum_speed_ratio"], 1.15, places=6)
 
 
 if __name__ == "__main__":

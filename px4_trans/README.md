@@ -1,5 +1,7 @@
 # PX4 神经网络控制器移植与嵌入层
 
+当前地面双机组合操作见 [地面组合飞行流程](../Docs/GROUND_PAIR_FLIGHT_zh.md)：External Mode 3 选模、遥控器 disarm，以及首次建链后断链锁死。
+
 ## 1. 项目定位
 
 本目录用于完成开源 PX4 飞控的移植、裁剪与改造，并将训练完成的循环神经网络控制器部署到飞控 MCU。最终目标是以神经网络替代传统飞控中的姿态 **controller + control allocation** 链路：真实飞手直接控制上桨油门，网络接收飞手姿态命令、当前上桨油门、飞行器状态和必要历史信息，输出下桨电机与三路舵机的归一化指令。
@@ -587,7 +589,7 @@ param show SYS_AUTOSTART
 param show NN_AIRFRAME_ID
 ```
 
-地面站位置闭环与 RC 通道 8 模式槽 6 的接口、GS-Link v1 消息格式、4 Mbaud 串口参数和验证步骤
+地面站位置闭环与 RC 通道 8 模式槽 4 的接口、GS-Link v1 消息格式、4 Mbaud 串口参数和验证步骤
 见 [`GROUND_STATION_POSITION_LINK_zh.md`](GROUND_STATION_POSITION_LINK_zh.md)。
 位置环在地面站运行；飞控接收的是归一化四轴虚拟遥控量，不是位置目标。串口协议见
 [`GS_LINK_PROTOCOL_V1_zh.md`](GS_LINK_PROTOCOL_V1_zh.md)；当前固件已由 `gs_link`
@@ -605,8 +607,8 @@ fresh `CONTROL_ENABLE` 和 `PAIR_ARM` 事务完成；`AIRLINK_PAIR_EN=1` 时 C_S
 普通 arming check 不会再成为绕过通道。
 
 `nn_control` 会注册 PX4 外部模式 `Ground Station`。22001 机架预留外部模式哈希槽，
-使其稳定分配为 External Mode 2，并通过 `RC_MAP_FLTMODE=8` 将 RC 模式槽 6
-（`COM_FLTMODE6=101`）映射到该模式；模式槽 1 保持 Manual/RC。
+使其稳定分配为 External Mode 2，并通过 `RC_MAP_FLTMODE=8` 将 RC 模式槽 4
+（`COM_FLTMODE4=101`）映射到该模式；模式槽 1 保持 Manual/RC。
 
 检查输入和执行器主题：
 
@@ -1018,7 +1020,7 @@ airlink pair on
 - 始终显式指定 `.venv`，不要依赖当前终端碰巧激活的 Conda 环境；
 - `nn_control` 当前直接发布 `actuator_motors` 和 `actuator_servos`，不会经过 Control
   Allocator；
-- 地面站链路只是 RC 解锁、通道 8 模式槽 6、External Mode 状态和
+- 地面站链路只是 RC 解锁、通道 8 模式槽 4、External Mode 状态和
   链路新鲜度共同允许时的辅助输入；它不能绕过 `NN_LQI_OUTPUT_EN`、Commander
   或执行器失效保护；
 - 接入真实模型后，必须重新完成无桨、台架、故障注入、SIL/HIL 和执行器映射验证；

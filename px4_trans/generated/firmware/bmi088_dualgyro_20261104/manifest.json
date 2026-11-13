@@ -1,0 +1,63 @@
+{
+  "firmware": "micoair_h743-v2_nncontrol_bmi088_dualgyro.px4",
+  "sha256": "3dd416db0c3012780a62dbad92d6b43e22489b0c6cddba0e87da1c6de9aabb34",
+  "target": "micoair_h743-v2_nncontrol",
+  "px4_head": "3fef8242687cf733b590ff21c5b36779943299d1",
+  "built_from_current_workspace": true,
+  "flashed": false,
+  "flash_blocker": "No flight-controller serial device available in this environment",
+  "gyro_priorities": {
+    "CAL_GYRO0_PRIO": 100,
+    "CAL_GYRO1_PRIO": 0,
+    "CAL_GYRO2_PRIO": 0,
+    "CAL_GYRO3_PRIO": 0
+  },
+  "expected_primary_gyro_id": 6684690,
+  "expected_primary_gyro_type": "BMI088",
+  "new_topics": {
+    "sensor_gyro": {
+      "instances": [
+        0,
+        1
+      ],
+      "interval_ms": 2
+    },
+    "sensor_gyro_fifo": {
+      "instances": [
+        0,
+        1
+      ],
+      "interval_ms": 0
+    },
+    "vehicle_imu_status": {
+      "instances": [
+        0,
+        1
+      ],
+      "interval_ms": 100
+    },
+    "sensor_selection": {
+      "instances": [
+        0
+      ],
+      "interval_ms": 100
+    }
+  },
+  "source_sha256": {
+    "ROMFS/px4fmu_common/init.d/airframes/22001_direct_actuator_controller": "e82ee151c2a7aab80475097b5fec0c8efe4cceb32948c9fef6f62b76d30581c6",
+    "src/modules/logger/logged_topics.cpp": "5682ca288ac8256496d117bfce2da6c2b1db63732a1938a78ae3d90f5f606526"
+  },
+  "checks": [
+    "PX4 target build passed",
+    "Airframe shell syntax passed",
+    "Changed files diff whitespace check passed",
+    "Built ROMFS priority policy verified",
+    "Firmware image decompression and size verified",
+    "Compiled logger diagnostic string verified"
+  ],
+  "runtime_checks_pending": [
+    "Confirm primary gyro ID 6684690 after flashing",
+    "Confirm both gyro and FIFO device IDs in new ULog",
+    "Measure SD logger dropouts under recording load"
+  ]
+}

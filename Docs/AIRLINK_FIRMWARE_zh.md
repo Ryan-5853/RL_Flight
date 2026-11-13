@@ -1,4 +1,9 @@
+> 恢复规则更新：AIRLINK 故障后，两机各自收到物理 RC disarm 且确认撤防后可清除故障；重新握手并再次 arm 即可恢复，无需重启。详见 `Docs/GROUND_PAIR_FLIGHT_zh.md`，以下历史永久锁存描述以此为准。
+
 # AIRLINK v1 固件实现
+
+> 2026-11-03 更新：当前地面组合飞行、External Mode 3 和断链停机锁死规则以
+> [地面组合飞行流程](GROUND_PAIR_FLIGHT_zh.md) 为准；本文中的旧接线边界和单体降落回退不再适用。
 
 日期：2026-10-30
 
@@ -132,6 +137,35 @@ airlink emergency
 
 ## 6. 链路测试
 
+### 控制待命授权与新鲜度（2026-11-04 修正）
+
+`PAIR_CONTROL_READY` 在同一有效会话内等待飞手 ARM，不再按授权 ACK 的
+10 ms 年龄退出。两端继续检查实时 RC、安全门和组合模式；任一端条件撤销时
+退回 READY，周期数据断流仍走原有断链处理。PAIR_ARM 两端仍检查实时安全和
+对端新鲜度。飞行中的传感器/控制流 10 ms 门槛没有放宽。
+
+### 延迟与复位取证
+
+两端 disarmed，在主机 PX4 控制台执行下面的测试；测试要求 `AIRLINK_READY`，
+可先将两端切出组合模式以避免自动控制授权进入待命。恢复组合模式另行操作。
+`rtt_max_us` 是完整往返时间，不能直接作为单向延迟，也不能简单除二推定最坏
+单向延迟。`max_receive_gap_us` 是测试回包到达的最大间隔，`link_interruptions`
+统计回包间隔超过 10000 us 的次数；这些是测试负载下的指标，不是实际
+SENSOR_STATE 源数据年龄。
+
+实际传感器交换可在主机运行 `airlink sensortest 10000`，结束输出
+`AIRLINK_SENSOR_TEST_JSON`，现有字段只有接收、重复、坏帧数量和结束时新鲜度，
+不能据此断言整个测试期间没有超时。
+
+判定 CEKF 重置需同时保留主机控制台的 `CEKF reset: ...`、
+`listener airlink_status`、`listener airlink_sensor_state` 和
+`listener composite_state_estimate`（或相应 ULog）。重点比较接收时间间隔、
+`status_flags` 的 SampleFresh 位、估计器 reset_counter 和会话 ID。
+两机启动时钟独立，不能将主机接收时间减从机 IMU 时间当作单向延迟。
+SampleFresh 还取决于从机本地 IMU、加速度、姿态、角速度全部有效且新鲜，
+掉位不等于无线传输超时。
+
+
 默认参数：
 
 ```sh
@@ -194,3 +228,54 @@ px4_trans/px4/build/micoair_h743-v2_nncontrol/micoair_h743-v2_nncontrol.px4
   质量、减振和下降速度完成台架/HIL 标定；
 - 编译与主机测试通过只证明协议、状态机和固件集成可构建，不等同于 HIL、台架、
   实机或飞行许可。
+
+## 飞行中通信健康统计（2026-11-04）
+
+AIRLINK 持续记录 1 kHz 工作项的开始间隔、执行耗时、双向角色对应周期帧的
+收发间隔和峰值、超 10 ms 次数、周期流连续超时事件、本机源年龄和对端 IMU
+无效事件。由 `airlink_health`（同时记录 ULog）到两端 GS-Link DATA 0x10 node schema 2（260 B），
+地面站兼容 schema 1 并将新字段直接保存在 pair JSONL。
+
+新增 DATA 0x0C 为 8 字节本机时间 token 的请求/回显，flags 分别 0/Response。
+每端最多 5 Hz 探测 RTT，100 ms 未获匹配回复计一次超时，测试负载期间暂停主动探测。
+RTT 包含发送排队和双方处理调度，不代表单向无线延迟；不相减两机启动时钟。
+探测帧不更新任何周期流、心跳安全计时，不可掩盖断流。新 RuntimeTiming
+capability 为 bit9，必须两端升级后才能完成组合握手。
+
+GS-Link node schema 2 前 108 B 保持兼容，其后依次为 38 个 U32 字段。
+时间单位微秒，未知年龄 UINT32_MAX；health 新增峰值/计数在模块重启时清零。
+`health_flags` bit0/1 为已有周期 RX/TX，bit2 为当前会话 RTT 有效（<=1秒），
+bit3 周期流超时，bit4 对端 IMU 无效，bit5 正在监控周期流，bit6 本机四路源年龄新鲜，
+GS-Link bit7 表示统计主题新鲜（<=10ms）。
+`stream_timeouts` 在读串口前检查，连续过期只计一次，恢复后再次过期才增计。
+`run_work_us` 是墙钟执行耗时而非纯 CPU 时间；`tx_interval_us` 记录成功写串口驱动，
+不代表无线发射时刻。详细字段、判读规则与地面站显示见地面站
+`docs/08-ground-pair-flight.md` 和 `docs/gs-link-diagnostics-schema.json`。
+
+此改动用于取证，不改变 CEKF 重置策略或 10 ms 控制/传感器安全门槛。
+
+## 组合估计失效双机停机（2026-11-04）
+
+保护范围是主机组合解锁事务开始、组合已解锁及组合激活阶段。未解锁时估计未就绪
+只阻止组合控制/解锁，不在上电初始化期间误触发双机停机。
+
+保护期间，估计输出无效、采样/发布年龄超过 10 ms、任一 IMU 源缺失/过期、
+退化成单源、非有限反馈/非法四元数、EKF 失去姿态有效状态或报告内部 fault，
+以及 reset_counter 改变都会锁存故障。comp_attitude 在源恢复、会话变化或 CLI
+请求需要重建 EKF 时，若组合仍受保护，直接发布持续无效估计，不在已解锁状态重建。
+AIRLINK 另行检查估计发布年龄及收到的从机传感器有效位，故估计器线程停止运行也会被检测。
+
+故障发生后：
+
+- 主机立即撤销本机执行器输出并请求强制 disarm；comp_control 和 NNControl 均有
+  独立估计保护，阻止复位后的高推力帧到达输出端。
+- AIRLINK 清除排队中的旧控制帧和待完成 ARM 事务，优先发送带 reason=11
+  （EstimatorInvalid）的可靠 EmergencyWithdraw。接收端撤销跟随命令、强制 disarm
+  并锁存 pair_lost/reattach；数据恢复、GS 请求、延迟 ACK 均不能自行恢复输出。
+- 若紧急包丢失或链路断开，主机停止发送有效控制，从机原有 10 ms 控制流看门狗停机。
+  这是调度及通信延迟受限的双机停机，不保证两台硬件同一时刻断电。
+- 两端实际 disarm 后，分别通过物理 RC OFF 确认清除本端锁存，再重新握手和 OFF→ON
+  解锁。自动 disarm 不清除故障。估计器故障原因/epoch 通过原观测器诊断上报。
+
+新增 EstimatorKill capability bit10；两机必须同步更新，避免与旧的紧急撤销语义混用。
+故障锁存不会放宽任何 10 ms 新鲜度门槛。

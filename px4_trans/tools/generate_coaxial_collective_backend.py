@@ -8,12 +8,12 @@ import argparse
 import hashlib
 import json
 import math
+import re
 import shutil
 from pathlib import Path
 from typing import Any, Mapping
 
 import numpy as np
-import torch
 import yaml
 
 
@@ -119,6 +119,8 @@ def load_model(
 ) -> tuple[
     dict[str, np.ndarray | float | int], dict[str, Any], dict[str, Any]
 ]:
+    import torch
+
     from flight_controller import (
         ControllerContext,
         create_controller,
@@ -289,6 +291,156 @@ def load_model(
     return model, deployment, metadata
 
 
+YAW_BALANCE_FIELDS = (
+    "trim_speed_ratio", "maximum_speed_ratio", "motor_command_maximum",
+    "grid_common_command", "grid_yaw_per_thrust_per_command",
+    "yaw_integral_moment_limit_n_m", "lower_torque_scale",
+)
+
+
+def apply_yaw_balance_profile(model, deployment, metadata):
+    profile = deployment.get("yaw_balance_profile")
+    if profile is None:
+        if deployment.get("allocation_safety") is not None:
+            raise ValueError("allocation_safety requires yaw_balance_profile")
+        return
+    if set(profile) != set(YAW_BALANCE_FIELDS):
+        raise ValueError("yaw_balance_profile must contain exactly the documented fields")
+    policy = np.asarray([profile[key] for key in YAW_BALANCE_FIELDS], dtype=np.float32)
+    ratio, maximum, cap, common, slope, limit, torque_scale = policy
+    if (not np.all(np.isfinite(policy)) or not 1 <= ratio <= maximum <= 1.5
+        or not 0 < cap <= 1 or abs(common) > .25 or slope <= 0
+        or not 0 < limit <= .01 or not 0 < torque_scale <= 1):
+        raise ValueError("invalid conservative yaw balance profile")
+    model["yaw_balance"] = policy
+    safety = deployment.get("allocation_safety")
+    if safety is not None:
+        expected = {"roll_pitch_integral_moment_fraction", "grid_common_preference_fraction"}
+        if set(safety) != expected:
+            raise ValueError("allocation_safety must contain the documented two fractions")
+        rp = float(safety["roll_pitch_integral_moment_fraction"])
+        grid = float(safety["grid_common_preference_fraction"])
+        if not math.isfinite(rp) or not 0 < rp <= 1 or not math.isfinite(grid) or not 0 <= grid <= 1:
+            raise ValueError("invalid allocation safety fractions")
+        model.update(roll_pitch_integral_moment_fraction=rp, grid_common_preference_fraction=grid, allocation_revision=2)
+        metadata["allocation_safety"] = dict(safety)
+    elif model.get("allocation_revision") == 2:
+        # Only explicit model-reuse mode permits this downgrade; reference-only
+        # callers reject a changed allocation_safety before reaching here.
+        for name in ("allocation_revision", "roll_pitch_integral_moment_fraction", "grid_common_preference_fraction"):
+            model.pop(name, None)
+        metadata.pop("allocation_safety", None)
+    coefficients = model["thrust_coefficients"]
+    denominator = coefficients[0] + coefficients[1] * ratio**2 + coefficients[2] * ratio
+    upper_speed = math.sqrt(model["mass"] * model["gravity"] / denominator)
+    speeds = [float(upper_speed), float(upper_speed * ratio)]
+    commands = [float(np.interp(speed, model[key][:, 1], model[key][:, 0])) for speed, key in zip(speeds, ("upper_table", "lower_table"))]
+    metadata["yaw_balance_profile"] = {key: float(value) for key, value in zip(YAW_BALANCE_FIELDS, policy)}
+    metadata["policy_hover_trim_controller_commands"] = commands
+    metadata["policy_hover_trim_physical_commands"] = [value * .5 for value in commands]
+    metadata["policy_hover_trim_motor_speed_rad_s"] = speeds
+    metadata["policy_scope"] = "Firmware deployment overlay; inherited plant/gains unchanged; lower torque scale is an experimental assumption. Ratios constrain predicted steady speed, not measured ESC speed."
+
+
+def apply_attitude_response(model, deployment, metadata):
+    """Optional moment-domain PID retune; no change to yaw or plant tables."""
+    response = deployment.get("attitude_response")
+    if response is None:
+        if metadata.get("attitude_response") is not None:
+            raise ValueError("removing a gain override requires reusing the original gain manifest")
+        return
+    names = ("roll_pitch_kp", "roll_pitch_kd", "roll_pitch_ki")
+    if set(response) != set(names):
+        raise ValueError("attitude_response requires exactly roll_pitch_kp/kd/ki")
+    kp, kd, ki = (float(response[name]) for name in names)
+    if not all(math.isfinite(value) and value > 0 for value in (kp, kd, ki)):
+        raise ValueError("attitude response gains must be finite and positive")
+    gain = np.asarray(model["attitude_gain"], dtype=np.float32).copy()
+    for axis in range(2):
+        gain[axis] = 0.0
+        gain[axis, axis] = kp
+        gain[axis, 2 + axis] = kd
+        gain[axis, 5 + axis] = ki
+    model["attitude_gain"] = gain
+    metadata["attitude_response"] = dict(response)
+    if "lqi_pole_radius" in metadata:
+        metadata["inherited_lqi_pole_radius"] = metadata.pop("lqi_pole_radius")
+    metadata["gain_design_scope"] = "Roll/pitch moment-domain PID retune with 50 Hz actuator ZOH/lag stability screen; original yaw row and plant retained. Not hardware validated."
+
+
+def load_reference_update(deployment_config: Path, manifest_path: Path):
+    """Preserve the verified plant/gains when only manual limits change.
+
+    This path does not need SimEnv or Torch. Check the old model checksum and
+    all plant source hashes before updating the reference and provenance.
+    """
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    metadata = dict(manifest["source"])
+    deployment = yaml.safe_load(deployment_config.read_text(encoding="utf-8"))
+    for path_key, hash_key in (
+        ("simulator_config", "simulator_sha256"),
+        ("controller_config", "controller_sha256"),
+        ("calibration_path", "calibration_sha256"),
+        ("identification_report", "identification_report_sha256"),
+    ):
+        if file_sha256(ROOT / metadata[path_key]) != metadata[hash_key]:
+            raise ValueError(f"reference-only update cannot change {path_key}")
+    if deployment["simulator_config"] != metadata["simulator_config"] or deployment["controller_config"] != metadata["controller_config"]:
+        raise ValueError("reference-only update cannot change plant/controller paths")
+    header = (ROOT / manifest["generated"]["candidate_payload"]).read_text()
+    if file_sha256(ROOT / manifest["generated"]["candidate_payload"]) != manifest["generated"]["candidate_payload_sha256"]:
+        raise ValueError("candidate payload hash mismatch")
+    arrays = {
+        name: np.array([float(v.strip().rstrip("f")) for v in values.split(",") if v.strip()], dtype=np.float32)
+        for name, values in re.findall(r"static constexpr float (\w+)\[\d+\] = \{(.*?)\};", header, re.S)
+    }
+    fields = re.search(r"static constexpr LqiCoaxialCollectiveModel kModel \{(.*?)\n\};", header, re.S).group(1)
+    tokens = [line.strip().rstrip(",") for line in fields.splitlines() if line.strip()][5:]
+    names = (
+        "attitude_gain", "servo_direction", "maximum_moment", "motor_effectiveness_points", "motor_effectiveness", "points_count",
+        "upper_table", "lower_table", "upper_count", "lower_count", "mass", "gravity", "thrust_coefficients", "motor_torque_coefficients",
+        "maximum_thrust", "minimum_thrust_fraction", "maximum_thrust_fraction", "tilt_cosine_minimum", "pilot_minimum", "pilot_maximum",
+        "maximum_vertical_acceleration", "acceleration_kp", "acceleration_ki", "acceleration_integral_limit", "acceleration_filter_time_constant",
+        "servo_effectiveness_scale", "servo_scale_minimum", "servo_scale_maximum", "motor_mix_regularization", "zero_throttle_threshold",
+        "dt", "max_roll_angle", "max_pitch_angle", "max_yaw_rate", "manual_command_decay", "weight_bytes", "checksum",
+    )
+    if len(tokens) == len(names) + 3:
+        names = (*names, "yaw_balance", "roll_pitch_integral_moment_fraction", "grid_common_preference_fraction")
+    elif len(tokens) == len(names) + 1:
+        names = (*names, "yaw_balance")
+    if len(tokens) != len(names):
+        raise ValueError("unsupported embedded model layout")
+    model = {}
+    for name, token in zip(names, tokens):
+        if token in arrays:
+            model[name] = arrays[token]
+        elif token.startswith("{"):
+            model[name] = np.array([float(v.strip().rstrip("f")) for v in token.strip("{}").split(",")], dtype=np.float32)
+        elif token.startswith("0x"):
+            model[name] = int(token.rstrip("u"), 16)
+        else:
+            model[name] = float(token.rstrip("fu"))
+    if "PilotAccelerationSharedYawAntiWindup" in fields:
+        model["allocation_revision"] = 2
+    for name, width in (("attitude_gain", 8), ("servo_direction", 2), ("motor_effectiveness", 4), ("upper_table", 2), ("lower_table", 2)):
+        model[name] = model[name].reshape(-1, width)
+    if checksum(model) != int(manifest["model_checksum"], 16) or model["checksum"] != checksum(model):
+        raise ValueError("embedded model checksum mismatch")
+    manual = deployment["manual_reference"]
+    model["max_roll_angle"] = float(manual["roll"]["limit_rad"])
+    model["max_pitch_angle"] = float(manual["pitch"]["limit_rad"])
+    model["max_yaw_rate"] = float(manual["yaw"]["limit_rad_s"])
+    tau = np.asarray([manual[axis]["time_constant_s"] for axis in ("roll", "pitch", "yaw")], dtype=np.float32)
+    if not np.all(np.isfinite(tau)) or np.any(tau < 0):
+        raise ValueError("manual reference time constants must be finite and non-negative")
+    decay = np.zeros_like(tau)
+    decay[tau > 0] = np.exp(-model["dt"] / tau[tau > 0])
+    model["manual_command_decay"] = decay
+    metadata["deployment_config"] = str(deployment_config.relative_to(ROOT))
+    metadata["deployment_sha256"] = file_sha256(deployment_config)
+    return model, deployment, metadata
+
+
 def checksum(model: Mapping[str, Any]) -> int:
     names = (
         "attitude_gain",
@@ -324,6 +476,11 @@ def checksum(model: Mapping[str, Any]) -> int:
         "max_yaw_rate",
         "manual_command_decay",
     )
+    if "yaw_balance" in model:
+        names = (*names, "yaw_balance")
+    if model.get("allocation_revision") == 2:
+        # Include the behavioral contract as well as its two new scalars.
+        names = (*names, "roll_pitch_integral_moment_fraction", "grid_common_preference_fraction", "allocation_revision")
     return fnv1a32(
         b"".join(
             np.asarray(model[name], dtype=np.float32).tobytes()
@@ -348,6 +505,10 @@ def write_model_header(
         "lower_table",
         "manual_command_decay",
     )
+    if "yaw_balance" in model:
+        weight_names = (*weight_names, "yaw_balance")
+    if model.get("allocation_revision") == 2:
+        weight_names = (*weight_names, "roll_pitch_integral_moment_fraction", "grid_common_preference_fraction")
     weight_bytes = (
         sum(np.asarray(model[name]).size for name in weight_names) * 4
     )
@@ -387,6 +548,9 @@ def write_model_header(
             cpp_name, np.asarray(model[name], dtype=np.float32)
         )
         lines.append("")
+    if "yaw_balance" in model:
+        lines += array_lines("kYawBalance", np.asarray(model["yaw_balance"], dtype=np.float32))
+        lines.append("")
     thrust = np.asarray(model["thrust_coefficients"], dtype=np.float32)
     torque = np.asarray(
         model["motor_torque_coefficients"], dtype=np.float32
@@ -397,7 +561,9 @@ def write_model_header(
         "\tLqiCoaxialCollectiveModel::WorldFrame::NED,",
         "\tLqiCoaxialCollectiveModel::BodyFrame::FRD,",
         "\tLqiCoaxialCollectiveModel::QuaternionConvention::HamiltonWxyzBodyToWorld,",
-        "\tLqiCoaxialCollectiveModel::CollectiveContract::PilotAccelerationDualMotorCommonDifferentialServoRollPitch,",
+        ("\tLqiCoaxialCollectiveModel::CollectiveContract::PilotAccelerationSharedYawAntiWindup,"
+         if model.get("allocation_revision") == 2 else "\tLqiCoaxialCollectiveModel::CollectiveContract::PilotAccelerationBoundedRotorDifferentialGridYawTrim,"
+         if "yaw_balance" in model else "\tLqiCoaxialCollectiveModel::CollectiveContract::PilotAccelerationDualMotorCommonDifferentialServoRollPitch,"),
         "\tkAttitudeGain,",
         "\tkServoDirection,",
         "\tkMaximumMoment,",
@@ -435,6 +601,9 @@ def write_model_header(
         "\tkManualCommandDecay,",
         f"\t{weight_bytes}u,",
         f"\t0x{digest:08x}u,",
+        *(["\tkYawBalance,"] if "yaw_balance" in model else []),
+        *([f"\t{literal(model['roll_pitch_integral_moment_fraction'])},", f"\t{literal(model['grid_common_preference_fraction'])},"]
+          if model.get("allocation_revision") == 2 else []),
         "};",
         "",
         "} // namespace lqi_coaxial_collective",
@@ -581,7 +750,10 @@ def coaxial_step_float32(
         model["minimum_thrust_fraction"] * model["maximum_thrust"],
         model["maximum_thrust_fraction"] * model["maximum_thrust"],
     )
-    speed_ratio = math.sqrt(
+    policy = model.get("yaw_balance")
+    if policy is not None:
+        rate_error[2] = current_rate[2] - np.clip(target_rate[2], -model["max_yaw_rate"], model["max_yaw_rate"])
+    speed_ratio = float(policy[0]) if policy is not None else math.sqrt(
         model["motor_torque_coefficients"][0]
         / max(model["motor_torque_coefficients"][1], 1.0e-16)
     )
@@ -592,6 +764,12 @@ def coaxial_step_float32(
         + coefficients[2] * speed_ratio
     )
     upper_speed = math.sqrt(max(desired_thrust, 0.0) / max(denominator, 1e-16))
+    base_saturated = False
+    if policy is not None:
+        speed_cap = min(float(np.interp(policy[2], model["upper_table"][:, 0], model["upper_table"][:, 1])),
+                        float(np.interp(policy[2], model["lower_table"][:, 0], model["lower_table"][:, 1])) / speed_ratio)
+        base_saturated = upper_speed > speed_cap
+        upper_speed = min(upper_speed, speed_cap)
     lower_speed = speed_ratio * upper_speed
     upper_base = _inverse_lookup(upper_speed, model["upper_table"])
     lower_base = _inverse_lookup(lower_speed, model["lower_table"])
@@ -599,12 +777,27 @@ def coaxial_step_float32(
     attitude_integral = persistent[2:5] + np.asarray(
         [error[0], error[1], rate_error[2]], dtype=np.float32
     ) * DT_S
+    yaw_ki = float(np.asarray(model["attitude_gain"])[2, 7])
+    if policy is not None:
+        integral_limit = policy[5] / max(abs(yaw_ki), 1e-9)
+        attitude_integral[2] = np.clip(attitude_integral[2], -integral_limit, integral_limit)
+    shared_yaw = model.get("allocation_revision") == 2
+    base_thrust = denominator * upper_speed**2
+    previous_rp = persistent[2:4].copy()
+    if shared_yaw:
+        for axis in range(2):
+            gain = float(model["attitude_gain"][axis, 5 + axis])
+            limit = model["roll_pitch_integral_moment_fraction"] * model["maximum_moment"][axis] / max(abs(gain), 1e-9)
+            previous_rp[axis] = np.clip(previous_rp[axis], -limit, limit)
+            attitude_integral[axis] = previous_rp[axis] if base_thrust < .5 * model["mass"] * model["gravity"] else np.clip(previous_rp[axis] + error[axis] * DT_S, -limit, limit)
     state = np.concatenate(
         (error[:2], rate_error, attitude_integral)
     ).astype(np.float32)
     desired_moment = (
         -np.asarray(model["attitude_gain"], dtype=np.float32) @ state
     )
+    raw_moment = desired_moment.copy()
+    raw_yaw_moment = float(desired_moment[2])
     desired_moment = np.clip(
         desired_moment,
         -np.asarray(model["maximum_moment"], dtype=np.float32),
@@ -628,6 +821,19 @@ def coaxial_step_float32(
         servo_raw / max(servo_limit, 1.0) if servo_saturated else servo_raw
     )
 
+    base_yaw = 0.0
+    grid_yaw = 0.0
+    if policy is not None:
+        common_min = max(-1.0, float(np.max(-1.0 - servos)))
+        common_max = min(1.0, float(np.min(1.0 - servos)))
+        full_common = policy[3] * np.clip(desired_thrust / (model["mass"] * model["gravity"]), 0, 1)
+        common_min = max(common_min, min(full_common, 0))
+        common_max = min(common_max, max(full_common, 0))
+        common = np.clip(full_common * (model["grid_common_preference_fraction"] if shared_yaw else 1), common_min, common_max)
+        servos = np.clip(servos + common, -1, 1)
+        base_yaw = model["motor_torque_coefficients"][0] * upper_speed**2 - model["motor_torque_coefficients"][1] * policy[6] * lower_speed**2
+        grid_yaw = policy[4] * denominator * upper_speed**2 * common
+    motor_yaw_request = float(desired_moment[2]) - base_yaw - grid_yaw
     effectiveness_points = np.asarray(
         model["motor_effectiveness_points"], dtype=np.float32
     )
@@ -646,6 +852,8 @@ def coaxial_step_float32(
         ],
         dtype=np.float32,
     )
+    if policy is not None:
+        effectiveness[3] *= policy[6]
     common_regularization = 2.0 * model["motor_mix_regularization"]
     common_t = float(effectiveness[0] + effectiveness[1])
     differential_t = float(effectiveness[0] - effectiveness[1])
@@ -658,10 +866,10 @@ def coaxial_step_float32(
     )
     if abs(determinant) < 1e-12:
         raise ValueError("singular motor mixer")
-    common_output = -differential_t * desired_moment[2] / determinant
+    common_output = -differential_t * motor_yaw_request / determinant
     differential_output = (
         (common_t + common_regularization)
-        * desired_moment[2]
+        * motor_yaw_request
         / determinant
     )
     motor_raw = np.asarray(
@@ -675,14 +883,62 @@ def coaxial_step_float32(
     motor_saturated = bool(
         np.any(motor_raw < 0.0) or np.any(motor_raw > 1.0)
     )
+    yaw_limited = abs(raw_yaw_moment - desired_moment[2]) > 1e-7
+    if policy is not None:
+        def feasible(value):
+            if np.any(value < 0) or np.any(value > policy[2]):
+                return False
+            speed = [float(np.interp(value[i], model[key][:, 0], model[key][:, 1])) for i, key in enumerate(("upper_table", "lower_table"))]
+            return speed[0] <= policy[1] * speed[1] + 1e-3 and speed[1] <= policy[1] * speed[0] + 1e-3
+        base = np.array([upper_base, lower_base], dtype=np.float32)
+        def allocate(delta):
+            fraction = 1.0
+            if not feasible(base + delta):
+                low, high = 0.0, 1.0
+                for _ in range(16):
+                    middle = .5 * (low + high)
+                    if feasible(base + middle * delta):
+                        low = middle
+                    else:
+                        high = middle
+                fraction = low
+            return base + fraction * delta, fraction
+        motors, fraction = allocate(motor_raw - base)
+        if shared_yaw and fraction < 1:
+            achieved_motor = float(effectiveness[2:] @ (motors - base))
+            grid_slope = policy[4] * base_thrust
+            if abs(grid_slope) > 1e-9:
+                selected = np.clip(common + (motor_yaw_request - achieved_motor) / grid_slope, common_min, common_max)
+                servos = np.clip(servos + selected - common, -1, 1)
+                common = selected
+                grid_yaw = grid_slope * common
+                motor_yaw_request = float(desired_moment[2]) - base_yaw - grid_yaw
+                delta = np.asarray([(-differential_t + common_t + common_regularization) / determinant,
+                                    (-differential_t - common_t - common_regularization) / determinant], dtype=np.float32) * motor_yaw_request
+                motors, fraction = allocate(delta)
+        motor_saturated = base_saturated or fraction < 1
+        yaw_limited = yaw_limited or fraction < 1
     next_state = np.empty(5, dtype=np.float32)
     next_state[0] = filtered_up
-    next_state[1] = persistent[1] if motor_saturated else z_integral
+    next_state[1] = persistent[1] if (base_saturated if policy is not None else motor_saturated) else z_integral
     next_state[2:5] = (
         persistent[2:5]
         if servo_saturated or motor_saturated
         else attitude_integral
     )
+    if policy is not None:
+        next_state[2:4] = persistent[2:4] if servo_saturated else attitude_integral[:2]
+        if shared_yaw:
+            for axis in range(2):
+                gain = float(model["attitude_gain"][axis, 5 + axis])
+                achieved = float(desired_moment[axis]) / max(servo_limit, 1.0)
+                residual = float(raw_moment[axis]) - achieved
+                change = -gain * (attitude_integral[axis] - previous_rp[axis])
+                next_state[2 + axis] = previous_rp[axis] if abs(residual) > 1e-7 and change * residual > 0 else attitude_integral[axis]
+        achieved_yaw = base_yaw + grid_yaw + float(effectiveness @ np.array([0, 0, motors[0] - upper_base, motors[1] - lower_base]))
+        residual = raw_yaw_moment - achieved_yaw
+        delta_moment = -yaw_ki * (attitude_integral[2] - persistent[4])
+        next_state[4] = np.clip(persistent[4] if yaw_limited and delta_moment * residual > 0 else attitude_integral[2], -integral_limit, integral_limit)
     output = np.concatenate(
         (motors, np.clip(servos, -1.0, 1.0))
     ).astype(np.float32)
@@ -817,6 +1073,8 @@ def main() -> None:
         action="store_true",
         help="archive the candidate without replacing the PX4 build headers",
     )
+    parser.add_argument("--reference-only-manifest", type=Path, help="Reuse a verified payload; update only manual reference constants")
+    parser.add_argument("--reuse-model-manifest", type=Path, help="Reuse verified plant/gains and apply an explicit deployment yaw-balance profile")
     args = parser.parse_args()
     deployment_config = args.deployment_config.expanduser().resolve()
     output_dir = args.output_dir.expanduser().resolve()
@@ -825,7 +1083,26 @@ def main() -> None:
     golden_json = output_dir / "lqi_coaxial_collective_golden.json"
     manifest_path = output_dir / "lqi_coaxial_collective_manifest.json"
 
-    model, deployment, metadata = load_model(deployment_config)
+    if args.reference_only_manifest and args.reuse_model_manifest:
+        raise ValueError("choose one verified-model reuse mode")
+    if args.reference_only_manifest or args.reuse_model_manifest:
+        manifest = args.reference_only_manifest or args.reuse_model_manifest
+        model, deployment, metadata = load_reference_update(deployment_config, manifest.resolve())
+        if args.reference_only_manifest and (
+            (deployment.get("yaw_balance_profile") is None) != (metadata.get("yaw_balance_profile") is None)
+            or (deployment.get("yaw_balance_profile") is not None and not np.array_equal(
+                np.asarray([deployment["yaw_balance_profile"][key] for key in YAW_BALANCE_FIELDS], dtype=np.float32),
+                model.get("yaw_balance")))
+        ):
+            raise ValueError("reference-only mode cannot change the yaw balance profile; use --reuse-model-manifest")
+    else:
+        model, deployment, metadata = load_model(deployment_config)
+    if args.reference_only_manifest and deployment.get("allocation_safety") != metadata.get("allocation_safety"):
+        raise ValueError("reference-only mode cannot change allocation safety; use --reuse-model-manifest")
+    if args.reference_only_manifest and deployment.get("attitude_response") != metadata.get("attitude_response"):
+        raise ValueError("reference-only mode cannot change attitude gains; use --reuse-model-manifest")
+    apply_yaw_balance_profile(model, deployment, metadata)
+    apply_attitude_response(model, deployment, metadata)
     digest = write_model_header(model, metadata, payload_path)
     vectors = golden_vectors(model)
     write_golden(vectors, golden_header, golden_json)
@@ -849,7 +1126,9 @@ def main() -> None:
         "artifact_type": "px4_coaxial_collective_lqi_model",
         "airframe_id": "airframe-1",
         "airframe_number": 1,
-        "controller_contract": "pilot_acceleration_dual_motor_common_differential_servo_roll_pitch",
+        "controller_contract": ("pilot_acceleration_shared_yaw_antiwindup"
+                                if model.get("allocation_revision") == 2 else "pilot_acceleration_bounded_rotor_differential_grid_yaw_trim"
+                                if "yaw_balance" in model else "pilot_acceleration_dual_motor_common_differential_servo_roll_pitch"),
         "model_checksum": f"0x{digest:08x}",
         "source": metadata,
         "generated": {

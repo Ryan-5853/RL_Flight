@@ -1,0 +1,70 @@
+{
+  "model": "reduced nonlinear yaw/vertical model, constant torque coefficients; not flight validation",
+  "results": [
+    {
+      "assumed_lower_upper_kq_ratio": 0.6,
+      "final_mean_rate_rad_s": 7.275709628227169e-07,
+      "max_abs_rate_rad_s": 0.2114133210900526,
+      "final_mean_physical_commands": [
+        0.25308250227570533,
+        0.3823963299691677
+      ],
+      "max_predicted_speed_ratio": 1.1500011004723885,
+      "max_physical_motor_command": 0.385450541973114,
+      "final_vertical_force_n": 6.472389302537407,
+      "final_yaw_integral_moment_n_m": 0.002808954566717148
+    },
+    {
+      "assumed_lower_upper_kq_ratio": 0.65,
+      "final_mean_rate_rad_s": 3.3677213279708635e-07,
+      "max_abs_rate_rad_s": 0.20387324737154275,
+      "final_mean_physical_commands": [
+        0.27025368317961695,
+        0.36623882219195364
+      ],
+      "max_predicted_speed_ratio": 1.150001068215907,
+      "max_physical_motor_command": 0.38567352294921875,
+      "final_vertical_force_n": 6.472389500089013,
+      "final_yaw_integral_moment_n_m": 0.001431701355613768
+    },
+    {
+      "assumed_lower_upper_kq_ratio": 0.7,
+      "final_mean_rate_rad_s": 3.067396888932061e-08,
+      "max_abs_rate_rad_s": 0.20450324455146957,
+      "final_mean_physical_commands": [
+        0.2861857416629791,
+        0.35094082403182986
+      ],
+      "max_predicted_speed_ratio": 1.1500008691515922,
+      "max_physical_motor_command": 0.3857487440109253,
+      "final_vertical_force_n": 6.4723893869607645,
+      "final_yaw_integral_moment_n_m": 0.00014042660768609494
+    },
+    {
+      "assumed_lower_upper_kq_ratio": 0.75,
+      "final_mean_rate_rad_s": 3.4140108590366805e-07,
+      "max_abs_rate_rad_s": 0.2052220107159434,
+      "final_mean_physical_commands": [
+        0.3010333014726639,
+        0.3364209562242031
+      ],
+      "max_predicted_speed_ratio": 1.1170129458601747,
+      "max_physical_motor_command": 0.37200504541397095,
+      "final_vertical_force_n": 6.472389453165999,
+      "final_yaw_integral_moment_n_m": -0.0010740130674093962
+    },
+    {
+      "assumed_lower_upper_kq_ratio": 0.8,
+      "final_mean_rate_rad_s": 7.052796919631249e-07,
+      "max_abs_rate_rad_s": 0.2057575565364849,
+      "final_mean_physical_commands": [
+        0.31503093242645264,
+        0.3226090226173401
+      ],
+      "max_predicted_speed_ratio": 1.0850174587766086,
+      "max_physical_motor_command": 0.35818758606910706,
+      "final_vertical_force_n": 6.472389177604305,
+      "final_yaw_integral_moment_n_m": -0.002224062103778124
+    }
+  ]
+}

@@ -1,0 +1,61 @@
+{
+  "firmware": "micoair_h743-v2_nncontrol_yaw_balanced_v2.px4",
+  "sha256": "c1c2500b0288bc207eefc26755b8df18df1df170c0068c484fdb2a1d379222dd",
+  "image_size": 1205720,
+  "flashed": false,
+  "model_schema_version": 5,
+  "controller_contract": "pilot_acceleration_shared_yaw_antiwindup",
+  "model_checksum": "0x30298daf",
+  "manual_yaw_limit_rad_s": 0.3,
+  "manual_yaw_time_constant_s": 0.2,
+  "yaw_balance_profile": {
+    "trim_speed_ratio": 1.0800000429153442,
+    "maximum_speed_ratio": 1.149999976158142,
+    "motor_command_maximum": 0.8999999761581421,
+    "grid_common_command": -0.1599999964237213,
+    "grid_yaw_per_thrust_per_command": 0.004287499934434891,
+    "yaw_integral_moment_limit_n_m": 0.003000000026077032,
+    "lower_torque_scale": 0.699999988079071
+  },
+  "allocation_safety": {
+    "roll_pitch_integral_moment_fraction": 0.5,
+    "grid_common_preference_fraction": 0.5
+  },
+  "preferred_grid_common_command": -0.08,
+  "roll_pitch_integral_moment_limit_n_m": [
+    0.0045,
+    0.0045
+  ],
+  "checks": [
+    "Full target firmware build passed",
+    "All host core/golden/protection/envelope tests passed",
+    "20-second RP saturation, directional unwind and servo-scaling unwind regression passed",
+    "Grid retreat/reserve and boundary continuity checks passed",
+    "Actual-heading RP reference regression passed",
+    "2 payload provenance tests passed",
+    "Legacy v1 golden compatibility passed",
+    "v2 payload read/checksum roundtrip passed",
+    "Frozen recorded-input v1/v2 comparison passed declared integral/common assertions",
+    "6 coupled rigid-body/actuator model cases passed declared checks",
+    "Packaged image size/decompression/profile/scalars/checksum verified"
+  ],
+  "limits": [
+    "Not flashed; no hardware or flight validation",
+    "Large constant roll disturbance model case still reaches about 24.4 deg transient",
+    "Rotor speed boundary remains model-predicted; no ESC speed feedback loop",
+    "Actual motor curves, grid direction, gain and linkage need bench calibration",
+    "Frozen replay is not a prediction of an alternate flight"
+  ],
+  "source_sha256": {
+    "px4_trans/configs/lqi_coaxial_collective_airframe1_yaw_balanced_v2.yaml": "3673b050c8991b2bb97f57372a0485fba36b3685f3ca99c3f20510891e8873b5",
+    "px4_trans/px4/src/modules/nn_control/LqiCoaxialCollectiveModel.hpp": "6e8df8bd6ae59770b616096c38a219798f2e5ee1fd33e35f9b1f55ee92184e19",
+    "px4_trans/px4/src/modules/nn_control/LqiCoaxialCollectiveCore.hpp": "b0a02dc07d4217b1736e13d72104fd32a6d843b0e50c077cb3cf4ee9e3cb3cbd",
+    "px4_trans/px4/src/modules/nn_control/LqiCoaxialCollectivePayload.hpp": "cd6641485c00318c3d212d47b35a4d539b23ff4f71cab2051374a75cd17637d7",
+    "px4_trans/px4/src/modules/nn_control/LqiManualReference.hpp": "dd2f983de1ed3f1a92ac527ce19bf70ebb979d9c030b02373d35db2bb0d7e3c2",
+    "px4_trans/px4/src/modules/nn_control/FinalMotorOutputMap.hpp": "e673642fe15e62842fc68532ab507760e1b9eb7d895406a9fc961dbdd85f78e2",
+    "px4_trans/tools/generate_coaxial_collective_backend.py": "a0d16ab890309a2bcaab801c1c866173ff22d5c06741b32cff020ca3f9632e7b",
+    "px4_trans/tests/shared_yaw_antiwindup_check.cpp": "de270feeab54bfeabcdd130809be523a463e070c3d03b7912885cbb84337c92b",
+    "analysis/yaw_balance_v2_20261105/frozen_replay_metrics.json": "aa82ae37dd069daa2b31f649cb99d85aff443e61c3aeee30803882ad3b2c2a0b",
+    "analysis/yaw_balance_v2_20261105/coupled_metrics.json": "f67f2e608f055b39e18a6522d9b3909ba7157aa161a12ef26465f8f1ab62747f"
+  }
+}

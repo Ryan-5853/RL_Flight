@@ -1,0 +1,112 @@
+#!/bin/sh
+#
+# @name Direct Actuator Controller (2 motors, 3 servos)
+#
+# @type Helicopter
+# @class Copter
+#
+# @output Motor1 upper rotor (M1)
+# @output Motor2 lower rotor (M2)
+# @output Servo1 swashplate servo 1 (M6)
+# @output Servo2 swashplate servo 2 (M7)
+# @output Servo3 swashplate servo 3 (M8)
+#
+# @maintainer Custom controller integration
+#
+
+. ${R}etc/init.d/rc.direct_control_defaults
+
+# RC is the sole Commander manual-control source in real flight. HIL keeps the
+# WebUI/MAVLink pilot path used by the existing simulation workflow.
+if param greater SYS_HITL 0
+then
+	param set COM_RC_IN_MODE 2
+else
+	param set COM_RC_IN_MODE 0
+fi
+
+# TELEM1 (SERIAL1) is the ESP32 link. GS-Link v1 is the sole runtime owner of
+# /dev/ttyS0; MAVLink must not claim this port. USB MAVLink remains available
+# for QGC through /dev/ttyACM0.
+param set MAV_0_CONFIG 0
+param set SER_TEL1_BAUD 4000000
+# Enable the RC-supervised ground-station input by default. A saved user value
+# still takes precedence; actuator authority remains separately controlled by
+# NN_LQI_OUTPUT_EN.
+param set-default NN_GS_EN 1
+# The embedded identified LQI payload must match this physical airframe. A
+# mismatch inhibits actuator output even when NN_LQI_OUTPUT_EN is set.
+param set-default NN_AIRFRAME_ID 1
+
+# PX4 assigns external modes by FNV-1a name hash, not by request order. Reserve
+# COM_MODE0 for External Mode 1 and pin the nn_control name "Ground Station"
+# to COM_MODE1 so it is always assigned External Mode 2 (nav_state 24).
+param set COM_MODE0_HASH -301203826
+param set COM_MODE1_HASH -696130346
+param set COM_MODE2_HASH -70735788
+# The three-position switch selects slots 1/4/6. Override saved old mappings.
+param set-default RC_MAP_FLTMODE 8
+param set COM_FLTMODE1 0
+param set COM_FLTMODE4 101
+param set COM_FLTMODE6 102
+param set NN_GS_MODE_SLOT 4
+# Physical ARM is a maintained two-state switch, not a momentary button.
+# Override saved button-mode settings on both endpoints; keep existing channel mapping.
+param set COM_ARM_SWISBTN 0
+param set-default RC_MAP_ARM_SW 5
+
+
+# Physical outputs M1-M4 share TIM1, M5-M6 share TIM3 and M7-M8 share
+# TIM4. M1/M2 drive the upper/lower rotor motors; M6/M7/M8 drive the
+# three swashplate servos.
+#
+# Bidirectional DShot reports electrical RPM. The 2026-10-26 vehicle uses
+# 28 motor magnets; the logs were collected with the incorrect default of 14,
+# which doubled every ESC RPM entering the LQI observer.
+param set MOT_POLE_COUNT 28
+param set-default PWM_MAIN_TIM0 400
+param set-default PWM_MAIN_TIM1 333
+param set-default PWM_MAIN_TIM2 333
+
+param set-default PWM_MAIN_FUNC1 101
+param set-default PWM_MAIN_FUNC2 102
+param set-default PWM_MAIN_FUNC3 0
+param set-default PWM_MAIN_FUNC4 0
+param set-default PWM_MAIN_FUNC5 0
+param set-default PWM_MAIN_FUNC6 201
+param set-default PWM_MAIN_FUNC7 202
+param set-default PWM_MAIN_FUNC8 203
+param set-default PWM_MAIN_FUNC9 0
+param set-default PWM_MAIN_FUNC10 0
+
+# Conservative PWM defaults. QGC Actuators can change servo direction, trim,
+# limits and motor protocol without changing the controller backend.
+param set-default PWM_MAIN_DIS1 1000
+param set-default PWM_MAIN_DIS2 1000
+param set-default PWM_MAIN_FAIL1 1000
+param set-default PWM_MAIN_FAIL2 1000
+
+param set-default PWM_MAIN_DIS6 1500
+param set-default PWM_MAIN_DIS7 1500
+param set-default PWM_MAIN_DIS8 1500
+param set-default PWM_MAIN_FAIL6 1500
+param set-default PWM_MAIN_FAIL7 1500
+param set-default PWM_MAIN_FAIL8 1500
+
+# Preserve discovery, arm, disarm and fault tails on both pair endpoints.
+param set SDLOG_MODE 2
+
+# Match the direct collective-controller termination guard. Commander confirms
+# for 100 ms; NNControl independently cuts output without an added delay.
+param set FD_FAIL_R 30
+param set FD_FAIL_P 30
+param set FD_FAIL_R_TTRI 0.1
+param set FD_FAIL_P_TTRI 0.1
+
+# Restore PX4 automatic gyro selection for the replacement flight controller,
+# including saved priorities left by the BMI088-exclusive diagnostic build.
+# Keep calibration IDs/offsets intact; do not bind selection to the old board.
+param reset CAL_GYRO0_PRIO
+param reset CAL_GYRO1_PRIO
+param reset CAL_GYRO2_PRIO
+param reset CAL_GYRO3_PRIO

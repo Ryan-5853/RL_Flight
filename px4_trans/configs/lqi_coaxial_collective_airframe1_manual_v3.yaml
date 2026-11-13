@@ -24,11 +24,11 @@ physical_motor_pole_count: 28
 
 manual_reference:
   roll:
-    limit_rad: 0.3490659
+    limit_rad: 0.1745329252
     # Zero means pass the upstream command through without a first-order lag.
     time_constant_s: 0.0
   pitch:
-    limit_rad: 0.3490659
+    limit_rad: 0.1745329252
     time_constant_s: 0.0
   yaw:
     limit_rad_s: 1.2

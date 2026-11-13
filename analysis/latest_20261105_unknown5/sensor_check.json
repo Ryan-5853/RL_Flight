@@ -1,0 +1,26 @@
+{
+  "preflight_window_s": [
+    4.5,
+    6
+  ],
+  "control_acceleration_samples": 58,
+  "control_acceleration_mean": [
+    0.06655123829841614,
+    0.21156245470046997,
+    -10.017106056213379
+  ],
+  "norm_control_acceleration_mean": 10.019560813903809,
+  "approx_calibrated_prebias_mean": [
+    0.0670851930103043,
+    0.21946507274517274,
+    -10.391963501075065
+  ],
+  "norm_approx_calibrated_prebias_mean": 10.394497137858695,
+  "raw_sensor_acceleration_mean": [
+    -0.07182605564594269,
+    -0.20334205031394958,
+    -9.885369300842285
+  ],
+  "norm_raw_sensor_mean": 9.887721061706543,
+  "limitation": "Adding interpolated online bias back to filtered control-layer acceleration is approximate; not native EKF IMU trace or exact calibration reconstruction."
+}
